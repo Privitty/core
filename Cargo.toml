@@ -98,7 +98,7 @@ smallvec = "1.13.2"
 strum = "0.26"
 strum_macros = "0.26"
 tagger = "4.3.4"
-textwrap = "0.16.1"
+textwrap = "0.16.2"
 thiserror = { workspace = true }
 tokio-io-timeout = "1.2.0"
 tokio-rustls = { version = "0.26.0", default-features = false }
