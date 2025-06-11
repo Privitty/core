@@ -26,8 +26,8 @@ use crate::token;
 use crate::tools::validate_id;
 
 const OPENPGP4FPR_SCHEME: &str = "OPENPGP4FPR:"; // yes: uppercase
-const IDELTACHAT_SCHEME: &str = "https://i.delta.chat/#";
-const IDELTACHAT_NOSLASH_SCHEME: &str = "https://i.delta.chat#";
+const IDELTACHAT_SCHEME: &str = "https://i.privittytech.com/#";
+const IDELTACHAT_NOSLASH_SCHEME: &str = "https://i.privittytech.com#";
 const DCACCOUNT_SCHEME: &str = "DCACCOUNT:";
 pub(super) const DCLOGIN_SCHEME: &str = "DCLOGIN:";
 const DCWEBRTC_SCHEME: &str = "DCWEBRTC:";
@@ -535,7 +535,7 @@ async fn decode_openpgp(context: &Context, qr: &str) -> Result<Qr> {
     }
 }
 
-/// scheme: `https://i.delta.chat[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
+/// scheme: `https://i.privittytech.com[/]#FINGERPRINT&a=ADDR[&OPTIONAL_PARAMS]`
 async fn decode_ideltachat(context: &Context, prefix: &str, qr: &str) -> Result<Qr> {
     let qr = qr.replacen(prefix, OPENPGP4FPR_SCHEME, 1);
     let qr = qr.replacen('&', "#", 1);
@@ -1165,13 +1165,13 @@ mod tests {
 
         let qr = check_qr(
             &ctx.ctx,
-            "https://i.delta.chat/#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+            "https://i.privittytech.com/#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
         ).await?;
         assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
 
         let qr = check_qr(
             &ctx.ctx,
-            "https://i.delta.chat#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+            "https://i.privittytech.com#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
         ).await?;
         assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
 

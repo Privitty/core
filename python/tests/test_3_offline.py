@@ -705,7 +705,7 @@ class TestOfflineChat:
         ac1 = acfactory.get_pseudo_configured_account()
         ac2 = acfactory.get_pseudo_configured_account()
         qr = ac1.get_setup_contact_qr()
-        assert qr.startswith("https://i.delta.chat")
+        assert qr.startswith("https://i.privittytech.com")
         res = ac2.check_qr(qr)
         assert res.is_ask_verifycontact()
         assert not res.is_ask_verifygroup()

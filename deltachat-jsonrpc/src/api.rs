@@ -1232,6 +1232,22 @@ impl CommandApi {
         Ok(receipts)
     }
 
+    // Returns subject of a requested msg_id
+    async fn get_msg_subject(&self, account_id: u32, msg_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        let message = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
+        let subject = message.get_subject().to_string();
+        Ok(subject)
+    }
+
+    // Set message subject for a given msg_id
+    async fn set_msg_subject(&self, account_id: u32, msg_id: u32, subj: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let mut message = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
+        message.set_subject(subj);
+        Ok(())
+    }
+
     /// Asks the core to start downloading a message fully.
     /// This function is typically called when the user hits the "Download" button
     /// that is shown by the UI in case `download_state` is `'Available'` or `'Failure'`
