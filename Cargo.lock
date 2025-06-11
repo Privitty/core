@@ -297,20 +297,19 @@ dependencies = [
 
 [[package]]
 name = "async-imap"
-version = "0.10.2"
+version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5488cd022c3c7bc41a9b34a540d9ac0d9c5cd42fdb106a67616521b7592d5b4e"
+checksum = "ca726c61b73c471f531b65e83e161776ba62c2b6ba4ec73d51fad357009ed00a"
 dependencies = [
  "async-channel 2.3.1",
  "async-compression",
- "base64 0.21.7",
+ "base64 0.22.1",
  "bytes",
  "chrono",
  "futures",
  "imap-proto",
  "log",
  "nom",
- "once_cell",
  "pin-project",
  "pin-utils",
  "self_cell",
@@ -2851,7 +2850,7 @@ dependencies = [
  "iana-time-zone-haiku",
  "js-sys",
  "wasm-bindgen",
- "windows-core 0.51.1",
+ "windows-core 0.52.0",
 ]
 
 [[package]]
