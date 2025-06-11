@@ -70,7 +70,7 @@ lettre_email = { git = "https://github.com/deltachat/lettre", branch = "master" 
 libc = { workspace = true }
 mailparse = "0.15"
 mime = "0.3.17"
-num_cpus = "1.16"
+num_cpus = "1.17"
 num-derive = "0.4"
 num-traits = { workspace = true }
 once_cell = { workspace = true }
