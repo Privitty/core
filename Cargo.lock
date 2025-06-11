@@ -1324,7 +1324,7 @@ dependencies = [
  "deltachat-time",
  "deltachat_derive",
  "email",
- "encoded-words",
+ "encoded-words 0.2.0 (git+https://github.com/async-email/encoded-words?branch=master)",
  "escaper",
  "fast-socks5",
  "fd-lock",
@@ -1811,11 +1811,11 @@ dependencies = [
 [[package]]
 name = "email"
 version = "0.0.20"
-source = "git+https://github.com/deltachat/rust-email?branch=master#5179cd68db44101ee3d3df7bfef96f014507352b"
+source = "git+https://github.com/deltachat/rust-email?branch=master#ba176ca31ae000203368eb9baacc7eb469fd7692"
 dependencies = [
  "base64 0.11.0",
  "chrono",
- "encoded-words",
+ "encoded-words 0.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "encoding",
  "lazy_static",
  "rand 0.7.3",
@@ -1827,6 +1827,21 @@ name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef1a6892d9eef45c8fa6b9e0086428a2cca8491aca8f787c534a3d6d0bcb3ced"
+
+[[package]]
+name = "encoded-words"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c1693107e6084e2b9444d34a985697f56c8832d314924d5cfb1fb7793154bef"
+dependencies = [
+ "base64 0.12.3",
+ "charset",
+ "encoding_rs",
+ "hex",
+ "lazy_static",
+ "regex",
+ "thiserror",
+]
 
 [[package]]
 name = "encoded-words"
@@ -2851,7 +2866,7 @@ dependencies = [
  "iana-time-zone-haiku",
  "js-sys",
  "wasm-bindgen",
- "windows-core 0.51.1",
+ "windows-core 0.52.0",
 ]
 
 [[package]]
