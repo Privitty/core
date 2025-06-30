@@ -4,22 +4,21 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use anyhow::{ensure, Context as _, Result};
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use anyhow::{Context as _, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use uuid::Uuid;
 
 #[cfg(not(target_os = "ios"))]
 use tokio::sync::oneshot;
 #[cfg(not(target_os = "ios"))]
-use tokio::time::{sleep, Duration};
+use tokio::time::{Duration, sleep};
 
 use crate::context::{Context, ContextBuilder};
 use crate::events::{Event, EventEmitter, EventType, Events};
+use crate::log::{info, warn};
 use crate::push::PushSubscriber;
 use crate::stock_str::StockStrings;
 
@@ -73,9 +72,7 @@ impl Accounts {
         let config_file = dir.join(CONFIG_NAME);
         ensure!(config_file.exists(), "{:?} does not exist", config_file);
 
-        let config = Config::from_file(config_file, writable)
-            .await
-            .context("failed to load accounts config")?;
+        let config = Config::from_file(config_file, writable).await?;
         let events = Events::new();
         let stockstrings = StockStrings::new();
         let push_subscriber = PushSubscriber::new();
@@ -306,12 +303,6 @@ impl Accounts {
     /// This is an auxiliary function and not part of public API.
     /// Use [Accounts::background_fetch] instead.
     async fn background_fetch_no_timeout(accounts: Vec<Context>, events: Events) {
-        async fn background_fetch_and_log_error(account: Context) {
-            if let Err(error) = account.background_fetch().await {
-                warn!(account, "{error:#}");
-            }
-        }
-
         events.emit(Event {
             id: 0,
             typ: EventType::Info(format!(
@@ -319,11 +310,15 @@ impl Accounts {
                 accounts.len()
             )),
         });
-        let mut futures_unordered: FuturesUnordered<_> = accounts
-            .into_iter()
-            .map(background_fetch_and_log_error)
-            .collect();
-        while futures_unordered.next().await.is_some() {}
+        let mut set = JoinSet::new();
+        for account in accounts {
+            set.spawn(async move {
+                if let Err(error) = account.background_fetch().await {
+                    warn!(account, "{error:#}");
+                }
+            });
+        }
+        set.join_all().await;
     }
 
     /// Auxiliary function for [Accounts::background_fetch].
@@ -357,7 +352,10 @@ impl Accounts {
     ///
     /// Returns a future that resolves when background fetch is done,
     /// but does not capture `&self`.
-    pub fn background_fetch(&self, timeout: std::time::Duration) -> impl Future<Output = ()> {
+    pub fn background_fetch(
+        &self,
+        timeout: std::time::Duration,
+    ) -> impl Future<Output = ()> + use<> {
         let accounts: Vec<Context> = self.accounts.values().cloned().collect();
         let events = self.events.clone();
         Self::background_fetch_with_timeout(accounts, events, timeout)
@@ -460,7 +458,11 @@ impl Config {
             rx.await?;
             Ok(())
         });
-        locked_rx.await?;
+        if locked_rx.await.is_err() {
+            bail!(
+                "Delta Chat is already running. To use Delta Chat, you must first close the existing Delta Chat process, or restart your device. (accounts.lock file is already locked)"
+            );
+        };
         Ok(Some(lock_task))
     }
 
@@ -503,11 +505,13 @@ impl Config {
     /// protects from parallel calls resulting to a wrong file contents.
     async fn sync(&mut self) -> Result<()> {
         #[cfg(not(target_os = "ios"))]
-        ensure!(!self
-            .lock_task
-            .as_ref()
-            .context("Config is read-only")?
-            .is_finished());
+        ensure!(
+            !self
+                .lock_task
+                .as_ref()
+                .context("Config is read-only")?
+                .is_finished()
+        );
 
         let tmp_path = self.file.with_extension("toml.tmp");
         let mut file = fs::File::create(&tmp_path)
@@ -965,9 +969,11 @@ mod tests {
 
         // Test that event emitter does not return `None` immediately.
         let duration = std::time::Duration::from_millis(1);
-        assert!(tokio::time::timeout(duration, event_emitter.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(duration, event_emitter.recv())
+                .await
+                .is_err()
+        );
 
         // When account manager is dropped, event emitter is exhausted.
         drop(accounts);

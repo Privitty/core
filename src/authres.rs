@@ -4,12 +4,12 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use deltachat_contact_tools::EmailAddress;
 use mailparse::MailHeaderMap;
 use mailparse::ParsedMail;
-use once_cell::sync::Lazy;
 
 use crate::config::Config;
 use crate::context::Context;
@@ -107,7 +107,8 @@ fn remove_comments(header: &str) -> Cow<'_, str> {
     // In Pomsky, this is:
     //     "(" Codepoint* lazy ")"
     // See https://playground.pomsky-lang.org/?text=%22(%22%20Codepoint*%20lazy%20%22)%22
-    static RE: Lazy<regex::Regex> = Lazy::new(|| regex::Regex::new(r"\([\s\S]*?\)").unwrap());
+    static RE: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r"\([\s\S]*?\)").unwrap());
 
     RE.replace_all(header, " ")
 }
@@ -265,7 +266,6 @@ mod tests {
 
     use super::*;
     use crate::mimeparser;
-    use crate::peerstate::Peerstate;
     use crate::test_utils::TestContext;
     use crate::test_utils::TestContextManager;
     use crate::tools;
@@ -519,41 +519,6 @@ Authentication-Results: dkim=";
         handle_authres(&t, &mail, "invalid@rom.com").await.unwrap();
     }
 
-    // Test that Autocrypt works with mailing list.
-    //
-    // Previous versions of Delta Chat ignored Autocrypt based on the List-Post header.
-    // This is not needed: comparing of the From address to Autocrypt header address is enough.
-    // If the mailing list is not rewriting the From header, Autocrypt should be applied.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_autocrypt_in_mailinglist_not_ignored() -> Result<()> {
-        let mut tcm = TestContextManager::new();
-        let alice = tcm.alice().await;
-        let bob = tcm.bob().await;
-
-        let alice_bob_chat = alice.create_chat(&bob).await;
-        let bob_alice_chat = bob.create_chat(&alice).await;
-        let mut sent = alice.send_text(alice_bob_chat.id, "hellooo").await;
-        sent.payload
-            .insert_str(0, "List-Post: <mailto:deltachat-community.example.net>\n");
-        bob.recv_msg(&sent).await;
-        let peerstate = Peerstate::from_addr(&bob, "alice@example.org").await?;
-        assert!(peerstate.is_some());
-
-        // Bob can now write encrypted to Alice:
-        let mut sent = bob
-            .send_text(bob_alice_chat.id, "hellooo in the mailinglist again")
-            .await;
-        assert!(sent.load_from_db().await.get_showpadlock());
-
-        sent.payload
-            .insert_str(0, "List-Post: <mailto:deltachat-community.example.net>\n");
-        let rcvd = alice.recv_msg(&sent).await;
-        assert!(rcvd.get_showpadlock());
-        assert_eq!(&rcvd.text, "hellooo in the mailinglist again");
-
-        Ok(())
-    }
-
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_authres_in_mailinglist_ignored() -> Result<()> {
         let mut tcm = TestContextManager::new();
@@ -583,12 +548,13 @@ Authentication-Results: dkim=";
         let rcvd = bob.recv_msg(&sent).await;
 
         // The message info should contain a warning:
-        assert!(rcvd
-            .id
-            .get_info(&bob)
-            .await
-            .unwrap()
-            .contains("DKIM Results: Passed=false"));
+        assert!(
+            rcvd.id
+                .get_info(&bob)
+                .await
+                .unwrap()
+                .contains("DKIM Results: Passed=false")
+        );
 
         Ok(())
     }

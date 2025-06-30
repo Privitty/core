@@ -43,7 +43,7 @@ Bootstrap Rust and Cargo by using rustup::
 
 Then clone the deltachat-core-rust repo::
 
-   git clone https://github.com/deltachat/deltachat-core-rust
+   git clone https://github.com/chatmail/core
    cd deltachat-core-rust
 
 To install the Delta Chat Python bindings make sure you have Python3 installed.
@@ -52,10 +52,7 @@ python3-venv` should give you a usable python installation.
 
 First, build the core library::
 
-   cargo build --release -p deltachat_ffi --features jsonrpc
-
-`jsonrpc` feature is required even if not used by the bindings
-because `deltachat.h` includes JSON-RPC functions unconditionally.
+   cargo build --release -p deltachat_ffi
 
 Create the virtual environment and activate it::
 

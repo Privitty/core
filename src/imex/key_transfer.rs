@@ -1,21 +1,22 @@
 //! # Key transfer via Autocrypt Setup Message.
-use rand::{thread_rng, Rng};
+use std::io::BufReader;
 
-use anyhow::{bail, ensure, Result};
+use rand::{Rng, thread_rng};
+
+use anyhow::{Result, bail, ensure};
 
 use crate::blob::BlobObject;
 use crate::chat::{self, ChatId};
 use crate::config::Config;
+use crate::constants::{ASM_BODY, ASM_SUBJECT};
 use crate::contact::ContactId;
 use crate::context::Context;
-use crate::imex::maybe_add_bcc_self_device_msg;
 use crate::imex::set_self_key;
-use crate::key::{load_self_secret_key, DcKey};
+use crate::key::{DcKey, load_self_secret_key};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::pgp;
-use crate::stock_str;
 use crate::tools::open_file_std;
 
 /// Initiates key transfer via Autocrypt Setup Message.
@@ -26,32 +27,29 @@ pub async fn initiate_key_transfer(context: &Context) -> Result<String> {
     /* this may require a keypair to be created. this may take a second ... */
     let setup_file_content = render_setup_file(context, &setup_code).await?;
     /* encrypting may also take a while ... */
-    let setup_file_blob = BlobObject::create(
+    let setup_file_blob = BlobObject::create_and_deduplicate_from_bytes(
         context,
-        "autocrypt-setup-message.html",
         setup_file_content.as_bytes(),
-    )
-    .await?;
+        "autocrypt-setup-message.html",
+    )?;
 
     let chat_id = ChatId::create_for_contact(context, ContactId::SELF).await?;
-    let mut msg = Message {
-        viewtype: Viewtype::File,
-        ..Default::default()
-    };
+    let mut msg = Message::new(Viewtype::File);
     msg.param.set(Param::File, setup_file_blob.as_name());
-    msg.subject = stock_str::ac_setup_msg_subject(context).await;
+    msg.param
+        .set(Param::Filename, "autocrypt-setup-message.html");
+    msg.subject = ASM_SUBJECT.to_owned();
     msg.param
         .set(Param::MimeType, "application/autocrypt-setup");
     msg.param.set_cmd(SystemMessage::AutocryptSetupMessage);
     msg.force_plaintext();
     msg.param.set_int(Param::SkipAutocrypt, 1);
 
+    // Enable BCC-self, because transferring a key
+    // means we have a multi-device setup.
+    context.set_config_bool(Config::BccSelf, true).await?;
+
     chat::send_msg(context, chat_id, &mut msg).await?;
-    // no maybe_add_bcc_self_device_msg() here.
-    // the ui shows the dialog with the setup code on this device,
-    // it would be too much noise to have two things popping up at the same time.
-    // maybe_add_bcc_self_device_msg() is called on the other device
-    // once the transfer is completed.
     Ok(setup_code)
 }
 
@@ -75,9 +73,9 @@ pub async fn continue_key_transfer(
     if let Some(filename) = msg.get_file(context) {
         let file = open_file_std(context, filename)?;
         let sc = normalize_setup_code(setup_code);
-        let armored_key = decrypt_setup_file(&sc, file).await?;
-        set_self_key(context, &armored_key, true).await?;
-        maybe_add_bcc_self_device_msg(context).await?;
+        let armored_key = decrypt_setup_file(&sc, BufReader::new(file)).await?;
+        set_self_key(context, &armored_key).await?;
+        context.set_config_bool(Config::BccSelf, true).await?;
 
         Ok(())
     } else {
@@ -100,7 +98,7 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
         true => Some(("Autocrypt-Prefer-Encrypt", "mutual")),
     };
     let private_key_asc = private_key.to_asc(ac_headers);
-    let encr = pgp::symm_encrypt(passphrase, private_key_asc.as_bytes())
+    let encr = pgp::symm_encrypt(passphrase, private_key_asc.into_bytes())
         .await?
         .replace('\n', "\r\n");
 
@@ -114,8 +112,8 @@ pub async fn render_setup_file(context: &Context, passphrase: &str) -> Result<St
     );
     let pgp_msg = encr.replace("-----BEGIN PGP MESSAGE-----", &replacement);
 
-    let msg_subj = stock_str::ac_setup_msg_subject(context).await;
-    let msg_body = stock_str::ac_setup_msg_body(context).await;
+    let msg_subj = ASM_SUBJECT;
+    let msg_body = ASM_BODY.to_string();
     let msg_body_html = msg_body.replace('\r', "").replace('\n', "<br>");
     Ok(format!(
         concat!(
@@ -143,7 +141,7 @@ fn create_setup_code(_context: &Context) -> String {
 
     for i in 0..9 {
         loop {
-            random_val = rng.gen();
+            random_val = rng.r#gen();
             if random_val as usize <= 60000 {
                 break;
             }
@@ -159,7 +157,7 @@ fn create_setup_code(_context: &Context) -> String {
     ret
 }
 
-async fn decrypt_setup_file<T: std::io::Read + std::io::Seek>(
+async fn decrypt_setup_file<T: std::fmt::Debug + std::io::BufRead + Send + 'static>(
     passphrase: &str,
     file: T,
 ) -> Result<String> {
@@ -186,9 +184,8 @@ fn normalize_setup_code(s: &str) -> String {
 mod tests {
     use super::*;
 
-    use crate::pgp::{split_armored_data, HEADER_AUTOCRYPT, HEADER_SETUPCODE};
+    use crate::pgp::{HEADER_AUTOCRYPT, HEADER_SETUPCODE, split_armored_data};
     use crate::receive_imf::receive_imf;
-    use crate::stock_str::StockMessage;
     use crate::test_utils::{TestContext, TestContextManager};
     use ::pgp::armor::BlockType;
 
@@ -214,12 +211,9 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_render_setup_file_newline_replace() {
         let t = TestContext::new_alice().await;
-        t.set_stock_translation(StockMessage::AcSetupMsgBody, "hello\r\nthere".to_string())
-            .await
-            .unwrap();
         let msg = render_setup_file(&t, "pw").await.unwrap();
         println!("{}", &msg);
-        assert!(msg.contains("<p>hello<br>there</p>"));
+        assert!(msg.contains("<p>This is the Autocrypt Setup Message used to transfer your end-to-end setup between clients.<br>"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -266,11 +260,10 @@ mod tests {
 
         assert!(!base64.is_empty());
 
-        let setup_file = S_EM_SETUPFILE.to_string();
-        let decrypted =
-            decrypt_setup_file(S_EM_SETUPCODE, std::io::Cursor::new(setup_file.as_bytes()))
-                .await
-                .unwrap();
+        let setup_file = S_EM_SETUPFILE;
+        let decrypted = decrypt_setup_file(S_EM_SETUPCODE, setup_file.as_bytes())
+            .await
+            .unwrap();
 
         let (typ, headers, _base64) = split_armored_data(decrypted.as_bytes()).unwrap();
 
@@ -286,47 +279,50 @@ mod tests {
     /// "Implementations MUST NOT use plaintext in Symmetrically Encrypted Data packets".
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_decrypt_plaintext_autocrypt_setup_message() {
-        let setup_file = S_PLAINTEXT_SETUPFILE.to_string();
+        let setup_file = S_PLAINTEXT_SETUPFILE;
         let incorrect_setupcode = "0000-0000-0000-0000-0000-0000-0000-0000-0000";
-        assert!(decrypt_setup_file(
-            incorrect_setupcode,
-            std::io::Cursor::new(setup_file.as_bytes()),
-        )
-        .await
-        .is_err());
+        assert!(
+            decrypt_setup_file(incorrect_setupcode, setup_file.as_bytes(),)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_key_transfer() -> Result<()> {
-        let alice = TestContext::new_alice().await;
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
 
-        let setup_code = initiate_key_transfer(&alice).await?;
+        tcm.section("Alice sends Autocrypt setup message");
+        alice.set_config(Config::BccSelf, Some("0")).await?;
+        let setup_code = initiate_key_transfer(alice).await?;
+
+        // Test that sending Autocrypt Setup Message enables `bcc_self`.
+        assert_eq!(alice.get_config_bool(Config::BccSelf).await?, true);
 
         // Get Autocrypt Setup Message.
         let sent = alice.pop_sent_msg().await;
 
-        // Alice sets up a second device.
-        let alice2 = TestContext::new().await;
+        tcm.section("Alice sets up a second device");
+        let alice2 = &tcm.unconfigured().await;
         alice2.set_name("alice2");
         alice2.configure_addr("alice@example.org").await;
         alice2.recv_msg(&sent).await;
         let msg = alice2.get_last_msg().await;
         assert!(msg.is_setupmessage());
-
-        // Send a message that cannot be decrypted because the keys are
-        // not synchronized yet.
-        let sent = alice2.send_text(msg.chat_id, "Test").await;
-        let trashed_message = alice.recv_msg_opt(&sent).await;
-        assert!(trashed_message.is_none());
-        assert_ne!(alice.get_last_msg().await.get_text(), "Test");
+        assert_eq!(crate::key::load_self_secret_keyring(alice2).await?.len(), 0);
 
         // Transfer the key.
-        continue_key_transfer(&alice2, msg.id, &setup_code).await?;
+        tcm.section("Alice imports a key from Autocrypt Setup Message");
+        alice2.set_config(Config::BccSelf, Some("0")).await?;
+        continue_key_transfer(alice2, msg.id, &setup_code).await?;
+        assert_eq!(alice2.get_config_bool(Config::BccSelf).await?, true);
+        assert_eq!(crate::key::load_self_secret_keyring(alice2).await?.len(), 1);
 
         // Alice sends a message to self from the new device.
         let sent = alice2.send_text(msg.chat_id, "Test").await;
-        alice.recv_msg(&sent).await;
-        assert_eq!(alice.get_last_msg().await.get_text(), "Test");
+        let rcvd_msg = alice.recv_msg(&sent).await;
+        assert_eq!(rcvd_msg.get_text(), "Test");
 
         Ok(())
     }

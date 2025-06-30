@@ -3,12 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
-use rusqlite::{config::DbConfig, types::ValueRef, Connection, OpenFlags, Row};
+use anyhow::{Context as _, Result, bail};
+use rusqlite::{Connection, OpenFlags, Row, config::DbConfig, types::ValueRef};
 use tokio::sync::RwLock;
 
 use crate::blob::BlobObject;
-use crate::chat::{self, add_device_msg, update_device_icon, update_saved_messages_icon};
+use crate::chat::add_device_msg;
 use crate::config::Config;
 use crate::constants::DC_CHAT_ID_TRASH;
 use crate::context::Context;
@@ -16,14 +16,14 @@ use crate::debug_logging::set_debug_logging_xdc;
 use crate::ephemeral::start_ephemeral_timers;
 use crate::imex::BLOBS_BACKUP_NAME;
 use crate::location::delete_orphaned_poi_locations;
-use crate::log::LogExt;
+use crate::log::{LogExt, error, info, warn};
 use crate::message::{Message, MsgId};
 use crate::net::dns::prune_dns_cache;
+use crate::net::http::http_cache_cleanup;
 use crate::net::prune_connection_history;
 use crate::param::{Param, Params};
-use crate::peerstate::Peerstate;
 use crate::stock_str;
-use crate::tools::{delete_file, time, SystemTime};
+use crate::tools::{SystemTime, delete_file, time};
 
 /// Extension to [`rusqlite::ToSql`] trait
 /// which also includes [`Send`] and [`Sync`].
@@ -41,12 +41,6 @@ macro_rules! params_slice {
     ($($param:expr),+) => {
         [$(&$param as &dyn $crate::sql::ToSql),+]
     };
-}
-
-pub(crate) fn params_iter(
-    iter: &[impl crate::sql::ToSql],
-) -> impl Iterator<Item = &dyn crate::sql::ToSql> {
-    iter.iter().map(|item| item as &dyn crate::sql::ToSql)
 }
 
 mod migrations;
@@ -196,7 +190,19 @@ impl Sql {
     async fn try_open(&self, context: &Context, dbfile: &Path, passphrase: String) -> Result<()> {
         *self.pool.write().await = Some(Self::new_pool(dbfile, passphrase.to_string())?);
 
-        self.run_migrations(context).await?;
+        if let Err(e) = self.run_migrations(context).await {
+            error!(context, "Running migrations failed: {e:#}");
+            // Emiting an error event probably doesn't work
+            // because we are in the process of opening the context,
+            // so there is no event emitter yet.
+            // So, try to report the error in other ways:
+            eprintln!("Running migrations failed: {e:#}");
+            context.set_migration_error(&format!("Updating Delta Chat failed. Please send this message to the Delta Chat developers, either at delta@merlinux.eu or at https://support.delta.chat.\n\n{e:#}"));
+            // We can't simply close the db for two reasons:
+            // a. backup export would fail
+            // b. The UI would think that the account is unconfigured (because `is_configured()` fails)
+            // and remove the account when the user presses "Back"
+        }
 
         Ok(())
     }
@@ -207,40 +213,13 @@ impl Sql {
         // this should be done before updates that use high-level objects that
         // rely themselves on the low-level structure.
 
-        let (recalc_fingerprints, update_icons, disable_server_delete, recode_avatar) =
-            migrations::run(context, self)
-                .await
-                .context("failed to run migrations")?;
+        // `update_icons` is not used anymore, since it's not necessary anymore to "update" icons:
+        let (_update_icons, disable_server_delete, recode_avatar) = migrations::run(context, self)
+            .await
+            .context("failed to run migrations")?;
 
         // (2) updates that require high-level objects
         // the structure is complete now and all objects are usable
-
-        if recalc_fingerprints {
-            info!(context, "[migration] recalc fingerprints");
-            let addrs = self
-                .query_map(
-                    "SELECT addr FROM acpeerstates;",
-                    (),
-                    |row| row.get::<_, String>(0),
-                    |addrs| {
-                        addrs
-                            .collect::<std::result::Result<Vec<_>, _>>()
-                            .map_err(Into::into)
-                    },
-                )
-                .await?;
-            for addr in &addrs {
-                if let Some(ref mut peerstate) = Peerstate::from_addr(context, addr).await? {
-                    peerstate.recalc_fingerprint();
-                    peerstate.save_to_db(self).await?;
-                }
-            }
-        }
-
-        if update_icons {
-            update_saved_messages_icon(context).await?;
-            update_device_icon(context).await?;
-        }
 
         if disable_server_delete {
             // We now always watch all folders and delete messages there if delete_server is enabled.
@@ -256,12 +235,16 @@ impl Sql {
 
         if recode_avatar {
             if let Some(avatar) = context.get_config(Config::Selfavatar).await? {
-                let mut blob = BlobObject::new_from_path(context, avatar.as_ref()).await?;
+                let mut blob = BlobObject::from_path(context, Path::new(&avatar))?;
                 match blob.recode_to_avatar_size(context).await {
                     Ok(()) => {
-                        context
-                            .set_config_internal(Config::Selfavatar, Some(&avatar))
-                            .await?
+                        if let Some(path) = blob.to_abs_path().to_str() {
+                            context
+                                .set_config_internal(Config::Selfavatar, Some(path))
+                                .await?;
+                        } else {
+                            warn!(context, "Setting selfavatar failed: non-UTF-8 filename");
+                        }
                     }
                     Err(e) => {
                         warn!(context, "Migrations can't recode avatar, removing. {:#}", e);
@@ -288,10 +271,7 @@ impl Sql {
         }
 
         let passphrase_nonempty = !passphrase.is_empty();
-        if let Err(err) = self.try_open(context, &self.dbfile, passphrase).await {
-            self.close().await;
-            return Err(err);
-        }
+        self.try_open(context, &self.dbfile, passphrase).await?;
         info!(context, "Opened database {:?}.", self.dbfile);
         *self.is_encrypted.write().await = Some(passphrase_nonempty);
 
@@ -302,10 +282,6 @@ impl Sql {
         {
             set_debug_logging_xdc(context, Some(MsgId::new(xdc_id))).await?;
         }
-        chat::resume_securejoin_wait(context)
-            .await
-            .log_err(context)
-            .ok();
         Ok(())
     }
 
@@ -440,7 +416,7 @@ impl Sql {
         .await
     }
 
-    /// Execute the function inside a transaction assuming that it does write queries.
+    /// Execute the function inside a transaction assuming that it does writes.
     ///
     /// If the function returns an error, the transaction will be rolled back. If it does not return an
     /// error, the transaction will be committed.
@@ -449,7 +425,30 @@ impl Sql {
         H: Send + 'static,
         G: Send + FnOnce(&mut rusqlite::Transaction<'_>) -> Result<H>,
     {
-        self.call_write(move |conn| {
+        let query_only = false;
+        self.transaction_ex(query_only, callback).await
+    }
+
+    /// Execute the function inside a transaction.
+    ///
+    /// * `query_only` - Whether the function only executes read statements (queries) and can be run
+    ///   in parallel with other transactions. NB: Creating and modifying temporary tables are also
+    ///   allowed with `query_only`, temporary tables aren't visible in other connections, but you
+    ///   need to pass `PRAGMA query_only=0;` to SQLite before that:
+    ///   ```text
+    ///   pragma_update(None, "query_only", "0")
+    ///   ```
+    ///   Also temporary tables need to be dropped because the connection is returned to the pool
+    ///   then.
+    ///
+    /// If the function returns an error, the transaction will be rolled back. If it does not return
+    /// an error, the transaction will be committed.
+    pub async fn transaction_ex<G, H>(&self, query_only: bool, callback: G) -> Result<H>
+    where
+        H: Send + 'static,
+        G: Send + FnOnce(&mut rusqlite::Transaction<'_>) -> Result<H>,
+    {
+        self.call(query_only, move |conn| {
             let mut transaction = conn.transaction()?;
             let ret = callback(&mut transaction);
 
@@ -720,6 +719,12 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         warn!(context, "Can't set config: {e:#}.");
     }
 
+    http_cache_cleanup(context)
+        .await
+        .context("Failed to cleanup HTTP cache")
+        .log_err(context)
+        .ok();
+
     if let Err(err) = remove_unused_files(context).await {
         warn!(
             context,
@@ -846,6 +851,22 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
         .await
         .context("housekeeping: failed to SELECT value FROM config")?;
 
+    context
+        .sql
+        .query_map(
+            "SELECT blobname FROM http_cache",
+            (),
+            |row| row.get::<_, String>(0),
+            |rows| {
+                for row in rows {
+                    maybe_add_file(&mut files_in_use, &row?);
+                }
+                Ok(())
+            },
+        )
+        .await
+        .context("Failed to SELECT blobname FROM http_cache")?;
+
     info!(context, "{} files in use.", files_in_use.len());
     /* go through directories and delete unused files */
     let blobdir = context.get_blobdir();
@@ -864,49 +885,57 @@ pub async fn remove_unused_files(context: &Context) -> Result<()> {
 
                     if p == blobdir
                         && (is_file_in_use(&files_in_use, None, &name_s)
-                            || is_file_in_use(&files_in_use, Some(".increation"), &name_s)
                             || is_file_in_use(&files_in_use, Some(".waveform"), &name_s)
                             || is_file_in_use(&files_in_use, Some("-preview.jpg"), &name_s))
                     {
                         continue;
                     }
 
-                    if let Ok(stats) = tokio::fs::metadata(entry.path()).await {
-                        if stats.is_dir() {
-                            if let Err(e) = tokio::fs::remove_dir(entry.path()).await {
-                                // The dir could be created not by a user, but by a desktop
-                                // environment f.e. So, no warning.
-                                info!(
-                                    context,
-                                    "Housekeeping: Cannot rmdir {}: {:#}.",
-                                    entry.path().display(),
-                                    e
-                                );
-                            }
-                            continue;
-                        }
-                        unreferenced_count += 1;
-                        let recently_created =
-                            stats.created().is_ok_and(|t| t > keep_files_newer_than);
-                        let recently_modified =
-                            stats.modified().is_ok_and(|t| t > keep_files_newer_than);
-                        let recently_accessed =
-                            stats.accessed().is_ok_and(|t| t > keep_files_newer_than);
-
-                        if p == blobdir
-                            && (recently_created || recently_modified || recently_accessed)
-                        {
-                            info!(
+                    let stats = match tokio::fs::metadata(entry.path()).await {
+                        Err(err) => {
+                            warn!(
                                 context,
-                                "Housekeeping: Keeping new unreferenced file #{}: {:?}.",
-                                unreferenced_count,
-                                entry.file_name(),
+                                "Cannot get metadata for {}: {:#}.",
+                                entry.path().display(),
+                                err
                             );
                             continue;
                         }
-                    } else {
-                        unreferenced_count += 1;
+                        Ok(stats) => stats,
+                    };
+
+                    if stats.is_dir() {
+                        if let Err(e) = tokio::fs::remove_dir(entry.path()).await {
+                            // The dir could be created not by a user, but by a desktop
+                            // environment f.e. So, no warning.
+                            info!(
+                                context,
+                                "Housekeeping: Cannot rmdir {}: {:#}.",
+                                entry.path().display(),
+                                e
+                            );
+                        }
+                        continue;
                     }
+
+                    unreferenced_count += 1;
+                    let recently_created = stats.created().is_ok_and(|t| t > keep_files_newer_than);
+                    let recently_modified =
+                        stats.modified().is_ok_and(|t| t > keep_files_newer_than);
+                    let recently_accessed =
+                        stats.accessed().is_ok_and(|t| t > keep_files_newer_than);
+
+                    if p == blobdir && (recently_created || recently_modified || recently_accessed)
+                    {
+                        info!(
+                            context,
+                            "Housekeeping: Keeping new unreferenced file #{}: {:?}.",
+                            unreferenced_count,
+                            entry.file_name(),
+                        );
+                        continue;
+                    }
+
                     info!(
                         context,
                         "Housekeeping: Deleting unreferenced file #{}: {:?}.",
@@ -1002,388 +1031,5 @@ async fn prune_tombstones(sql: &Sql) -> Result<()> {
     Ok(())
 }
 
-/// Helper function to return comma-separated sequence of `?` chars.
-///
-/// Use this together with [`rusqlite::ParamsFromIter`] to use dynamically generated
-/// parameter lists.
-pub fn repeat_vars(count: usize) -> String {
-    let mut s = "?,".repeat(count);
-    s.pop(); // Remove trailing comma
-    s
-}
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::{test_utils::TestContext, EventType};
-
-    #[test]
-    fn test_maybe_add_file() {
-        let mut files = Default::default();
-        maybe_add_file(&mut files, "$BLOBDIR/hello");
-        maybe_add_file(&mut files, "$BLOBDIR/world.txt");
-        maybe_add_file(&mut files, "world2.txt");
-        maybe_add_file(&mut files, "$BLOBDIR");
-
-        assert!(files.contains("hello"));
-        assert!(files.contains("world.txt"));
-        assert!(!files.contains("world2.txt"));
-        assert!(!files.contains("$BLOBDIR"));
-    }
-
-    #[test]
-    fn test_is_file_in_use() {
-        let mut files = Default::default();
-        maybe_add_file(&mut files, "$BLOBDIR/hello");
-        maybe_add_file(&mut files, "$BLOBDIR/world.txt");
-        maybe_add_file(&mut files, "world2.txt");
-
-        assert!(is_file_in_use(&files, None, "hello"));
-        assert!(!is_file_in_use(&files, Some(".txt"), "hello"));
-        assert!(is_file_in_use(&files, Some("-suffix"), "world.txt-suffix"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_table_exists() {
-        let t = TestContext::new().await;
-        assert!(t.ctx.sql.table_exists("msgs").await.unwrap());
-        assert!(!t.ctx.sql.table_exists("foobar").await.unwrap());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_col_exists() {
-        let t = TestContext::new().await;
-        assert!(t.ctx.sql.col_exists("msgs", "mime_modified").await.unwrap());
-        assert!(!t.ctx.sql.col_exists("msgs", "foobar").await.unwrap());
-        assert!(!t.ctx.sql.col_exists("foobar", "foobar").await.unwrap());
-    }
-
-    /// Tests that auto_vacuum is enabled for new databases.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_auto_vacuum() -> Result<()> {
-        let t = TestContext::new().await;
-
-        let query_only = true;
-        let auto_vacuum = t
-            .sql
-            .call(query_only, |conn| {
-                let auto_vacuum = conn.pragma_query_value(None, "auto_vacuum", |row| {
-                    let auto_vacuum: i32 = row.get(0)?;
-                    Ok(auto_vacuum)
-                })?;
-                Ok(auto_vacuum)
-            })
-            .await?;
-
-        // auto_vacuum=2 is the same as auto_vacuum=INCREMENTAL
-        assert_eq!(auto_vacuum, 2);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_housekeeping_db_closed() {
-        let t = TestContext::new().await;
-
-        let avatar_src = t.dir.path().join("avatar.png");
-        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
-        tokio::fs::write(&avatar_src, avatar_bytes).await.unwrap();
-        t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
-            .await
-            .unwrap();
-
-        let event_source = t.get_event_emitter();
-
-        let a = t.get_config(Config::Selfavatar).await.unwrap().unwrap();
-        assert_eq!(avatar_bytes, &tokio::fs::read(&a).await.unwrap()[..]);
-
-        t.sql.close().await;
-        housekeeping(&t).await.unwrap(); // housekeeping should emit warnings but not fail
-        t.sql.open(&t, "".to_string()).await.unwrap();
-
-        let a = t.get_config(Config::Selfavatar).await.unwrap().unwrap();
-        assert_eq!(avatar_bytes, &tokio::fs::read(&a).await.unwrap()[..]);
-
-        while let Ok(event) = event_source.try_recv() {
-            match event.typ {
-                EventType::Info(s) => assert!(
-                    !s.contains("Keeping new unreferenced file"),
-                    "File {s} was almost deleted, only reason it was kept is that it was created recently (as the tests don't run for a long time)"
-                ),
-                EventType::Error(s) => panic!("{}", s),
-                _ => {}
-            }
-        }
-    }
-
-    /// Regression test for a bug where housekeeping deleted drafts since their
-    /// `hidden` flag is set.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_housekeeping_dont_delete_drafts() {
-        let t = TestContext::new_alice().await;
-
-        let chat = t.create_chat_with_contact("bob", "bob@example.com").await;
-        let mut new_draft = Message::new_text("This is my draft".to_string());
-        chat.id.set_draft(&t, Some(&mut new_draft)).await.unwrap();
-
-        housekeeping(&t).await.unwrap();
-
-        let loaded_draft = chat.id.get_draft(&t).await.unwrap();
-        assert_eq!(loaded_draft.unwrap().text, "This is my draft");
-    }
-
-    /// Tests that `housekeeping` deletes the blobs backup dir which is created normally by
-    /// `imex::import_backup`.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_housekeeping_delete_blobs_backup_dir() {
-        let t = TestContext::new_alice().await;
-        let dir = t.get_blobdir().join(BLOBS_BACKUP_NAME);
-        tokio::fs::create_dir(&dir).await.unwrap();
-        tokio::fs::write(dir.join("f"), "").await.unwrap();
-        housekeeping(&t).await.unwrap();
-        tokio::fs::create_dir(&dir).await.unwrap();
-    }
-
-    /// Regression test.
-    ///
-    /// Previously the code checking for existence of `config` table
-    /// checked it with `PRAGMA table_info("config")` but did not
-    /// drain `SqlitePool.fetch` result, only using the first row
-    /// returned. As a result, prepared statement for `PRAGMA` was not
-    /// finalized early enough, leaving reader connection in a broken
-    /// state after reopening the database, when `config` table
-    /// existed and `PRAGMA` returned non-empty result.
-    ///
-    /// Statements were not finalized due to a bug in sqlx:
-    /// <https://github.com/launchbadge/sqlx/issues/1147>
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_db_reopen() -> Result<()> {
-        use tempfile::tempdir;
-
-        // The context is used only for logging.
-        let t = TestContext::new().await;
-
-        // Create a separate empty database for testing.
-        let dir = tempdir()?;
-        let dbfile = dir.path().join("testdb.sqlite");
-        let sql = Sql::new(dbfile);
-
-        // Create database with all the tables.
-        sql.open(&t, "".to_string()).await.unwrap();
-        sql.close().await;
-
-        // Reopen the database
-        sql.open(&t, "".to_string()).await?;
-        sql.execute(
-            "INSERT INTO config (keyname, value) VALUES (?, ?);",
-            ("foo", "bar"),
-        )
-        .await?;
-
-        let value: Option<String> = sql
-            .query_get_value("SELECT value FROM config WHERE keyname=?;", ("foo",))
-            .await?;
-        assert_eq!(value.unwrap(), "bar");
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_migration_flags() -> Result<()> {
-        let t = TestContext::new().await;
-        t.evtracker.get_info_contains("Opened database").await;
-
-        // as migrations::run() was already executed on context creation,
-        // another call should not result in any action needed.
-        // this test catches some bugs where dbversion was forgotten to be persisted.
-        let (recalc_fingerprints, update_icons, disable_server_delete, recode_avatar) =
-            migrations::run(&t, &t.sql).await?;
-        assert!(!recalc_fingerprints);
-        assert!(!update_icons);
-        assert!(!disable_server_delete);
-        assert!(!recode_avatar);
-
-        info!(&t, "test_migration_flags: XXX END MARKER");
-
-        loop {
-            let evt = t
-                .evtracker
-                .get_matching(|evt| matches!(evt, EventType::Info(_)))
-                .await;
-            match evt {
-                EventType::Info(msg) => {
-                    assert!(
-                        !msg.contains("[migration]"),
-                        "Migrations were run twice, you probably forgot to update the db version"
-                    );
-                    if msg.contains("test_migration_flags: XXX END MARKER") {
-                        break;
-                    }
-                }
-                _ => unreachable!(),
-            }
-        }
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_check_passphrase() -> Result<()> {
-        use tempfile::tempdir;
-
-        // The context is used only for logging.
-        let t = TestContext::new().await;
-
-        // Create a separate empty database for testing.
-        let dir = tempdir()?;
-        let dbfile = dir.path().join("testdb.sqlite");
-        let sql = Sql::new(dbfile.clone());
-
-        sql.check_passphrase("foo".to_string()).await?;
-        sql.open(&t, "foo".to_string())
-            .await
-            .context("failed to open the database first time")?;
-        sql.close().await;
-
-        // Reopen the database
-        let sql = Sql::new(dbfile);
-
-        // Test that we can't open encrypted database without a passphrase.
-        assert!(sql.open(&t, "".to_string()).await.is_err());
-
-        // Now open the database with passpharse, it should succeed.
-        sql.check_passphrase("foo".to_string()).await?;
-        sql.open(&t, "foo".to_string())
-            .await
-            .context("failed to open the database second time")?;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_sql_change_passphrase() -> Result<()> {
-        use tempfile::tempdir;
-
-        // The context is used only for logging.
-        let t = TestContext::new().await;
-
-        // Create a separate empty database for testing.
-        let dir = tempdir()?;
-        let dbfile = dir.path().join("testdb.sqlite");
-        let sql = Sql::new(dbfile.clone());
-
-        sql.open(&t, "foo".to_string())
-            .await
-            .context("failed to open the database first time")?;
-        sql.close().await;
-
-        // Change the passphrase from "foo" to "bar".
-        let sql = Sql::new(dbfile.clone());
-        sql.open(&t, "foo".to_string())
-            .await
-            .context("failed to open the database second time")?;
-        sql.change_passphrase("bar".to_string())
-            .await
-            .context("failed to change passphrase")?;
-
-        // Test that at least two connections are still working.
-        // This ensures that not only the connection which changed the password is working,
-        // but other connections as well.
-        {
-            let lock = sql.pool.read().await;
-            let pool = lock.as_ref().unwrap();
-            let query_only = true;
-            let conn1 = pool.get(query_only).await?;
-            let conn2 = pool.get(query_only).await?;
-            conn1
-                .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
-                .unwrap();
-            conn2
-                .query_row("SELECT count(*) FROM sqlite_master", [], |_row| Ok(()))
-                .unwrap();
-        }
-
-        sql.close().await;
-
-        let sql = Sql::new(dbfile);
-
-        // Test that old passphrase is not working.
-        assert!(sql.open(&t, "foo".to_string()).await.is_err());
-
-        // Open the database with the new passphrase.
-        sql.check_passphrase("bar".to_string()).await?;
-        sql.open(&t, "bar".to_string())
-            .await
-            .context("failed to open the database third time")?;
-        sql.close().await;
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_query_only() -> Result<()> {
-        let t = TestContext::new().await;
-
-        // `query_row` does not acquire write lock
-        // and operates on read-only connection.
-        // Using it to `INSERT` should fail.
-        let res = t
-            .sql
-            .query_row(
-                "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 1",
-                ("xyz", "ijk"),
-                |row| {
-                    let res: u32 = row.get(0)?;
-                    Ok(res)
-                },
-            )
-            .await;
-        assert!(res.is_err());
-
-        // If you want to `INSERT` and get value via `RETURNING`,
-        // use `call_write` or `transaction`.
-
-        let res: Result<u32> = t
-            .sql
-            .call_write(|conn| {
-                let val = conn.query_row(
-                    "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 2",
-                    ("foo", "bar"),
-                    |row| {
-                        let res: u32 = row.get(0)?;
-                        Ok(res)
-                    },
-                )?;
-                Ok(val)
-            })
-            .await;
-        assert_eq!(res.unwrap(), 2);
-
-        let res = t
-            .sql
-            .transaction(|t| {
-                let val = t.query_row(
-                    "INSERT INTO config (keyname, value) VALUES (?, ?) RETURNING 3",
-                    ("abc", "def"),
-                    |row| {
-                        let res: u32 = row.get(0)?;
-                        Ok(res)
-                    },
-                )?;
-                Ok(val)
-            })
-            .await;
-        assert_eq!(res.unwrap(), 3);
-
-        Ok(())
-    }
-
-    /// Tests that incremental_vacuum does not fail.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_incremental_vacuum() -> Result<()> {
-        let t = TestContext::new().await;
-
-        incremental_vacuum(&t).await?;
-
-        Ok(())
-    }
-}
+mod sql_tests;

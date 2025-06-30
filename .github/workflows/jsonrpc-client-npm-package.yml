@@ -4,10 +4,12 @@ on:
   release:
     types: [published]
 
+permissions: {}
+
 jobs:
   pack-module:
     name: "Publish @deltachat/jsonrpc-client"
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
@@ -15,6 +17,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
 
       - uses: actions/setup-node@v4
         with:

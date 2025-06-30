@@ -12,6 +12,8 @@ on:
     branches:
       - main
 
+permissions: {}
+
 jobs:
   format:
     name: check flake formatting
@@ -20,8 +22,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix fmt
 
       # Check that formatting does not change anything.
@@ -53,7 +55,9 @@ jobs:
           - deltachat-rpc-server-aarch64-linux
           - deltachat-rpc-server-aarch64-linux-wheel
           - deltachat-rpc-server-arm64-v8a-android
+          - deltachat-rpc-server-arm64-v8a-android-wheel
           - deltachat-rpc-server-armeabi-v7a-android
+          - deltachat-rpc-server-armeabi-v7a-android-wheel
           - deltachat-rpc-server-armv6l-linux
           - deltachat-rpc-server-armv6l-linux-wheel
           - deltachat-rpc-server-armv7l-linux
@@ -80,8 +84,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix build .#${{ matrix.installable }}
 
   build-macos:
@@ -91,14 +95,15 @@ jobs:
       fail-fast: false
       matrix:
         installable:
-          - deltachat-rpc-server-aarch64-darwin
+          - deltachat-rpc-server
 
           # Fails to bulid
+          # - deltachat-rpc-server-aarch64-darwin
           # - deltachat-rpc-server-x86_64-darwin
     steps:
       - uses: actions/checkout@v4
         with:
           show-progress: false
+          persist-credentials: false
       - uses: DeterminateSystems/nix-installer-action@main
-      - uses: DeterminateSystems/magic-nix-cache-action@main
       - run: nix build .#${{ matrix.installable }}

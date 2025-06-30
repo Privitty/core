@@ -48,8 +48,7 @@ def test_delivery_status(acfactory: ACFactory) -> None:
     """
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
 
     alice.clear_all_events()
@@ -119,8 +118,7 @@ def test_download_on_demand(acfactory: ACFactory) -> None:
     """
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("hi")
 
@@ -150,18 +148,13 @@ def test_download_on_demand(acfactory: ACFactory) -> None:
 def get_multi_account_test_setup(acfactory: ACFactory) -> [Account, Account, Account]:
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("hi")
 
     bob.wait_for_incoming_msg_event()
 
-    alice_second_device: Account = acfactory.get_unconfigured_account()
-
-    alice._rpc.provide_backup.future(alice.id)
-    backup_code = alice._rpc.get_backup_qr(alice.id)
-    alice_second_device._rpc.get_backup(alice_second_device.id, backup_code)
+    alice_second_device = alice.clone()
     alice_second_device.start_io()
     alice.clear_all_events()
     alice_second_device.clear_all_events()

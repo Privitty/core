@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context as _, Result};
+use anyhow::{Context as _, Result, anyhow};
 use async_imap::types::{Quota, QuotaResource};
 
 use crate::chat::add_device_msg_with_importance;
@@ -11,9 +11,10 @@ use crate::config::Config;
 use crate::context::Context;
 use crate::imap::scan_folders::get_watched_folders;
 use crate::imap::session::Session as ImapSession;
+use crate::log::warn;
 use crate::message::Message;
 use crate::tools::{self, time_elapsed};
-use crate::{stock_str, EventType};
+use crate::{EventType, stock_str};
 
 /// warn about a nearly full mailbox after this usage percentage is reached.
 /// quota icon is "yellow".
@@ -187,7 +188,7 @@ mod tests {
         Ok(())
     }
 
-    #[allow(clippy::assertions_on_constants)]
+    #[expect(clippy::assertions_on_constants)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_quota_thresholds() -> anyhow::Result<()> {
         assert!(QUOTA_ALLCLEAR_PERCENTAGE > 50);

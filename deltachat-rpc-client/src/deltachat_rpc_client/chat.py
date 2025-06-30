@@ -1,3 +1,5 @@
+"""Chat module."""
+
 from __future__ import annotations
 
 import calendar
@@ -89,7 +91,8 @@ class Chat:
     def set_ephemeral_timer(self, timer: int) -> None:
         """Set ephemeral timer of this chat in seconds.
 
-        0 means the timer is disabled, use 1 for immediate deletion."""
+        0 means the timer is disabled, use 1 for immediate deletion.
+        """
         self._rpc.set_chat_ephemeral_timer(self.account.id, self.id, timer)
 
     def get_encryption_info(self) -> str:
@@ -124,6 +127,7 @@ class Chat:
         html: Optional[str] = None,
         viewtype: Optional[ViewType] = None,
         file: Optional[str] = None,
+        filename: Optional[str] = None,
         location: Optional[tuple[float, float]] = None,
         override_sender_name: Optional[str] = None,
         quoted_msg: Optional[Union[int, Message]] = None,
@@ -137,6 +141,7 @@ class Chat:
             "html": html,
             "viewtype": viewtype,
             "file": file,
+            "filename": filename,
             "location": location,
             "overrideSenderName": override_sender_name,
             "quotedMessageId": quoted_msg,
@@ -172,13 +177,14 @@ class Chat:
         self,
         text: Optional[str] = None,
         file: Optional[str] = None,
+        filename: Optional[str] = None,
         quoted_msg: Optional[int] = None,
         viewtype: Optional[str] = None,
     ) -> None:
         """Set draft message."""
         if isinstance(quoted_msg, Message):
             quoted_msg = quoted_msg.id
-        self._rpc.misc_set_draft(self.account.id, self.id, text, file, quoted_msg, viewtype)
+        self._rpc.misc_set_draft(self.account.id, self.id, text, file, filename, quoted_msg, viewtype)
 
     def remove_draft(self) -> None:
         """Remove draft message."""
@@ -196,12 +202,12 @@ class Chat:
         return snapshot
 
     def get_messages(self, info_only: bool = False, add_daymarker: bool = False) -> list[Message]:
-        """get the list of messages in this chat."""
+        """Get the list of messages in this chat."""
         msgs = self._rpc.get_message_ids(self.account.id, self.id, info_only, add_daymarker)
         return [Message(self.account, msg_id) for msg_id in msgs]
 
     def get_fresh_message_count(self) -> int:
-        """Get number of fresh messages in this chat"""
+        """Get number of fresh messages in this chat."""
         return self._rpc.get_fresh_msg_cnt(self.account.id, self.id)
 
     def mark_noticed(self) -> None:
@@ -237,6 +243,11 @@ class Chat:
         """
         contacts = self._rpc.get_chat_contacts(self.account.id, self.id)
         return [Contact(self.account, contact_id) for contact_id in contacts]
+
+    def get_past_contacts(self) -> list[Contact]:
+        """Get past contacts for this chat."""
+        past_contacts = self._rpc.get_past_chat_contacts(self.account.id, self.id)
+        return [Contact(self.account, contact_id) for contact_id in past_contacts]
 
     def set_image(self, path: str) -> None:
         """Set profile image of this chat.

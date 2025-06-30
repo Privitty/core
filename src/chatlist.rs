@@ -1,15 +1,16 @@
 //! # Chat list module.
 
-use anyhow::{ensure, Context as _, Result};
-use once_cell::sync::Lazy;
+use anyhow::{Context as _, Result, ensure};
+use std::sync::LazyLock;
 
-use crate::chat::{update_special_chat_names, Chat, ChatId, ChatVisibility};
+use crate::chat::{Chat, ChatId, ChatVisibility, update_special_chat_names};
 use crate::constants::{
     Blocked, Chattype, DC_CHAT_ID_ALLDONE_HINT, DC_CHAT_ID_ARCHIVED_LINK, DC_GCL_ADD_ALLDONE_HINT,
     DC_GCL_ARCHIVED_ONLY, DC_GCL_FOR_FORWARDING, DC_GCL_NO_SPECIALS,
 };
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
+use crate::log::warn;
 use crate::message::{Message, MessageState, MsgId};
 use crate::param::{Param, Params};
 use crate::stock_str;
@@ -17,8 +18,8 @@ use crate::summary::Summary;
 use crate::tools::IsNoneOrEmpty;
 
 /// Regex to find out if a query should filter by unread messages.
-pub static IS_UNREAD_FILTER: Lazy<regex::Regex> =
-    Lazy::new(|| regex::Regex::new(r"\bis:unread\b").unwrap());
+pub static IS_UNREAD_FILTER: LazyLock<regex::Regex> =
+    LazyLock::new(|| regex::Regex::new(r"\bis:unread\b").unwrap());
 
 /// An object representing a single chatlist in memory.
 ///
@@ -144,7 +145,7 @@ impl Chatlist {
                                   ORDER BY timestamp DESC, id DESC LIMIT 1)
                  WHERE c.id>9
                    AND c.blocked!=1
-                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2)
+                   AND c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?2 AND add_timestamp >= remove_timestamp)
                  GROUP BY c.id
                  ORDER BY c.archived=?3 DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
                 (MessageState::OutDraft, query_contact_id, ChatVisibility::Pinned),
@@ -261,7 +262,7 @@ impl Chatlist {
                      WHERE c.id>9 AND c.id!=?
                        AND c.blocked=0
                        AND NOT c.archived=?
-                       AND (c.type!=? OR c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=?))
+                       AND (c.type!=? OR c.id IN(SELECT chat_id FROM chats_contacts WHERE contact_id=? AND add_timestamp >= remove_timestamp))
                      GROUP BY c.id
                      ORDER BY c.id=? DESC, c.archived=? DESC, IFNULL(m.timestamp,c.created_timestamp) DESC, m.id DESC;",
                     (
@@ -322,7 +323,7 @@ impl Chatlist {
                     (chat_id, MessageState::OutDraft),
                 )
                 .await
-                .with_context(|| format!("failed to get msg ID for chat {}", chat_id))?;
+                .with_context(|| format!("failed to get msg ID for chat {chat_id}"))?;
             ids.push((chat_id, msg_id));
         }
         Ok(Chatlist { ids })
@@ -407,16 +408,17 @@ impl Chatlist {
         let lastcontact = if let Some(lastmsg) = &lastmsg {
             if lastmsg.from_id == ContactId::SELF {
                 None
+            } else if chat.typ == Chattype::Group
+                || chat.typ == Chattype::Broadcast
+                || chat.typ == Chattype::Mailinglist
+                || chat.is_self_talk()
+            {
+                let lastcontact = Contact::get_by_id(context, lastmsg.from_id)
+                    .await
+                    .context("loading contact failed")?;
+                Some(lastcontact)
             } else {
-                match chat.typ {
-                    Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
-                        let lastcontact = Contact::get_by_id(context, lastmsg.from_id)
-                            .await
-                            .context("loading contact failed")?;
-                        Some(lastcontact)
-                    }
-                    Chattype::Single => None,
-                }
+                None
             }
         } else {
             None
@@ -479,29 +481,32 @@ pub async fn get_last_message_for_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat::save_msgs;
     use crate::chat::{
-        add_contact_to_chat, create_group_chat, get_chat_contacts, remove_contact_from_chat,
-        send_text_msg, ProtectionStatus,
+        ProtectionStatus, add_contact_to_chat, create_group_chat, get_chat_contacts,
+        remove_contact_from_chat, send_text_msg,
     };
     use crate::receive_imf::receive_imf;
     use crate::stock_str::StockMessage;
     use crate::test_utils::TestContext;
+    use crate::test_utils::TestContextManager;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_try_load() {
-        let t = TestContext::new_bob().await;
-        let chat_id1 = create_group_chat(&t, ProtectionStatus::Unprotected, "a chat")
+        let mut tcm = TestContextManager::new();
+        let bob = &tcm.bob().await;
+        let chat_id1 = create_group_chat(bob, ProtectionStatus::Unprotected, "a chat")
             .await
             .unwrap();
-        let chat_id2 = create_group_chat(&t, ProtectionStatus::Unprotected, "b chat")
+        let chat_id2 = create_group_chat(bob, ProtectionStatus::Unprotected, "b chat")
             .await
             .unwrap();
-        let chat_id3 = create_group_chat(&t, ProtectionStatus::Unprotected, "c chat")
+        let chat_id3 = create_group_chat(bob, ProtectionStatus::Unprotected, "c chat")
             .await
             .unwrap();
 
         // check that the chatlist starts with the most recent message
-        let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
+        let chats = Chatlist::try_load(bob, 0, None, None).await.unwrap();
         assert_eq!(chats.len(), 3);
         assert_eq!(chats.get_chat_id(0).unwrap(), chat_id3);
         assert_eq!(chats.get_chat_id(1).unwrap(), chat_id2);
@@ -517,51 +522,49 @@ mod tests {
         // 2s here.
         for chat_id in &[chat_id1, chat_id3, chat_id2] {
             let mut msg = Message::new_text("hello".to_string());
-            chat_id.set_draft(&t, Some(&mut msg)).await.unwrap();
+            chat_id.set_draft(bob, Some(&mut msg)).await.unwrap();
         }
 
-        let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
+        let chats = Chatlist::try_load(bob, 0, None, None).await.unwrap();
         assert_eq!(chats.get_chat_id(0).unwrap(), chat_id2);
 
         // check chatlist query and archive functionality
-        let chats = Chatlist::try_load(&t, 0, Some("b"), None).await.unwrap();
+        let chats = Chatlist::try_load(bob, 0, Some("b"), None).await.unwrap();
         assert_eq!(chats.len(), 1);
 
         // receive a message from alice
-        let alice = TestContext::new_alice().await;
-        let alice_chat_id = create_group_chat(&alice, ProtectionStatus::Unprotected, "alice chat")
+        let alice = &tcm.alice().await;
+        let alice_chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "alice chat")
             .await
             .unwrap();
         add_contact_to_chat(
-            &alice,
+            alice,
             alice_chat_id,
-            Contact::create(&alice, "bob", "bob@example.net")
-                .await
-                .unwrap(),
+            alice.add_or_lookup_contact_id(bob).await,
         )
         .await
         .unwrap();
-        send_text_msg(&alice, alice_chat_id, "hi".into())
+        send_text_msg(alice, alice_chat_id, "hi".into())
             .await
             .unwrap();
         let sent_msg = alice.pop_sent_msg().await;
 
-        t.recv_msg(&sent_msg).await;
-        let chats = Chatlist::try_load(&t, 0, Some("is:unread"), None)
+        bob.recv_msg(&sent_msg).await;
+        let chats = Chatlist::try_load(bob, 0, Some("is:unread"), None)
             .await
             .unwrap();
-        assert!(chats.len() == 1);
+        assert_eq!(chats.len(), 1);
 
-        let chats = Chatlist::try_load(&t, DC_GCL_ARCHIVED_ONLY, None, None)
+        let chats = Chatlist::try_load(bob, DC_GCL_ARCHIVED_ONLY, None, None)
             .await
             .unwrap();
         assert_eq!(chats.len(), 0);
 
         chat_id1
-            .set_visibility(&t, ChatVisibility::Archived)
+            .set_visibility(bob, ChatVisibility::Archived)
             .await
             .ok();
-        let chats = Chatlist::try_load(&t, DC_GCL_ARCHIVED_ONLY, None, None)
+        let chats = Chatlist::try_load(bob, DC_GCL_ARCHIVED_ONLY, None, None)
             .await
             .unwrap();
         assert_eq!(chats.len(), 1);
@@ -569,27 +572,31 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_sort_self_talk_up_on_forward() {
-        let t = TestContext::new().await;
+        let t = TestContext::new_alice().await;
         t.update_device_chats().await.unwrap();
         create_group_chat(&t, ProtectionStatus::Unprotected, "a chat")
             .await
             .unwrap();
 
         let chats = Chatlist::try_load(&t, 0, None, None).await.unwrap();
-        assert!(chats.len() == 3);
-        assert!(!Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
-            .await
-            .unwrap()
-            .is_self_talk());
+        assert_eq!(chats.len(), 3);
+        assert!(
+            !Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
+                .await
+                .unwrap()
+                .is_self_talk()
+        );
 
         let chats = Chatlist::try_load(&t, DC_GCL_FOR_FORWARDING, None, None)
             .await
             .unwrap();
-        assert!(chats.len() == 2); // device chat cannot be written and is skipped on forwarding
-        assert!(Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
-            .await
-            .unwrap()
-            .is_self_talk());
+        assert_eq!(chats.len(), 2); // device chat cannot be written and is skipped on forwarding
+        assert!(
+            Chat::load_from_db(&t, chats.get_chat_id(0).unwrap())
+                .await
+                .unwrap()
+                .is_self_talk()
+        );
 
         remove_contact_from_chat(&t, chats.get_chat_id(1).unwrap(), ContactId::SELF)
             .await
@@ -597,12 +604,12 @@ mod tests {
         let chats = Chatlist::try_load(&t, DC_GCL_FOR_FORWARDING, None, None)
             .await
             .unwrap();
-        assert!(chats.len() == 1);
+        assert_eq!(chats.len(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_search_special_chat_names() {
-        let t = TestContext::new().await;
+        let t = TestContext::new_alice().await;
         t.update_device_chats().await.unwrap();
 
         let chats = Chatlist::try_load(&t, 0, Some("t-1234-s"), None)
@@ -785,6 +792,31 @@ mod tests {
 
         let summary_res = chats.get_summary(&t, 0, None).await;
         assert!(summary_res.is_ok());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_get_summary_for_saved_messages() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = tcm.alice().await;
+        let bob = tcm.bob().await;
+        let chat_alice = alice.create_chat(&bob).await;
+
+        send_text_msg(&alice, chat_alice.id, "hi".into()).await?;
+        let sent1 = alice.pop_sent_msg().await;
+        save_msgs(&alice, &[sent1.sender_msg_id]).await?;
+        let chatlist = Chatlist::try_load(&alice, 0, None, None).await?;
+        let summary = chatlist.get_summary(&alice, 0, None).await?;
+        assert_eq!(summary.prefix.unwrap().to_string(), "Me");
+        assert_eq!(summary.text, "hi");
+
+        let msg = bob.recv_msg(&sent1).await;
+        save_msgs(&bob, &[msg.id]).await?;
+        let chatlist = Chatlist::try_load(&bob, 0, None, None).await?;
+        let summary = chatlist.get_summary(&bob, 0, None).await?;
+        assert_eq!(summary.prefix.unwrap().to_string(), "alice@example.org");
+        assert_eq!(summary.text, "hi");
+
+        Ok(())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

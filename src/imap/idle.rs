@@ -1,14 +1,14 @@
 use std::time::Duration;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result};
 use async_channel::Receiver;
 use async_imap::extensions::idle::IdleResponse;
-use futures_lite::FutureExt;
 use tokio::time::timeout;
 
-use super::session::Session;
 use super::Imap;
+use super::session::Session;
 use crate::context::Context;
+use crate::log::{info, warn};
 use crate::net::TIMEOUT;
 use crate::tools::{self, time_elapsed};
 
@@ -27,27 +27,32 @@ impl Session {
         idle_interrupt_receiver: Receiver<()>,
         folder: &str,
     ) -> Result<Self> {
-        use futures::future::FutureExt;
-
-        self.select_with_uidvalidity(context, folder).await?;
+        let create = true;
+        self.select_with_uidvalidity(context, folder, create)
+            .await?;
 
         if self.drain_unsolicited_responses(context)? {
             self.new_mail = true;
         }
 
         if self.new_mail {
+            info!(
+                context,
+                "Skipping IDLE in {folder:?} because there may be new mail."
+            );
             return Ok(self);
         }
 
         if let Ok(()) = idle_interrupt_receiver.try_recv() {
-            info!(context, "skip idle, got interrupt");
+            info!(context, "Skip IDLE in {folder:?} because we got interrupt.");
             return Ok(self);
         }
 
         let mut handle = self.inner.idle();
-        if let Err(err) = handle.init().await {
-            bail!("IMAP IDLE protocol failed to init/complete: {}", err);
-        }
+        handle
+            .init()
+            .await
+            .with_context(|| format!("IMAP IDLE protocol failed to init in folder {folder:?}"))?;
 
         // At this point IDLE command was sent and we received a "+ idling" response. We will now
         // read from the stream without getting any data for up to `IDLE_TIMEOUT`. If we don't
@@ -56,38 +61,45 @@ impl Session {
         handle.as_mut().set_read_timeout(None);
         let (idle_wait, interrupt) = handle.wait_with_timeout(IDLE_TIMEOUT);
 
-        enum Event {
-            IdleResponse(IdleResponse),
-            Interrupt,
-        }
+        info!(
+            context,
+            "IDLE entering wait-on-remote state in folder {folder:?}."
+        );
 
-        info!(context, "{folder}: Idle entering wait-on-remote state");
-        let fut = idle_wait.map(|ev| ev.map(Event::IdleResponse)).race(async {
-            idle_interrupt_receiver.recv().await.ok();
+        // Spawn a task to relay interrupts from `idle_interrupt_receiver`
+        // into interruptions of IDLE.
+        let interrupt_relay = {
+            let context = context.clone();
+            let folder = folder.to_string();
 
-            // cancel imap idle connection properly
-            drop(interrupt);
+            tokio::spawn(async move {
+                idle_interrupt_receiver.recv().await.ok();
 
-            Ok(Event::Interrupt)
-        });
+                info!(context, "{folder:?}: Received interrupt, stopping IDLE.");
 
-        match fut.await {
-            Ok(Event::IdleResponse(IdleResponse::NewData(x))) => {
-                info!(context, "{folder}: Idle has NewData {:?}", x);
+                // Drop `interrupt` in order to stop the IMAP IDLE.
+                drop(interrupt);
+            })
+        };
+
+        match idle_wait.await {
+            Ok(IdleResponse::NewData(x)) => {
+                info!(context, "{folder:?}: Idle has NewData {x:?}");
             }
-            Ok(Event::IdleResponse(IdleResponse::Timeout)) => {
-                info!(context, "{folder}: Idle-wait timeout or interruption");
+            Ok(IdleResponse::Timeout) => {
+                info!(context, "{folder:?}: Idle-wait timeout or interruption.");
             }
-            Ok(Event::IdleResponse(IdleResponse::ManualInterrupt)) => {
-                info!(context, "{folder}: Idle wait was interrupted manually");
-            }
-            Ok(Event::Interrupt) => {
-                info!(context, "{folder}: Idle wait was interrupted");
+            Ok(IdleResponse::ManualInterrupt) => {
+                info!(context, "{folder:?}: Idle wait was interrupted manually.");
             }
             Err(err) => {
-                warn!(context, "{folder}: Idle wait errored: {err:?}");
+                warn!(context, "{folder:?}: Idle wait errored: {err:?}.");
             }
         }
+
+        // Abort the task, then await to ensure the future is dropped.
+        interrupt_relay.abort();
+        interrupt_relay.await.ok();
 
         let mut session = tokio::time::timeout(Duration::from_secs(15), handle.done())
             .await

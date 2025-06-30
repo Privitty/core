@@ -57,6 +57,7 @@ pub enum HeaderDef {
     ChatGroupId,
     ChatGroupName,
     ChatGroupNameChanged,
+    ChatGroupNameTimestamp,
     ChatVerified,
     ChatGroupAvatar,
     ChatUserAvatar,
@@ -65,14 +66,36 @@ pub enum HeaderDef {
     ChatGroupMemberAdded,
     ChatContent,
 
+    /// Past members of the group.
+    ChatGroupPastMembers,
+
+    /// Space-separated timestamps of member addition
+    /// for members listed in the `To` field
+    /// followed by timestamps of member removal
+    /// for members listed in the `Chat-Group-Past-Members` field.
+    ChatGroupMemberTimestamps,
+
+    /// Space-separated PGP key fingerprints
+    /// of group members listed in the `To` field
+    /// followed by fingerprints
+    /// of past members listed in the `Chat-Group-Past-Members` field.
+    ChatGroupMemberFpr,
+
     /// Duration of the attached media file.
     ChatDuration,
 
     ChatDispositionNotificationTo,
     ChatWebrtcRoom,
 
+    /// This message deletes the messages listed in the value by rfc724_mid.
+    ChatDelete,
+
+    /// This message obsoletes the text of the message defined here by rfc724_mid.
+    ChatEdit,
+
     /// [Autocrypt](https://autocrypt.org/) header.
     Autocrypt,
+    AutocryptGossip,
     AutocryptSetupMessage,
     SecureJoin,
 
@@ -117,14 +140,14 @@ pub trait HeaderDefMap {
     fn get_header_value(&self, headerdef: HeaderDef) -> Option<String>;
 
     /// Returns requested header if it exists.
-    fn get_header(&self, headerdef: HeaderDef) -> Option<&MailHeader>;
+    fn get_header(&self, headerdef: HeaderDef) -> Option<&MailHeader<'_>>;
 }
 
 impl HeaderDefMap for [MailHeader<'_>] {
     fn get_header_value(&self, headerdef: HeaderDef) -> Option<String> {
         self.get_first_value(headerdef.get_headername())
     }
-    fn get_header(&self, headerdef: HeaderDef) -> Option<&MailHeader> {
+    fn get_header(&self, headerdef: HeaderDef) -> Option<&MailHeader<'_>> {
         self.get_first_header(headerdef.get_headername())
     }
 }

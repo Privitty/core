@@ -3,17 +3,18 @@
 use std::cmp::max;
 use std::collections::BTreeMap;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail, ensure};
 use deltachat_derive::{FromSql, ToSql};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::context::Context;
 use crate::imap::session::Session;
+use crate::log::info;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{MimeMessage, Part};
 use crate::tools::time;
-use crate::{chatlist_events, stock_str, EventType};
+use crate::{EventType, chatlist_events, stock_str};
 
 /// Download limits should not be used below `MIN_DOWNLOAD_LIMIT`.
 ///
@@ -82,7 +83,7 @@ impl MsgId {
         let msg = Message::load_from_db(context, self).await?;
         match msg.download_state() {
             DownloadState::Done | DownloadState::Undecipherable => {
-                return Err(anyhow!("Nothing to download."))
+                return Err(anyhow!("Nothing to download."));
             }
             DownloadState::InProgress => return Err(anyhow!("Download already in progress.")),
             DownloadState::Available | DownloadState::Failure => {
@@ -201,7 +202,11 @@ impl Session {
             bail!("Attempt to fetch UID 0");
         }
 
-        self.select_with_uidvalidity(context, folder).await?;
+        let create = false;
+        let folder_exists = self
+            .select_with_uidvalidity(context, folder, create)
+            .await?;
+        ensure!(folder_exists, "No folder {folder}");
 
         // we are connected, and the folder is selected
         info!(context, "Downloading message {}/{} fully...", folder, uid);
@@ -215,7 +220,6 @@ impl Session {
                 uidvalidity,
                 vec![uid],
                 &uid_message_ids,
-                false,
                 false,
             )
             .await?;
@@ -349,8 +353,7 @@ mod tests {
     async fn test_partial_receive_imf() -> Result<()> {
         let t = TestContext::new_alice().await;
 
-        let header =
-            "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
+        let header = "Received: (Postfix, from userid 1000); Mon, 4 Dec 2006 14:51:39 +0100 (CET)\n\
              From: bob@example.com\n\
              To: alice@example.org\n\
              Subject: foo\n\
@@ -365,15 +368,15 @@ mod tests {
             header.as_bytes(),
             false,
             Some(100000),
-            false,
         )
         .await?;
         let msg = t.get_last_msg().await;
         assert_eq!(msg.download_state(), DownloadState::Available);
         assert_eq!(msg.get_subject(), "foo");
-        assert!(msg
-            .get_text()
-            .contains(&stock_str::partial_download_msg_body(&t, 100000).await));
+        assert!(
+            msg.get_text()
+                .contains(&stock_str::partial_download_msg_body(&t, 100000).await)
+        );
 
         receive_imf_from_inbox(
             &t,
@@ -381,7 +384,6 @@ mod tests {
             format!("{header}\n\n100k text...").as_bytes(),
             false,
             None,
-            false,
         )
         .await?;
         let msg = t.get_last_msg().await;
@@ -416,7 +418,6 @@ mod tests {
                     Content-Type: text/plain",
             false,
             Some(100000),
-            false,
         )
         .await?;
         assert_eq!(
@@ -436,7 +437,7 @@ mod tests {
         let file = alice.get_blobdir().join("minimal.xdc");
         tokio::fs::write(&file, include_bytes!("../test-data/webxdc/minimal.xdc")).await?;
         let mut instance = Message::new(Viewtype::File);
-        instance.set_file(file.to_str().unwrap(), None);
+        instance.set_file_and_deduplicate(&alice, &file, None, None)?;
         let _sent1 = alice.send_msg(chat_id, &mut instance).await;
 
         alice
@@ -453,7 +454,6 @@ mod tests {
             sent2.payload().as_bytes(),
             false,
             Some(sent2.payload().len() as u32),
-            false,
         )
         .await?;
         let msg = bob.get_last_msg().await;
@@ -469,13 +469,14 @@ mod tests {
             sent2.payload().as_bytes(),
             false,
             None,
-            false,
         )
         .await?;
         assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
-        assert!(Message::load_from_db_optional(&bob, msg.id)
-            .await?
-            .is_none());
+        assert!(
+            Message::load_from_db_optional(&bob, msg.id)
+                .await?
+                .is_none()
+        );
 
         Ok(())
     }
@@ -513,15 +514,7 @@ mod tests {
             ";
 
         // not downloading the mdn results in an placeholder
-        receive_imf_from_inbox(
-            &bob,
-            "bar@example.org",
-            raw,
-            false,
-            Some(raw.len() as u32),
-            false,
-        )
-        .await?;
+        receive_imf_from_inbox(&bob, "bar@example.org", raw, false, Some(raw.len() as u32)).await?;
         let msg = bob.get_last_msg().await;
         let chat_id = msg.chat_id;
         assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 1);
@@ -529,11 +522,13 @@ mod tests {
 
         // downloading the mdn afterwards expands to nothing and deletes the placeholder directly
         // (usually mdn are too small for not being downloaded directly)
-        receive_imf_from_inbox(&bob, "bar@example.org", raw, false, None, false).await?;
+        receive_imf_from_inbox(&bob, "bar@example.org", raw, false, None).await?;
         assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
-        assert!(Message::load_from_db_optional(&bob, msg.id)
-            .await?
-            .is_none());
+        assert!(
+            Message::load_from_db_optional(&bob, msg.id)
+                .await?
+                .is_none()
+        );
 
         Ok(())
     }

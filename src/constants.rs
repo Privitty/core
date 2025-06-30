@@ -2,14 +2,16 @@
 
 #![allow(missing_docs)]
 
+use std::sync::LazyLock;
+
 use deltachat_derive::{FromSql, ToSql};
-use once_cell::sync::Lazy;
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC};
 use serde::{Deserialize, Serialize};
 
 use crate::chat::ChatId;
 
-pub static DC_VERSION_STR: Lazy<String> = Lazy::new(|| env!("CARGO_PKG_VERSION").to_string());
+pub static DC_VERSION_STR: LazyLock<String> =
+    LazyLock::new(|| env!("CARGO_PKG_VERSION").to_string());
 
 /// Set of characters to percent-encode in email addresses and names.
 pub(crate) const NON_ALPHANUMERIC_WITHOUT_DOT: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.');
@@ -58,25 +60,6 @@ pub enum MediaQuality {
     Worse = 1,
 }
 
-/// Type of the key to generate.
-#[derive(
-    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
-)]
-#[repr(u8)]
-pub enum KeyGenType {
-    #[default]
-    Default = 0,
-
-    /// 2048-bit RSA.
-    Rsa2048 = 1,
-
-    /// [Ed25519](https://ed25519.cr.yp.to/) signature and X25519 encryption.
-    Ed25519 = 2,
-
-    /// 4096-bit RSA.
-    Rsa4096 = 3,
-}
-
 /// Video chat URL type.
 #[derive(
     Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
@@ -105,7 +88,6 @@ pub const DC_GCL_NO_SPECIALS: usize = 0x02;
 pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 pub const DC_GCL_FOR_FORWARDING: usize = 0x08;
 
-pub const DC_GCL_VERIFIED_ONLY: u32 = 0x01;
 pub const DC_GCL_ADD_SELF: u32 = 0x02;
 
 // unchanged user avatars are resent to the recipients every some days
@@ -197,16 +179,15 @@ pub const DC_LP_AUTH_NORMAL: i32 = 0x4;
 /// if none of these flags are set, the default is chosen
 pub const DC_LP_AUTH_FLAGS: i32 = DC_LP_AUTH_OAUTH2 | DC_LP_AUTH_NORMAL;
 
-/// How many existing messages shall be fetched after configuration.
-pub(crate) const DC_FETCH_EXISTING_MSGS_COUNT: i64 = 100;
-
 // max. weight of images to send w/o recoding
 pub const BALANCED_IMAGE_BYTES: usize = 500_000;
 pub const WORSE_IMAGE_BYTES: usize = 130_000;
 
-// max. width/height of an avatar
-pub(crate) const BALANCED_AVATAR_SIZE: u32 = 256;
+// max. width/height and bytes of an avatar
+pub(crate) const BALANCED_AVATAR_SIZE: u32 = 512;
+pub(crate) const BALANCED_AVATAR_BYTES: usize = 60_000;
 pub(crate) const WORSE_AVATAR_SIZE: u32 = 128;
+pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outlook servers don't allowing headers larger than 32k.
 
 // max. width/height of images scaled down because of being too huge
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
@@ -229,10 +210,22 @@ pub(crate) const DC_BACKGROUND_FETCH_QUOTA_CHECK_RATELIMIT: u64 = 12 * 60 * 60; 
 /// in the group membership consistency algo to reject outdated membership changes.
 pub(crate) const TIMESTAMP_SENT_TOLERANCE: i64 = 60;
 
-/// How long a 1:1 chat can't be used for sending while the SecureJoin is in progress. This should
-/// be 10-20 seconds so that we are reasonably sure that the app remains active and receiving also
-/// on mobile devices. See also [`crate::chat::CantSendReason::SecurejoinWait`].
-pub(crate) const SECUREJOIN_WAIT_TIMEOUT: u64 = 15;
+// To make text edits clearer for Non-Delta-MUA or old Delta Chats, edited text will be prefixed by EDITED_PREFIX.
+// Newer Delta Chats will remove the prefix as needed.
+pub(crate) const EDITED_PREFIX: &str = "✏️";
+
+// Strings needed to render the Autocrypt Setup Message.
+// Left untranslated as not being supported/recommended workflow and as translations would require deep knowledge.
+pub(crate) const ASM_SUBJECT: &str = "Autocrypt Setup Message";
+pub(crate) const ASM_BODY: &str = "This is the Autocrypt Setup Message \
+    used to transfer your end-to-end setup between clients.
+
+    To decrypt and use your setup, \
+    open the message in an Autocrypt-compliant client \
+    and enter the setup code presented on the generating device.
+
+    If you see this message in a chatmail client (Delta Chat, Arcane Chat, Delta Touch ...), \
+    use \"Settings / Add Second Device\" instead.";
 
 #[cfg(test)]
 mod tests {
@@ -247,16 +240,6 @@ mod tests {
         assert_eq!(Chattype::Group, Chattype::from_i32(120).unwrap());
         assert_eq!(Chattype::Mailinglist, Chattype::from_i32(140).unwrap());
         assert_eq!(Chattype::Broadcast, Chattype::from_i32(160).unwrap());
-    }
-
-    #[test]
-    fn test_keygentype_values() {
-        // values may be written to disk and must not change
-        assert_eq!(KeyGenType::Default, KeyGenType::default());
-        assert_eq!(KeyGenType::Default, KeyGenType::from_i32(0).unwrap());
-        assert_eq!(KeyGenType::Rsa2048, KeyGenType::from_i32(1).unwrap());
-        assert_eq!(KeyGenType::Ed25519, KeyGenType::from_i32(2).unwrap());
-        assert_eq!(KeyGenType::Rsa4096, KeyGenType::from_i32(3).unwrap());
     }
 
     #[test]

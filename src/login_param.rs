@@ -2,23 +2,38 @@
 
 use std::fmt;
 
-use anyhow::{format_err, Context as _, Result};
-use deltachat_contact_tools::EmailAddress;
+use anyhow::{Context as _, Result, bail, ensure, format_err};
+use deltachat_contact_tools::{EmailAddress, addr_cmp, addr_normalize};
+use num_traits::ToPrimitive as _;
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::configure::server_params::{expand_param_vector, ServerParams};
-use crate::constants::{DC_LP_AUTH_FLAGS, DC_LP_AUTH_NORMAL, DC_LP_AUTH_OAUTH2};
+use crate::configure::server_params::{ServerParams, expand_param_vector};
+use crate::constants::{DC_LP_AUTH_FLAGS, DC_LP_AUTH_OAUTH2};
 use crate::context::Context;
 use crate::net::load_connection_timestamp;
-use crate::net::proxy::ProxyConfig;
-use crate::provider::{Protocol, Provider, Socket, UsernamePattern};
+pub use crate::net::proxy::ProxyConfig;
+pub use crate::provider::Socket;
+use crate::provider::{Protocol, Provider, UsernamePattern, get_provider_by_id};
 use crate::sql::Sql;
+use crate::tools::ToOption;
 
 /// User-entered setting for certificate checks.
 ///
 /// Should be saved into `imap_certificate_checks` before running configuration.
-#[derive(Copy, Clone, Debug, Default, Display, FromPrimitive, ToPrimitive, PartialEq, Eq)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    Display,
+    FromPrimitive,
+    ToPrimitive,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
 pub enum EnteredCertificateChecks {
@@ -41,10 +56,12 @@ pub enum EnteredCertificateChecks {
 }
 
 /// Values saved into `imap_certificate_checks`.
-#[derive(Copy, Clone, Debug, Display, FromPrimitive, ToPrimitive, PartialEq, Eq)]
+#[derive(
+    Copy, Clone, Debug, Display, FromPrimitive, ToPrimitive, PartialEq, Eq, Serialize, Deserialize,
+)]
 #[repr(u32)]
 #[strum(serialize_all = "snake_case")]
-pub enum ConfiguredCertificateChecks {
+pub(crate) enum ConfiguredCertificateChecks {
     /// Use configuration from the provider database.
     /// If there is no provider database setting for certificate checks,
     /// accept invalid certificates.
@@ -78,7 +95,7 @@ pub enum ConfiguredCertificateChecks {
 }
 
 /// Login parameters for a single server, either IMAP or SMTP
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnteredServerLoginParam {
     /// Server hostname or IP address.
     pub server: String,
@@ -101,7 +118,7 @@ pub struct EnteredServerLoginParam {
 }
 
 /// Login parameters entered by the user.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnteredLoginParam {
     /// Email address.
     pub addr: String,
@@ -116,15 +133,13 @@ pub struct EnteredLoginParam {
     /// invalid hostnames
     pub certificate_checks: EnteredCertificateChecks,
 
-    /// Proxy configuration.
-    pub proxy_config: Option<ProxyConfig>,
-
+    /// If true, login via OAUTH2 (not recommended anymore)
     pub oauth2: bool,
 }
 
 impl EnteredLoginParam {
     /// Loads entered account settings.
-    pub async fn load(context: &Context) -> Result<Self> {
+    pub(crate) async fn load(context: &Context) -> Result<Self> {
         let addr = context
             .get_config(Config::Addr)
             .await?
@@ -196,8 +211,6 @@ impl EnteredLoginParam {
             .unwrap_or_default();
         let oauth2 = matches!(server_flags & DC_LP_AUTH_FLAGS, DC_LP_AUTH_OAUTH2);
 
-        let proxy_config = ProxyConfig::load(context).await?;
-
         Ok(EnteredLoginParam {
             addr,
             imap: EnteredServerLoginParam {
@@ -215,9 +228,70 @@ impl EnteredLoginParam {
                 password: send_pw,
             },
             certificate_checks,
-            proxy_config,
             oauth2,
         })
+    }
+
+    /// Saves entered account settings,
+    /// so that they can be prefilled if the user wants to configure the server again.
+    pub(crate) async fn save(&self, context: &Context) -> Result<()> {
+        context.set_config(Config::Addr, Some(&self.addr)).await?;
+
+        context
+            .set_config(Config::MailServer, self.imap.server.to_option())
+            .await?;
+        context
+            .set_config(Config::MailPort, self.imap.port.to_option().as_deref())
+            .await?;
+        context
+            .set_config(
+                Config::MailSecurity,
+                self.imap.security.to_i32().to_option().as_deref(),
+            )
+            .await?;
+        context
+            .set_config(Config::MailUser, self.imap.user.to_option())
+            .await?;
+        context
+            .set_config(Config::MailPw, self.imap.password.to_option())
+            .await?;
+
+        context
+            .set_config(Config::SendServer, self.smtp.server.to_option())
+            .await?;
+        context
+            .set_config(Config::SendPort, self.smtp.port.to_option().as_deref())
+            .await?;
+        context
+            .set_config(
+                Config::SendSecurity,
+                self.smtp.security.to_i32().to_option().as_deref(),
+            )
+            .await?;
+        context
+            .set_config(Config::SendUser, self.smtp.user.to_option())
+            .await?;
+        context
+            .set_config(Config::SendPw, self.smtp.password.to_option())
+            .await?;
+
+        context
+            .set_config(
+                Config::ImapCertificateChecks,
+                self.certificate_checks.to_i32().to_option().as_deref(),
+            )
+            .await?;
+
+        let server_flags = if self.oauth2 {
+            Some(DC_LP_AUTH_OAUTH2.to_string())
+        } else {
+            None
+        };
+        context
+            .set_config(Config::ServerFlags, server_flags.as_deref())
+            .await?;
+
+        Ok(())
     }
 }
 
@@ -256,11 +330,7 @@ impl fmt::Display for EnteredLoginParam {
 }
 
 fn unset_empty(s: &str) -> &str {
-    if s.is_empty() {
-        "unset"
-    } else {
-        s
-    }
+    if s.is_empty() { "unset" } else { s }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -319,7 +389,7 @@ impl TryFrom<Socket> for ConnectionSecurity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConfiguredServerLoginParam {
+pub(crate) struct ConfiguredServerLoginParam {
     pub connection: ConnectionCandidate,
 
     /// Username.
@@ -357,7 +427,7 @@ pub(crate) async fn prioritize_server_login_params(
 /// Login parameters saved to the database
 /// after successful configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConfiguredLoginParam {
+pub(crate) struct ConfiguredLoginParam {
     /// `From:` address that was used at the time of configuration.
     pub addr: String,
 
@@ -381,15 +451,29 @@ pub struct ConfiguredLoginParam {
 
     pub smtp_password: String,
 
-    /// Proxy configuration.
-    pub proxy_config: Option<ProxyConfig>,
-
     pub provider: Option<&'static Provider>,
 
     /// TLS options: whether to allow invalid certificates and/or
     /// invalid hostnames
     pub certificate_checks: ConfiguredCertificateChecks,
 
+    /// If true, login via OAUTH2 (not recommended anymore)
+    pub oauth2: bool,
+}
+
+/// The representation of ConfiguredLoginParam in the database,
+/// saved as Json.
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfiguredLoginParamJson {
+    pub addr: String,
+    pub imap: Vec<ConfiguredServerLoginParam>,
+    pub imap_user: String,
+    pub imap_password: String,
+    pub smtp: Vec<ConfiguredServerLoginParam>,
+    pub smtp_user: String,
+    pub smtp_password: String,
+    pub provider_id: Option<String>,
+    pub certificate_checks: ConfiguredCertificateChecks,
     pub oauth2: bool,
 }
 
@@ -428,7 +512,27 @@ impl ConfiguredLoginParam {
     /// Load configured account settings from the database.
     ///
     /// Returns `None` if account is not configured.
-    pub async fn load(context: &Context) -> Result<Option<Self>> {
+    pub(crate) async fn load(context: &Context) -> Result<Option<Self>> {
+        let Some(self_addr) = context.get_config(Config::ConfiguredAddr).await? else {
+            return Ok(None);
+        };
+
+        let json: Option<String> = context
+            .sql
+            .query_get_value(
+                "SELECT configured_param FROM transports WHERE addr=?",
+                (&self_addr,),
+            )
+            .await?;
+        if let Some(json) = json {
+            Ok(Some(Self::from_json(&json)?))
+        } else {
+            bail!("Self address {self_addr} doesn't have a corresponding transport");
+        }
+    }
+
+    /// Loads legacy configured param. Only used for tests and the migration.
+    pub(crate) async fn load_legacy(context: &Context) -> Result<Option<Self>> {
         if !context.get_config_bool(Config::Configured).await? {
             return Ok(None);
         }
@@ -681,8 +785,6 @@ impl ConfiguredLoginParam {
             }];
         }
 
-        let proxy_config = ProxyConfig::load(context).await?;
-
         Ok(Some(ConfiguredLoginParam {
             addr,
             imap,
@@ -693,94 +795,92 @@ impl ConfiguredLoginParam {
             smtp_password: send_pw,
             certificate_checks,
             provider,
-            proxy_config,
             oauth2,
         }))
     }
 
-    /// Save this loginparam to the database.
-    pub async fn save_as_configured_params(&self, context: &Context) -> Result<()> {
-        context.set_primary_self_addr(&self.addr).await?;
-
+    pub(crate) async fn save_to_transports_table(
+        self,
+        context: &Context,
+        entered_param: &EnteredLoginParam,
+    ) -> Result<()> {
+        let addr = addr_normalize(&self.addr);
+        let provider_id = self.provider.map(|provider| provider.id);
+        let configured_addr = context.get_config(Config::ConfiguredAddr).await?;
+        if let Some(configured_addr) = &configured_addr {
+            ensure!(
+                addr_cmp(configured_addr, &addr),
+                "Adding a second transport is not supported right now."
+            );
+        }
         context
-            .set_config(
-                Config::ConfiguredImapServers,
-                Some(&serde_json::to_string(&self.imap)?),
+            .sql
+            .execute(
+                "INSERT INTO transports (addr, entered_param, configured_param)
+                VALUES (?, ?, ?)
+                ON CONFLICT (addr)
+                DO UPDATE SET entered_param=excluded.entered_param, configured_param=excluded.configured_param",
+                (
+                    self.addr.clone(),
+                    serde_json::to_string(entered_param)?,
+                    self.into_json()?,
+                ),
             )
             .await?;
-        context
-            .set_config(
-                Config::ConfiguredSmtpServers,
-                Some(&serde_json::to_string(&self.smtp)?),
-            )
-            .await?;
-
-        context
-            .set_config(Config::ConfiguredMailUser, Some(&self.imap_user))
-            .await?;
-        context
-            .set_config(Config::ConfiguredMailPw, Some(&self.imap_password))
-            .await?;
-
-        context
-            .set_config(Config::ConfiguredSendUser, Some(&self.smtp_user))
-            .await?;
-        context
-            .set_config(Config::ConfiguredSendPw, Some(&self.smtp_password))
-            .await?;
-
-        context
-            .set_config_u32(
-                Config::ConfiguredImapCertificateChecks,
-                self.certificate_checks as u32,
-            )
-            .await?;
-        context
-            .set_config_u32(
-                Config::ConfiguredSmtpCertificateChecks,
-                self.certificate_checks as u32,
-            )
-            .await?;
-
-        // Remove legacy settings.
-        context
-            .set_config(Config::ConfiguredMailServer, None)
-            .await?;
-        context.set_config(Config::ConfiguredMailPort, None).await?;
-        context
-            .set_config(Config::ConfiguredMailSecurity, None)
-            .await?;
-        context
-            .set_config(Config::ConfiguredSendServer, None)
-            .await?;
-        context.set_config(Config::ConfiguredSendPort, None).await?;
-        context
-            .set_config(Config::ConfiguredSendSecurity, None)
-            .await?;
-
-        let server_flags = match self.oauth2 {
-            true => DC_LP_AUTH_OAUTH2,
-            false => DC_LP_AUTH_NORMAL,
-        };
-        context
-            .set_config_u32(Config::ConfiguredServerFlags, server_flags as u32)
-            .await?;
-
-        context
-            .set_config(
-                Config::ConfiguredProvider,
-                self.provider.map(|provider| provider.id),
-            )
-            .await?;
-
+        if configured_addr.is_none() {
+            // If there is no transport yet, set the new transport as the primary one
+            context
+                .sql
+                .set_raw_config(Config::ConfiguredProvider.as_ref(), provider_id)
+                .await?;
+            context
+                .sql
+                .set_raw_config(Config::ConfiguredAddr.as_ref(), Some(&addr))
+                .await?;
+        }
         Ok(())
     }
 
-    pub fn strict_tls(&self) -> bool {
+    pub(crate) fn from_json(json: &str) -> Result<Self> {
+        let json: ConfiguredLoginParamJson = serde_json::from_str(json)?;
+
+        let provider = json.provider_id.and_then(|id| get_provider_by_id(&id));
+
+        Ok(ConfiguredLoginParam {
+            addr: json.addr,
+            imap: json.imap,
+            imap_user: json.imap_user,
+            imap_password: json.imap_password,
+            smtp: json.smtp,
+            smtp_user: json.smtp_user,
+            smtp_password: json.smtp_password,
+            provider,
+            certificate_checks: json.certificate_checks,
+            oauth2: json.oauth2,
+        })
+    }
+
+    pub(crate) fn into_json(self) -> Result<String> {
+        let json = ConfiguredLoginParamJson {
+            addr: self.addr,
+            imap: self.imap,
+            imap_user: self.imap_user,
+            imap_password: self.imap_password,
+            smtp: self.smtp,
+            smtp_user: self.smtp_user,
+            smtp_password: self.smtp_password,
+            provider_id: self.provider.map(|p| p.id.to_string()),
+            certificate_checks: self.certificate_checks,
+            oauth2: self.oauth2,
+        };
+        Ok(serde_json::to_string(&json)?)
+    }
+
+    pub(crate) fn strict_tls(&self, connected_through_proxy: bool) -> bool {
         let provider_strict_tls = self.provider.map(|provider| provider.opt.strict_tls);
         match self.certificate_checks {
             ConfiguredCertificateChecks::OldAutomatic => {
-                provider_strict_tls.unwrap_or(self.proxy_config.is_some())
+                provider_strict_tls.unwrap_or(connected_through_proxy)
             }
             ConfiguredCertificateChecks::Automatic => provider_strict_tls.unwrap_or(true),
             ConfiguredCertificateChecks::Strict => true,
@@ -793,8 +893,10 @@ impl ConfiguredLoginParam {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log::LogExt as _;
     use crate::provider::get_provider_by_id;
     use crate::test_utils::TestContext;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_certificate_checks_display() {
@@ -840,6 +942,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_save_entered_login_param() -> Result<()> {
+        let t = TestContext::new().await;
+        let param = EnteredLoginParam {
+            addr: "alice@example.org".to_string(),
+            imap: EnteredServerLoginParam {
+                server: "".to_string(),
+                port: 0,
+                security: Socket::Starttls,
+                user: "".to_string(),
+                password: "foobar".to_string(),
+            },
+            smtp: EnteredServerLoginParam {
+                server: "".to_string(),
+                port: 2947,
+                security: Socket::default(),
+                user: "".to_string(),
+                password: "".to_string(),
+            },
+            certificate_checks: Default::default(),
+            oauth2: false,
+        };
+        param.save(&t).await?;
+        assert_eq!(
+            t.get_config(Config::Addr).await?.unwrap(),
+            "alice@example.org"
+        );
+        assert_eq!(t.get_config(Config::MailPw).await?.unwrap(), "foobar");
+        assert_eq!(t.get_config(Config::SendPw).await?, None);
+        assert_eq!(t.get_config_int(Config::SendPort).await?, 2947);
+
+        assert_eq!(EnteredLoginParam::load(&t).await?, param);
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_save_load_login_param() -> Result<()> {
         let t = TestContext::new().await;
 
@@ -865,24 +1003,37 @@ mod tests {
             }],
             smtp_user: "".to_string(),
             smtp_password: "bar".to_string(),
-            // proxy_config is not saved by `save_to_database`, using default value
-            proxy_config: None,
             provider: None,
             certificate_checks: ConfiguredCertificateChecks::Strict,
             oauth2: false,
         };
 
-        param.save_as_configured_params(&t).await?;
+        param
+            .clone()
+            .save_to_transports_table(&t, &EnteredLoginParam::default())
+            .await?;
+        let expected_param = r#"{"addr":"alice@example.org","imap":[{"connection":{"host":"imap.example.com","port":123,"security":"Starttls"},"user":"alice"}],"imap_user":"","imap_password":"foo","smtp":[{"connection":{"host":"smtp.example.com","port":456,"security":"Tls"},"user":"alice@example.org"}],"smtp_user":"","smtp_password":"bar","provider_id":null,"certificate_checks":"Strict","oauth2":false}"#;
         assert_eq!(
-            t.get_config(Config::ConfiguredImapServers).await?.unwrap(),
-            r#"[{"connection":{"host":"imap.example.com","port":123,"security":"Starttls"},"user":"alice"}]"#
+            t.sql
+                .query_get_value::<String>("SELECT configured_param FROM transports", ())
+                .await?
+                .unwrap(),
+            expected_param
         );
-        t.set_config(Config::Configured, Some("1")).await?;
+        assert_eq!(t.is_configured().await?, true);
         let loaded = ConfiguredLoginParam::load(&t).await?.unwrap();
         assert_eq!(param, loaded);
 
-        // Test that we don't panic on unknown ConfiguredImapCertificateChecks values.
+        // Legacy ConfiguredImapCertificateChecks config is ignored
         t.set_config(Config::ConfiguredImapCertificateChecks, Some("999"))
+            .await?;
+        assert!(ConfiguredLoginParam::load(&t).await.is_ok());
+
+        // Test that we don't panic on unknown ConfiguredImapCertificateChecks values.
+        let wrong_param = expected_param.replace("Strict", "Stricct");
+        assert_ne!(expected_param, wrong_param);
+        t.sql
+            .execute("UPDATE transports SET configured_param=?", (wrong_param,))
             .await?;
         assert!(ConfiguredLoginParam::load(&t).await.is_err());
 
@@ -900,7 +1051,8 @@ mod tests {
         t.set_config(Config::Configured, Some("1")).await?;
         t.set_config(Config::ConfiguredProvider, Some("posteo"))
             .await?;
-        t.set_config(Config::ConfiguredAddr, Some("alice@posteo.at"))
+        t.sql
+            .set_raw_config(Config::ConfiguredAddr.as_ref(), Some("alice@posteo.at"))
             .await?;
         t.set_config(Config::ConfiguredMailServer, Some("posteo.de"))
             .await?;
@@ -969,16 +1121,71 @@ mod tests {
             ],
             smtp_user: "alice@posteo.de".to_string(),
             smtp_password: "foobarbaz".to_string(),
-            proxy_config: None,
             provider: get_provider_by_id("posteo"),
             certificate_checks: ConfiguredCertificateChecks::Strict,
             oauth2: false,
         };
 
+        let loaded = ConfiguredLoginParam::load_legacy(&t).await?.unwrap();
+        assert_eq!(loaded, param);
+
+        migrate_configured_login_param(&t).await;
         let loaded = ConfiguredLoginParam::load(&t).await?.unwrap();
         assert_eq!(loaded, param);
 
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_empty_server_list_legacy() -> Result<()> {
+        // Find a provider that does not have server list set.
+        //
+        // There is at least one such provider in the provider database.
+        let (domain, provider) = crate::provider::data::PROVIDER_DATA
+            .iter()
+            .find(|(_domain, provider)| provider.server.is_empty())
+            .unwrap();
+
+        let t = TestContext::new().await;
+
+        let addr = format!("alice@{domain}");
+
+        t.set_config(Config::Configured, Some("1")).await?;
+        t.set_config(Config::ConfiguredProvider, Some(provider.id))
+            .await?;
+        t.sql
+            .set_raw_config(Config::ConfiguredAddr.as_ref(), Some(&addr))
+            .await?;
+        t.set_config(Config::ConfiguredMailPw, Some("foobarbaz"))
+            .await?;
+        t.set_config(Config::ConfiguredImapCertificateChecks, Some("1"))
+            .await?; // Strict
+        t.set_config(Config::ConfiguredSendPw, Some("foobarbaz"))
+            .await?;
+        t.set_config(Config::ConfiguredSmtpCertificateChecks, Some("1"))
+            .await?; // Strict
+        t.set_config(Config::ConfiguredServerFlags, Some("0"))
+            .await?;
+
+        let loaded = ConfiguredLoginParam::load_legacy(&t).await?.unwrap();
+        assert_eq!(loaded.provider, Some(*provider));
+        assert_eq!(loaded.imap.is_empty(), false);
+        assert_eq!(loaded.smtp.is_empty(), false);
+
+        migrate_configured_login_param(&t).await;
+
+        let loaded = ConfiguredLoginParam::load(&t).await?.unwrap();
+        assert_eq!(loaded.provider, Some(*provider));
+        assert_eq!(loaded.imap.is_empty(), false);
+        assert_eq!(loaded.smtp.is_empty(), false);
+
+        Ok(())
+    }
+
+    async fn migrate_configured_login_param(t: &TestContext) {
+        t.sql.execute("DROP TABLE transports;", ()).await.unwrap();
+        t.sql.set_raw_config_int("dbversion", 130).await.unwrap();
+        t.sql.run_migrations(t).await.log_err(t).ok();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -995,25 +1202,41 @@ mod tests {
 
         let addr = format!("alice@{domain}");
 
-        t.set_config(Config::Configured, Some("1")).await?;
-        t.set_config(Config::ConfiguredProvider, Some(provider.id))
-            .await?;
-        t.set_config(Config::ConfiguredAddr, Some(&addr)).await?;
-        t.set_config(Config::ConfiguredMailPw, Some("foobarbaz"))
-            .await?;
-        t.set_config(Config::ConfiguredImapCertificateChecks, Some("1"))
-            .await?; // Strict
-        t.set_config(Config::ConfiguredSendPw, Some("foobarbaz"))
-            .await?;
-        t.set_config(Config::ConfiguredSmtpCertificateChecks, Some("1"))
-            .await?; // Strict
-        t.set_config(Config::ConfiguredServerFlags, Some("0"))
-            .await?;
+        ConfiguredLoginParam {
+            addr: addr.clone(),
+            imap: vec![ConfiguredServerLoginParam {
+                connection: ConnectionCandidate {
+                    host: "example.org".to_string(),
+                    port: 100,
+                    security: ConnectionSecurity::Tls,
+                },
+                user: addr.clone(),
+            }],
+            imap_user: addr.clone(),
+            imap_password: "foobarbaz".to_string(),
+            smtp: vec![ConfiguredServerLoginParam {
+                connection: ConnectionCandidate {
+                    host: "example.org".to_string(),
+                    port: 100,
+                    security: ConnectionSecurity::Tls,
+                },
+                user: addr.clone(),
+            }],
+            smtp_user: addr.clone(),
+            smtp_password: "foobarbaz".to_string(),
+            provider: Some(provider),
+            certificate_checks: ConfiguredCertificateChecks::Automatic,
+            oauth2: false,
+        }
+        .save_to_transports_table(&t, &EnteredLoginParam::default())
+        .await?;
 
         let loaded = ConfiguredLoginParam::load(&t).await?.unwrap();
         assert_eq!(loaded.provider, Some(*provider));
         assert_eq!(loaded.imap.is_empty(), false);
         assert_eq!(loaded.smtp.is_empty(), false);
+        assert_eq!(t.get_configured_provider().await?, Some(*provider));
+
         Ok(())
     }
 }

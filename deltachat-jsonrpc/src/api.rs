@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,6 +7,7 @@ use std::{collections::HashMap, str::FromStr};
 
 use anyhow::{anyhow, bail, ensure, Context, Result};
 pub use deltachat::accounts::Accounts;
+use deltachat::blob::BlobObject;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, get_chat_media, get_chat_msgs, get_chat_msgs_ex,
     marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
@@ -18,10 +19,11 @@ use deltachat::constants::DC_MSG_ID_DAYMARKER;
 use deltachat::contact::{may_be_valid_addr, Contact, ContactId, Origin};
 use deltachat::context::get_info;
 use deltachat::ephemeral::Timer;
+use deltachat::imex;
 use deltachat::location;
 use deltachat::message::get_msg_read_receipts;
 use deltachat::message::{
-    self, delete_msgs, markseen_msgs, Message, MessageState, MsgId, Viewtype,
+    self, delete_msgs_ex, markseen_msgs, Message, MessageState, MsgId, Viewtype,
 };
 use deltachat::peer_channels::{
     leave_webxdc_realtime, send_webxdc_realtime_advertisement, send_webxdc_realtime_data,
@@ -34,10 +36,10 @@ use deltachat::securejoin;
 use deltachat::stock_str::StockMessage;
 use deltachat::webxdc::StatusUpdateSerial;
 use deltachat::EventEmitter;
-use deltachat::{imex, info};
 use sanitize_filename::is_sanitized;
 use tokio::fs;
 use tokio::sync::{watch, Mutex, RwLock};
+use types::login_param::EnteredLoginParam;
 use walkdir::WalkDir;
 use yerpc::rpc;
 
@@ -212,14 +214,12 @@ impl CommandApi {
         self.accounts.read().await.get_all()
     }
 
-    /// Select account id for internally selected state.
-    /// TODO: Likely this is deprecated as all methods take an account id now.
+    /// Select account in account manager, this saves the last used account to accounts.toml
     async fn select_account(&self, id: u32) -> Result<()> {
         self.accounts.write().await.select_account(id).await
     }
 
-    /// Get the selected account id of the internal state..
-    /// TODO: Likely this is deprecated as all methods take an account id now.
+    /// Get the selected account from the account manager (on startup it is read from accounts.toml)
     async fn get_selected_account_id(&self) -> Option<u32> {
         self.accounts.read().await.get_selected_account_id()
     }
@@ -227,8 +227,9 @@ impl CommandApi {
     /// Get a list of all configured accounts.
     async fn get_all_accounts(&self) -> Result<Vec<Account>> {
         let mut accounts = Vec::new();
-        for id in self.accounts.read().await.get_all() {
-            let context_option = self.accounts.read().await.get_account(id);
+        let accounts_lock = self.accounts.read().await;
+        for id in accounts_lock.get_all() {
+            let context_option = accounts_lock.get_account(id);
             if let Some(ctx) = context_option {
                 accounts.push(Account::from_context(&ctx, id).await?)
             }
@@ -326,8 +327,12 @@ impl CommandApi {
             .get_config_bool(deltachat::config::Config::ProxyEnabled)
             .await?;
 
-        let provider_info =
-            get_provider_info(&ctx, email.split('@').last().unwrap_or(""), proxy_enabled).await;
+        let provider_info = get_provider_info(
+            &ctx,
+            email.split('@').next_back().unwrap_or(""),
+            proxy_enabled,
+        )
+        .await;
         Ok(ProviderInfo::from_dc_type(provider_info))
     }
 
@@ -343,9 +348,31 @@ impl CommandApi {
         ctx.get_info().await
     }
 
+    /// Get the blob dir.
     async fn get_blob_dir(&self, account_id: u32) -> Result<Option<String>> {
         let ctx = self.get_context(account_id).await?;
         Ok(ctx.get_blobdir().to_str().map(|s| s.to_owned()))
+    }
+
+    /// If there was an error while the account was opened
+    /// and migrated to the current version,
+    /// then this function returns it.
+    ///
+    /// This function is useful because the key-contacts migration could fail due to bugs
+    /// and then the account will not work properly.
+    ///
+    /// After opening an account, the UI should call this function
+    /// and show the error string if one is returned.
+    async fn get_migration_error(&self, account_id: u32) -> Result<Option<String>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(ctx.get_migration_error())
+    }
+
+    /// Copy file to blob dir.
+    async fn copy_to_blob_dir(&self, account_id: u32, path: String) -> Result<PathBuf> {
+        let ctx = self.get_context(account_id).await?;
+        let file = Path::new(&path);
+        Ok(BlobObject::create_and_deduplicate(&ctx, file, file)?.to_abs_path())
     }
 
     async fn draft_self_report(&self, account_id: u32) -> Result<u32> {
@@ -424,6 +451,9 @@ impl CommandApi {
 
     /// Configures this account with the currently set parameters.
     /// Setup the credential config before calling this.
+    ///
+    /// Deprecated as of 2025-02; use `add_transport_from_qr()`
+    /// or `add_or_update_transport()` instead.
     async fn configure(&self, account_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         ctx.stop_io().await;
@@ -436,6 +466,78 @@ impl CommandApi {
         }
         ctx.start_io().await;
         Ok(())
+    }
+
+    /// Configures a new email account using the provided parameters
+    /// and adds it as a transport.
+    ///
+    /// If the email address is the same as an existing transport,
+    /// then this existing account will be reconfigured instead of a new one being added.
+    ///
+    /// This function stops and starts IO as needed.
+    ///
+    /// Usually it will be enough to only set `addr` and `password`,
+    /// and all the other settings will be autoconfigured.
+    ///
+    /// During configuration, ConfigureProgress events are emitted;
+    /// they indicate a successful configuration as well as errors
+    /// and may be used to create a progress bar.
+    /// This function will return after configuration is finished.
+    ///
+    /// If configuration is successful,
+    /// the working server parameters will be saved
+    /// and used for connecting to the server.
+    /// The parameters entered by the user will be saved separately
+    /// so that they can be prefilled when the user opens the server-configuration screen again.
+    ///
+    /// See also:
+    /// - [Self::is_configured()] to check whether there is
+    ///   at least one working transport.
+    /// - [Self::add_transport_from_qr()] to add a transport
+    ///   from a server encoded in a QR code.
+    /// - [Self::list_transports()] to get a list of all configured transports.
+    /// - [Self::delete_transport()] to remove a transport.
+    async fn add_or_update_transport(
+        &self,
+        account_id: u32,
+        param: EnteredLoginParam,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.add_or_update_transport(&mut param.try_into()?).await
+    }
+
+    /// Deprecated 2025-04. Alias for [Self::add_or_update_transport()].
+    async fn add_transport(&self, account_id: u32, param: EnteredLoginParam) -> Result<()> {
+        self.add_or_update_transport(account_id, param).await
+    }
+
+    /// Adds a new email account as a transport
+    /// using the server encoded in the QR code.
+    /// See [Self::add_or_update_transport].
+    async fn add_transport_from_qr(&self, account_id: u32, qr: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.add_transport_from_qr(&qr).await
+    }
+
+    /// Returns the list of all email accounts that are used as a transport in the current profile.
+    /// Use [Self::add_or_update_transport()] to add or change a transport
+    /// and [Self::delete_transport()] to delete a transport.
+    async fn list_transports(&self, account_id: u32) -> Result<Vec<EnteredLoginParam>> {
+        let ctx = self.get_context(account_id).await?;
+        let res = ctx
+            .list_transports()
+            .await?
+            .into_iter()
+            .map(|t| t.into())
+            .collect();
+        Ok(res)
+    }
+
+    /// Removes the transport with the specified email address
+    /// (i.e. [EnteredLoginParam::addr]).
+    async fn delete_transport(&self, account_id: u32, addr: String) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.delete_transport(&addr).await
     }
 
     /// Signal an ongoing process to stop.
@@ -836,6 +938,13 @@ impl CommandApi {
         Ok(contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>())
     }
 
+    /// Returns contact IDs of the past chat members.
+    async fn get_past_chat_contacts(&self, account_id: u32, chat_id: u32) -> Result<Vec<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        let contacts = chat::get_past_chat_contacts(&ctx, ChatId::new(chat_id)).await?;
+        Ok(contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>())
+    }
+
     /// Create a new group chat.
     ///
     /// After creation,
@@ -993,6 +1102,12 @@ impl CommandApi {
         marknoticed_chat(&ctx, ChatId::new(chat_id)).await
     }
 
+    /// Returns the message that is immediately followed by the last seen
+    /// message.
+    /// From the point of view of the user this is effectively
+    /// "first unread", but in reality in the database a seen message
+    /// _can_ be followed by a fresh (unseen) message
+    /// if that message has not been individually marked as seen.
     async fn get_first_unread_message_of_chat(
         &self,
         account_id: u32,
@@ -1081,6 +1196,9 @@ impl CommandApi {
         markseen_msgs(&ctx, msg_ids.into_iter().map(MsgId::new).collect()).await
     }
 
+    /// Returns all messages of a particular chat.
+    /// If `add_daymarker` is `true`, it will return them as
+    /// `DC_MSG_ID_DAYMARKER`, e.g. [1234, 1237, 9, 1239].
     async fn get_message_ids(
         &self,
         account_id: u32,
@@ -1191,7 +1309,15 @@ impl CommandApi {
     async fn delete_messages(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
-        delete_msgs(&ctx, &msgs).await
+        delete_msgs_ex(&ctx, &msgs, false).await
+    }
+
+    /// Delete messages. The messages are deleted on the current device,
+    /// on the IMAP server and also for all chat members
+    async fn delete_messages_for_all(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let msgs: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
+        delete_msgs_ex(&ctx, &msgs, true).await
     }
 
     /// Get an informational text for a single message. The text is multiline and may
@@ -1305,6 +1431,12 @@ impl CommandApi {
             );
         }
         Ok(results)
+    }
+
+    async fn save_msgs(&self, account_id: u32, message_ids: Vec<u32>) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        let message_ids: Vec<MsgId> = message_ids.into_iter().map(MsgId::new).collect();
+        chat::save_msgs(&ctx, &message_ids).await
     }
 
     // ---------------------------------------------
@@ -1440,15 +1572,7 @@ impl CommandApi {
         Ok(())
     }
 
-    /// Resets contact encryption.
-    async fn reset_contact_encryption(&self, account_id: u32, contact_id: u32) -> Result<()> {
-        let ctx = self.get_context(account_id).await?;
-        let contact_id = ContactId::new(contact_id);
-
-        contact_id.reset_encryption(&ctx).await?;
-        Ok(())
-    }
-
+    /// Sets display name for existing contact.
     async fn change_contact_name(
         &self,
         account_id: u32,
@@ -1457,9 +1581,7 @@ impl CommandApi {
     ) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         let contact_id = ContactId::new(contact_id);
-        let contact = Contact::get_by_id(&ctx, contact_id).await?;
-        let addr = contact.get_addr();
-        Contact::create(&ctx, &name, addr).await?;
+        contact_id.set_name(&ctx, &name).await?;
         Ok(())
     }
 
@@ -1508,6 +1630,18 @@ impl CommandApi {
         let vcard = tokio::fs::read(Path::new(&path)).await?;
         let vcard = str::from_utf8(&vcard)?;
         Ok(deltachat::contact::import_vcard(&ctx, vcard)
+            .await?
+            .into_iter()
+            .map(|c| c.to_u32())
+            .collect())
+    }
+
+    /// Imports contacts from a vCard.
+    ///
+    /// Returns the ids of created/modified contacts in the order they appear in the vCard.
+    async fn import_vcard_contents(&self, account_id: u32, vcard: String) -> Result<Vec<u32>> {
+        let ctx = self.get_context(account_id).await?;
+        Ok(deltachat::contact::import_vcard(&ctx, &vcard)
             .await?
             .into_iter()
             .map(|c| c.to_u32())
@@ -1806,12 +1940,10 @@ impl CommandApi {
         instance_msg_id: u32,
     ) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
-        let fut = send_webxdc_realtime_advertisement(&ctx, MsgId::new(instance_msg_id)).await?;
-        if let Some(fut) = fut {
-            tokio::spawn(async move {
-                fut.await.ok();
-                info!(ctx, "send_webxdc_realtime_advertisement done")
-            });
+        if let Some(fut) =
+            send_webxdc_realtime_advertisement(&ctx, MsgId::new(instance_msg_id)).await?
+        {
+            tokio::spawn(fut);
         }
         Ok(())
     }
@@ -1847,13 +1979,9 @@ impl CommandApi {
 
     /// Get href from a WebxdcInfoMessage which might include a hash holding
     /// information about a specific position or state in a webxdc app (optional)
-    async fn get_webxdc_href(
-        &self,
-        account_id: u32,
-        instance_msg_id: u32,
-    ) -> Result<Option<String>> {
+    async fn get_webxdc_href(&self, account_id: u32, info_msg_id: u32) -> Result<Option<String>> {
         let ctx = self.get_context(account_id).await?;
-        let message = Message::load_from_db(&ctx, MsgId::new(instance_msg_id)).await?;
+        let message = Message::load_from_db(&ctx, MsgId::new(info_msg_id)).await?;
         Ok(message.get_webxdc_href())
     }
 
@@ -1946,7 +2074,7 @@ impl CommandApi {
         let ctx = self.get_context(account_id).await?;
 
         let mut msg = Message::new(Viewtype::Sticker);
-        msg.set_file(&sticker_path, None);
+        msg.set_file_and_deduplicate(&ctx, Path::new(&sticker_path), None, None)?;
 
         // JSON-rpc does not need heuristics to turn [Viewtype::Sticker] into [Viewtype::Image]
         msg.force_sticker();
@@ -1998,6 +2126,16 @@ impl CommandApi {
             .context("Failed to send created message")?
             .to_u32();
         Ok(msg_id)
+    }
+
+    async fn send_edit_request(
+        &self,
+        account_id: u32,
+        msg_id: u32,
+        new_text: String,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        chat::send_edit_request(&ctx, MsgId::new(msg_id), new_text).await
     }
 
     /// Checks if messages can be sent to a given chat.
@@ -2166,12 +2304,45 @@ impl CommandApi {
 
     // mimics the old desktop call, will get replaced with something better in the composer rewrite,
     // the better version will just be sending the current draft, though there will be probably something similar with more options to this for the corner cases like setting a marker on the map
+    /// Send a message to a chat.
+    ///
+    /// This function returns after the message has been placed in the sending queue.
+    /// This does not imply that the message was really sent out yet.
+    /// However, from your view, you're done with the message.
+    /// Sooner or later it will find its way.
+    ///
+    /// **Attaching files:**
+    ///
+    /// Pass the file path in the `file` parameter.
+    /// If `file` is not in the blob directory yet,
+    /// it will be copied into the blob directory.
+    /// If you want, you can delete the file immediately after this function returns.
+    ///
+    /// You can also write the attachment directly into the blob directory
+    /// and then pass the path as the `file` parameter;
+    /// this will prevent an unnecessary copying of the file.
+    ///
+    /// In `filename`, you can pass the original name of the file,
+    /// which will then be shown in the UI.
+    /// in this case the current name of `file` on the filesystem will be ignored.
+    ///
+    /// In order to deduplicate files that contain the same data,
+    /// the file will be named `<hash>.<extension>`, e.g. `ce940175885d7b78f7b7e9f1396611f.jpg`.
+    ///
+    /// NOTE:
+    /// - This function will rename the file. To get the new file path, call `get_file()`.
+    /// - The file must not be modified after this function was called.
+    /// - Images etc. will NOT be recoded.
+    ///   In order to recode images,
+    ///   use `misc_set_draft` and pass `Image` as the viewtype.
+    #[expect(clippy::too_many_arguments)]
     async fn misc_send_msg(
         &self,
         account_id: u32,
         chat_id: u32,
         text: Option<String>,
         file: Option<String>,
+        filename: Option<String>,
         location: Option<(f64, f64)>,
         quoted_message_id: Option<u32>,
     ) -> Result<(u32, MessageObject)> {
@@ -2183,7 +2354,7 @@ impl CommandApi {
         });
         message.set_text(text.unwrap_or_default());
         if let Some(file) = file {
-            message.set_file(file, None);
+            message.set_file_and_deduplicate(&ctx, Path::new(&file), filename.as_deref(), None)?;
         }
         if let Some((latitude, longitude)) = location {
             message.set_location(latitude, longitude);
@@ -2211,12 +2382,14 @@ impl CommandApi {
     // the better version should support:
     // - changing viewtype to enable/disable compression
     // - keeping same message id as long as attachment does not change for webxdc messages
+    #[expect(clippy::too_many_arguments)]
     async fn misc_set_draft(
         &self,
         account_id: u32,
         chat_id: u32,
         text: Option<String>,
         file: Option<String>,
+        filename: Option<String>,
         quoted_message_id: Option<u32>,
         view_type: Option<MessageViewtype>,
     ) -> Result<()> {
@@ -2233,7 +2406,7 @@ impl CommandApi {
         ));
         draft.set_text(text.unwrap_or_default());
         if let Some(file) = file {
-            draft.set_file(file, None);
+            draft.set_file_and_deduplicate(&ctx, Path::new(&file), filename.as_deref(), None)?;
         }
         if let Some(id) = quoted_message_id {
             draft

@@ -5,12 +5,15 @@ use anyhow::Context as _;
 use super::session::Session as ImapSession;
 use super::{get_uid_next, get_uidvalidity, set_modseq, set_uid_next, set_uidvalidity};
 use crate::context::Context;
+use crate::log::{info, warn};
 
 type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("Got a NO response when trying to select {0}, usually this means that it doesn't exist: {1}")]
+    #[error(
+        "Got a NO response when trying to select {0}, usually this means that it doesn't exist: {1}"
+    )]
     NoFolder(String, String),
 
     #[error("IMAP other error: {0}")]
@@ -33,10 +36,10 @@ impl ImapSession {
     pub(super) async fn maybe_close_folder(&mut self, context: &Context) -> anyhow::Result<()> {
         if let Some(folder) = &self.selected_folder {
             if self.selected_folder_needs_expunge {
-                info!(context, "Expunge messages in \"{}\".", folder);
+                info!(context, "Expunge messages in {folder:?}.");
 
                 self.close().await.context("IMAP close/expunge failed")?;
-                info!(context, "close/expunge succeeded");
+                info!(context, "Close/expunge succeeded.");
                 self.selected_folder = None;
                 self.selected_folder_needs_expunge = false;
                 self.new_mail = false;
@@ -73,6 +76,7 @@ impl ImapSession {
 
         match res {
             Ok(mailbox) => {
+                info!(context, "Selected folder {folder:?}.");
                 self.selected_folder = Some(folder.to_string());
                 self.selected_mailbox = Some(mailbox);
                 Ok(NewlySelected::Yes)
@@ -94,7 +98,7 @@ impl ImapSession {
             Ok(newly_selected) => Ok(newly_selected),
             Err(err) => match err {
                 Error::NoFolder(..) => {
-                    info!(context, "Failed to select folder {} because it does not exist, trying to create it.", folder);
+                    info!(context, "Failed to select folder {folder:?} because it does not exist, trying to create it.");
                     let create_res = self.create(folder).await;
                     if let Err(ref err) = create_res {
                         info!(context, "Couldn't select folder, then create() failed: {err:#}.");
@@ -111,7 +115,8 @@ impl ImapSession {
         }
     }
 
-    /// Selects a folder and takes care of UIDVALIDITY changes.
+    /// Selects a folder optionally creating it and takes care of UIDVALIDITY changes. Returns false
+    /// iff `folder` doesn't exist.
     ///
     /// When selecting a folder for the first time, sets the uid_next to the current
     /// mailbox.uid_next so that no old emails are fetched.
@@ -123,22 +128,35 @@ impl ImapSession {
         &mut self,
         context: &Context,
         folder: &str,
-    ) -> Result<()> {
-        let newly_selected = self
-            .select_or_create_folder(context, folder)
-            .await
-            .with_context(|| format!("failed to select or create folder {folder}"))?;
+        create: bool,
+    ) -> Result<bool> {
+        let newly_selected = if create {
+            self.select_or_create_folder(context, folder)
+                .await
+                .with_context(|| format!("Failed to select or create folder {folder:?}"))?
+        } else {
+            match self.select_folder(context, folder).await {
+                Ok(newly_selected) => newly_selected,
+                Err(err) => match err {
+                    Error::NoFolder(..) => return Ok(false),
+                    _ => {
+                        return Err(err)
+                            .with_context(|| format!("Failed to select folder {folder:?}"))?;
+                    }
+                },
+            }
+        };
         let mailbox = self
             .selected_mailbox
             .as_mut()
-            .with_context(|| format!("No mailbox selected, folder: {folder}"))?;
+            .with_context(|| format!("No mailbox selected, folder: {folder:?}"))?;
 
         let old_uid_validity = get_uidvalidity(context, folder)
             .await
-            .with_context(|| format!("failed to get old UID validity for folder {folder}"))?;
+            .with_context(|| format!("Failed to get old UID validity for folder {folder:?}"))?;
         let old_uid_next = get_uid_next(context, folder)
             .await
-            .with_context(|| format!("failed to get old UID NEXT for folder {folder}"))?;
+            .with_context(|| format!("Failed to get old UID NEXT for folder {folder:?}"))?;
 
         let new_uid_validity = mailbox
             .uid_validity
@@ -194,12 +212,15 @@ impl ImapSession {
                     // If UIDNEXT changed, there are new emails.
                     self.new_mail |= new_uid_next != old_uid_next;
                 } else {
-                    warn!(context, "Folder {folder} was just selected but we failed to determine UIDNEXT, assume that it has new mail.");
+                    warn!(
+                        context,
+                        "Folder {folder} was just selected but we failed to determine UIDNEXT, assume that it has new mail."
+                    );
                     self.new_mail = true;
                 }
             }
 
-            return Ok(());
+            return Ok(true);
         }
 
         // UIDVALIDITY is modified, reset highest seen MODSEQ.
@@ -233,7 +254,7 @@ impl ImapSession {
             old_uid_next,
             old_uid_validity,
         );
-        Ok(())
+        Ok(true)
     }
 }
 

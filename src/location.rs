@@ -12,7 +12,7 @@
 
 use std::time::Duration;
 
-use anyhow::{ensure, Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use async_channel::Receiver;
 use quick_xml::events::{BytesEnd, BytesStart, BytesText};
 use tokio::time::timeout;
@@ -22,6 +22,7 @@ use crate::constants::DC_CHAT_ID_TRASH;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
+use crate::log::{info, warn};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::tools::{duration_to_str, time};
@@ -707,9 +708,6 @@ pub(crate) async fn save(
                     ))?;
 
                     if timestamp > newest_timestamp {
-                        // okay to drop, as we use cached prepared statements
-                        drop(stmt_test);
-                        drop(stmt_insert);
                         newest_timestamp = timestamp;
                         newest_location_id = Some(u32::try_from(conn.last_insert_rowid())?);
                     }
@@ -1077,7 +1075,7 @@ Content-Disposition: attachment; filename="location.kml"
         let file = alice.get_blobdir().join(file_name);
         tokio::fs::write(&file, bytes).await?;
         let mut msg = Message::new(Viewtype::Image);
-        msg.set_file(file.to_str().unwrap(), None);
+        msg.set_file_and_deduplicate(&alice, &file, Some("logo.png"), None)?;
         let sent = alice.send_msg(alice_chat.id, &mut msg).await;
         let alice_msg = Message::load_from_db(&alice, sent.sender_msg_id).await?;
         assert_eq!(alice_msg.has_location(), false);
@@ -1129,6 +1127,10 @@ Content-Disposition: attachment; filename="location.kml"
         bob.recv_msg_opt(&alice.pop_sent_msg().await).await;
         assert_eq!(get_range(alice, None, None, 0, 0).await?.len(), 1);
         assert_eq!(get_range(bob, None, None, 0, 0).await?.len(), 1);
+
+        // Location-only messages are "auto-generated", but they mustn't make the contact a bot.
+        let contact = bob.add_or_lookup_contact(alice).await;
+        assert!(!contact.is_bot());
 
         // Day later Bob removes location.
         SystemTime::shift(Duration::from_secs(86400));

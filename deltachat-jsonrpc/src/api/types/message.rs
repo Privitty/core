@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use crate::api::VcardContact;
 use anyhow::{Context as _, Result};
 use deltachat::chat::Chat;
@@ -17,10 +19,10 @@ use typescript_type_def::TypeDef;
 use super::color_int_to_hex_string;
 use super::contact::ContactObject;
 use super::reactions::JSONRPCReactions;
-use super::webxdc::WebxdcMessageInfo;
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase", tag = "kind")]
+#[expect(clippy::large_enum_variant)]
 pub enum MessageLoadResult {
     Message(MessageObject),
     LoadingError { error: String },
@@ -36,6 +38,8 @@ pub struct MessageObject {
     parent_id: Option<u32>,
 
     text: String,
+
+    is_edited: bool,
 
     /// Check if a message has a POI location bound to it.
     /// These locations are also returned by `get_locations` method.
@@ -55,6 +59,13 @@ pub struct MessageObject {
 
     // summary - use/create another function if you need it
     subject: String,
+
+    /// True if the message was correctly encrypted&signed, false otherwise.
+    /// Historically, UIs showed a small padlock on the message then.
+    ///
+    /// Today, the UIs should instead show a small email-icon on the message
+    /// if `show_padlock` is `false`,
+    /// and nothing if it is `true`.
     show_padlock: bool,
     is_setupmessage: bool,
     is_info: bool,
@@ -65,6 +76,9 @@ pub struct MessageObject {
 
     /// when is_info is true this describes what type of system message it is
     system_message_type: SystemMessageType,
+
+    /// if is_info is set, this refers to the contact profile that should be opened when the info message is tapped.
+    info_contact_id: Option<u32>,
 
     duration: i32,
     dimensions_height: i32,
@@ -83,11 +97,13 @@ pub struct MessageObject {
     file_bytes: u64,
     file_name: Option<String>,
 
-    webxdc_info: Option<WebxdcMessageInfo>,
-
     webxdc_href: Option<String>,
 
     download_state: DownloadState,
+
+    original_msg_id: Option<u32>,
+
+    saved_message_id: Option<u32>,
 
     reactions: Option<JSONRPCReactions>,
 
@@ -104,6 +120,9 @@ enum MessageQuote {
     WithMessage {
         text: String,
         message_id: u32,
+        /// The quoted message does not always belong
+        /// to the same chat, e.g. when "Reply Privately" is used.
+        chat_id: u32,
         author_display_name: String,
         author_display_color: String,
         override_sender_name: Option<String>,
@@ -128,12 +147,6 @@ impl MessageObject {
         let file_bytes = message.get_filebytes(context).await?.unwrap_or_default();
         let override_sender_name = message.get_override_sender_name();
 
-        let webxdc_info = if message.get_viewtype() == Viewtype::Webxdc {
-            Some(WebxdcMessageInfo::get_for_message(context, msg_id).await?)
-        } else {
-            None
-        };
-
         let parent_id = message.parent(context).await?.map(|m| m.get_id().to_u32());
 
         let download_state = message.download_state().into();
@@ -147,6 +160,7 @@ impl MessageObject {
                     Some(MessageQuote::WithMessage {
                         text: quoted_text,
                         message_id: quote.get_id().to_u32(),
+                        chat_id: quote.get_chat_id().to_u32(),
                         author_display_name: quote_author.get_display_name().to_owned(),
                         author_display_color: color_int_to_hex_string(quote_author.get_color()),
                         override_sender_name: quote.get_override_sender_name(),
@@ -194,6 +208,7 @@ impl MessageObject {
             quote,
             parent_id,
             text: message.get_text(),
+            is_edited: message.is_edited(),
             has_location: message.has_location(),
             has_html: message.has_html(),
             view_type: message.get_viewtype().into(),
@@ -215,6 +230,10 @@ impl MessageObject {
             is_forwarded: message.is_forwarded(),
             is_bot: message.is_bot(),
             system_message_type: message.get_info_type().into(),
+            info_contact_id: message
+                .get_info_contact_id(context)
+                .await?
+                .map(|id| id.to_u32()),
 
             duration: message.get_duration(),
             dimensions_height: message.get_height(),
@@ -241,13 +260,22 @@ impl MessageObject {
             file_mime: message.get_filemime(),
             file_bytes,
             file_name: message.get_filename(),
-            webxdc_info,
 
             // On a WebxdcInfoMessage this might include a hash holding
             // information about a specific position or state in a webxdc app
             webxdc_href: message.get_webxdc_href(),
 
             download_state,
+
+            original_msg_id: message
+                .get_original_msg_id(context)
+                .await?
+                .map(|id| id.to_u32()),
+
+            saved_message_id: message
+                .get_saved_msg_id(context)
+                .await?
+                .map(|id| id.to_u32()),
 
             reactions,
 
@@ -273,6 +301,9 @@ pub enum MessageViewtype {
     Gif,
 
     /// Message containing a sticker, similar to image.
+    /// NB: When sending, the message viewtype may be changed to `Image` by some heuristics like
+    /// checking for transparent pixels. Use `Message::force_sticker()` to disable them.
+    ///
     /// If possible, the ui should display the image without borders in a transparent way.
     /// A click on a sticker will offer to install the sticker set in some future.
     Sticker,
@@ -586,6 +617,7 @@ pub struct MessageData {
     pub html: Option<String>,
     pub viewtype: Option<MessageViewtype>,
     pub file: Option<String>,
+    pub filename: Option<String>,
     pub location: Option<(f64, f64)>,
     pub override_sender_name: Option<String>,
     /// Quoted message id. Takes preference over `quoted_text` (see below).
@@ -610,7 +642,12 @@ impl MessageData {
             message.set_override_sender_name(self.override_sender_name);
         }
         if let Some(file) = self.file {
-            message.set_file(file, None);
+            message.set_file_and_deduplicate(
+                context,
+                Path::new(&file),
+                self.filename.as_deref(),
+                None,
+            )?;
         }
         if let Some((latitude, longitude)) = self.location {
             message.set_location(latitude, longitude);
@@ -641,7 +678,6 @@ pub struct MessageReadReceipt {
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageInfo {
-    rawtext: String,
     ephemeral_timer: EphemeralTimer,
     /// When message is ephemeral this contains the timestamp of the message expiry
     ephemeral_timestamp: Option<i64>,
@@ -654,7 +690,6 @@ pub struct MessageInfo {
 impl MessageInfo {
     pub async fn from_msg_id(context: &Context, msg_id: MsgId) -> Result<Self> {
         let message = Message::load_from_db(context, msg_id).await?;
-        let rawtext = msg_id.rawtext(context).await?;
         let ephemeral_timer = message.get_ephemeral_timer().into();
         let ephemeral_timestamp = match message.get_ephemeral_timer() {
             deltachat::ephemeral::Timer::Disabled => None,
@@ -667,7 +702,6 @@ impl MessageInfo {
         let hop_info = msg_id.hop_info(context).await?;
 
         Ok(Self {
-            rawtext,
             ephemeral_timer,
             ephemeral_timestamp,
             error: message.error(),

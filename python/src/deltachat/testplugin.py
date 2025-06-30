@@ -423,8 +423,6 @@ class ACFactory:
         where we can make valid SMTP and IMAP connections with.
         """
         configdict = next(self._liveconfig_producer).copy()
-        if "e2ee_enabled" not in configdict:
-            configdict["e2ee_enabled"] = "1"
 
         if self.pytestconfig.getoption("--strict-tls"):
             # Enable strict certificate checks for online accounts
@@ -484,12 +482,8 @@ class ACFactory:
         addr = f"{acname}@offline.org"
         ac.update_config(
             {
-                "addr": addr,
-                "displayname": acname,
-                "mail_pw": "123",
                 "configured_addr": addr,
-                "configured_mail_pw": "123",
-                "configured": "1",
+                "displayname": acname,
             },
         )
         self._preconfigure_key(ac)
@@ -651,6 +645,9 @@ class BotProcess:
 
     def __init__(self, popen, addr) -> None:
         self.popen = popen
+
+        # The first thing the bot prints to stdout is an invite link.
+        self.qr = self.popen.stdout.readline()
         self.addr = addr
 
         # we read stdout as quickly as we can in a thread and make

@@ -1,3 +1,5 @@
+"""Account module."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,17 +28,35 @@ class Account:
     def _rpc(self) -> "Rpc":
         return self.manager.rpc
 
-    def wait_for_event(self) -> AttrDict:
+    def wait_for_event(self, event_type=None) -> AttrDict:
         """Wait until the next event and return it."""
-        return AttrDict(self._rpc.wait_for_event(self.id))
+        while True:
+            next_event = AttrDict(self._rpc.wait_for_event(self.id))
+            if event_type is None or next_event.kind == event_type:
+                return next_event
 
     def clear_all_events(self):
-        """Removes all queued-up events for a given account. Useful for tests."""
+        """Remove all queued-up events for a given account.
+
+        Useful for tests.
+        """
         self._rpc.clear_all_events(self.id)
 
     def remove(self) -> None:
         """Remove the account."""
         self._rpc.remove_account(self.id)
+
+    def clone(self) -> "Account":
+        """Clone given account.
+
+        This uses backup-transfer via iroh, i.e. the 'Add second device' feature.
+        """
+        future = self._rpc.provide_backup.future(self.id)
+        qr = self._rpc.get_backup_qr(self.id)
+        new_account = self.manager.add_account()
+        new_account._rpc.get_backup(new_account.id, qr)
+        future()
+        return new_account
 
     def start_io(self) -> None:
         """Start the account I/O."""
@@ -67,7 +87,7 @@ class Account:
         return self._rpc.get_config(self.id, key)
 
     def update_config(self, **kwargs) -> None:
-        """update config values."""
+        """Update config values."""
         for key, value in kwargs.items():
             self.set_config(key, value)
 
@@ -83,9 +103,15 @@ class Account:
         return self.get_config("selfavatar")
 
     def check_qr(self, qr):
+        """Parse QR code contents.
+
+        This function takes the raw text scanned
+        and checks what can be done with it.
+        """
         return self._rpc.check_qr(self.id, qr)
 
     def set_config_from_qr(self, qr: str):
+        """Set configuration values from a QR code."""
         self._rpc.set_config_from_qr(self.id, qr)
 
     @futuremethod
@@ -93,15 +119,23 @@ class Account:
         """Configure an account."""
         yield self._rpc.configure.future(self.id)
 
+    @futuremethod
+    def add_or_update_transport(self, params):
+        """Add a new transport."""
+        yield self._rpc.add_or_update_transport.future(self.id, params)
+
+    @futuremethod
+    def list_transports(self):
+        """Return the list of all email accounts that are used as a transport in the current profile."""
+        transports = yield self._rpc.list_transports.future(self.id)
+        return transports
+
     def bring_online(self):
         """Start I/O and wait until IMAP becomes IDLE."""
         self.start_io()
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.IMAP_INBOX_IDLE:
-                break
+        self.wait_for_event(EventType.IMAP_INBOX_IDLE)
 
-    def create_contact(self, obj: Union[int, str, Contact], name: Optional[str] = None) -> Contact:
+    def create_contact(self, obj: Union[int, str, Contact, "Account"], name: Optional[str] = None) -> Contact:
         """Create a new Contact or return an existing one.
 
         Calling this method will always result in the same
@@ -109,19 +143,42 @@ class Account:
         with that e-mail address, it is unblocked and its display
         name is updated if specified.
 
-        :param obj: email-address or contact id.
+        :param obj: email-address, contact id or account.
         :param name: (optional) display name for this contact.
         """
+        if isinstance(obj, Account):
+            vcard = obj.self_contact.make_vcard()
+            [contact] = self.import_vcard(vcard)
+            if name:
+                contact.set_name(name)
+            return contact
         if isinstance(obj, int):
             obj = Contact(self, obj)
         if isinstance(obj, Contact):
             obj = obj.get_snapshot().address
         return Contact(self, self._rpc.create_contact(self.id, obj, name))
 
+    def make_vcard(self, contacts: list[Contact]) -> str:
+        """Create vCard with the given contacts."""
+        assert all(contact.account == self for contact in contacts)
+        contact_ids = [contact.id for contact in contacts]
+        return self._rpc.make_vcard(self.id, contact_ids)
+
+    def import_vcard(self, vcard: str) -> list[Contact]:
+        """Import vCard.
+
+        Return created or modified contacts in the order they appear in vCard.
+        """
+        contact_ids = self._rpc.import_vcard_contents(self.id, vcard)
+        return [Contact(self, contact_id) for contact_id in contact_ids]
+
     def create_chat(self, account: "Account") -> Chat:
-        addr = account.get_config("addr")
-        contact = self.create_contact(addr)
-        return contact.create_chat()
+        """Create a 1:1 chat with another account."""
+        return self.create_contact(account).create_chat()
+
+    def get_device_chat(self) -> Chat:
+        """Return device chat."""
+        return self.device_contact.create_chat()
 
     def get_contact_by_id(self, contact_id: int) -> Contact:
         """Return Contact instance for the given contact ID."""
@@ -154,8 +211,8 @@ class Account:
     def get_contacts(
         self,
         query: Optional[str] = None,
+        *,
         with_self: bool = False,
-        verified_only: bool = False,
         snapshot: bool = False,
     ) -> Union[list[Contact], list[AttrDict]]:
         """Get a filtered list of contacts.
@@ -163,12 +220,9 @@ class Account:
         :param query: if a string is specified, only return contacts
                       whose name or e-mail matches query.
         :param with_self: if True the self-contact is also included if it matches the query.
-        :param only_verified: if True only return verified contacts.
         :param snapshot: If True return a list of contact snapshots instead of Contact instances.
         """
         flags = 0
-        if verified_only:
-            flags |= ContactFlag.VERIFIED_ONLY
         if with_self:
             flags |= ContactFlag.ADD_SELF
 
@@ -180,8 +234,13 @@ class Account:
 
     @property
     def self_contact(self) -> Contact:
-        """This account's identity as a Contact."""
+        """Account's identity as a Contact."""
         return Contact(self, SpecialContactId.SELF)
+
+    @property
+    def device_contact(self) -> Chat:
+        """Account's device contact."""
+        return Contact(self, SpecialContactId.DEVICE)
 
     def get_chatlist(
         self,
@@ -238,8 +297,7 @@ class Account:
         return Chat(self, chat_id)
 
     def secure_join(self, qrdata: str) -> Chat:
-        """Continue a Setup-Contact or Verified-Group-Invite protocol started on
-        another device.
+        """Continue a Setup-Contact or Verified-Group-Invite protocol started on another device.
 
         The function returns immediately and the handshake runs in background, sending
         and receiving several messages.
@@ -296,34 +354,40 @@ class Account:
 
     def wait_for_incoming_msg_event(self):
         """Wait for incoming message event and return it."""
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.INCOMING_MSG:
-                return event
+        return self.wait_for_event(EventType.INCOMING_MSG)
+
+    def wait_for_msgs_changed_event(self):
+        """Wait for messages changed event and return it."""
+        return self.wait_for_event(EventType.MSGS_CHANGED)
+
+    def wait_for_msgs_noticed_event(self):
+        """Wait for messages noticed event and return it."""
+        return self.wait_for_event(EventType.MSGS_NOTICED)
 
     def wait_for_incoming_msg(self):
         """Wait for incoming message and return it.
 
-        Consumes all events before the next incoming message event."""
+        Consumes all events before the next incoming message event.
+        """
         return self.get_message_by_id(self.wait_for_incoming_msg_event().msg_id)
 
     def wait_for_securejoin_inviter_success(self):
+        """Wait until SecureJoin process finishes successfully on the inviter side."""
         while True:
             event = self.wait_for_event()
             if event["kind"] == "SecurejoinInviterProgress" and event["progress"] == 1000:
                 break
 
     def wait_for_securejoin_joiner_success(self):
+        """Wait until SecureJoin process finishes successfully on the joiner side."""
         while True:
             event = self.wait_for_event()
             if event["kind"] == "SecurejoinJoinerProgress" and event["progress"] == 1000:
                 break
 
     def wait_for_reactions_changed(self):
-        while True:
-            event = self.wait_for_event()
-            if event.kind == EventType.REACTIONS_CHANGED:
-                return event
+        """Wait for reaction change event."""
+        return self.wait_for_event(EventType.REACTIONS_CHANGED)
 
     def get_fresh_messages_in_arrival_order(self) -> list[Message]:
         """Return fresh messages list sorted in the order of their arrival, with ascending IDs."""
@@ -352,3 +416,7 @@ class Account:
         """Import keys."""
         passphrase = ""  # Importing passphrase-protected keys is currently not supported.
         self._rpc.import_self_keys(self.id, str(path), passphrase)
+
+    def initiate_autocrypt_key_transfer(self) -> None:
+        """Send Autocrypt Setup Message."""
+        return self._rpc.initiate_autocrypt_key_transfer(self.id)

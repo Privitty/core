@@ -1,29 +1,27 @@
 //! # Blob directory management.
 
 use core::cmp::max;
-use std::ffi::OsStr;
-use std::fmt;
 use std::io::{Cursor, Seek};
 use std::iter::FusedIterator;
 use std::mem;
 use std::path::{Path, PathBuf};
 
-use anyhow::{format_err, Context as _, Result};
+use anyhow::{Context as _, Result, ensure, format_err};
 use base64::Engine as _;
 use futures::StreamExt;
-use image::codecs::jpeg::JpegEncoder;
 use image::ImageReader;
+use image::codecs::jpeg::JpegEncoder;
 use image::{DynamicImage, GenericImage, GenericImageView, ImageFormat, Pixel, Rgba};
 use num_traits::FromPrimitive;
-use tokio::io::AsyncWriteExt;
-use tokio::{fs, io};
+use tokio::{fs, task};
 use tokio_stream::wrappers::ReadDirStream;
 
 use crate::config::Config;
 use crate::constants::{self, MediaQuality};
 use crate::context::Context;
 use crate::events::EventType;
-use crate::log::LogExt;
+use crate::log::{LogExt, error, info, warn};
+use crate::tools::sanitize_filename;
 
 /// Represents a file in the blob directory.
 ///
@@ -34,6 +32,10 @@ use crate::log::LogExt;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobObject<'a> {
     blobdir: &'a Path,
+
+    /// The name of the file on the disc.
+    /// Note that this is NOT the user-visible filename,
+    /// which is only stored in Param::Filename on the message.
     name: String,
 }
 
@@ -44,120 +46,98 @@ enum ImageOutputFormat {
 }
 
 impl<'a> BlobObject<'a> {
-    /// Creates a new blob object with a unique name.
+    /// Creates a blob object by copying or renaming an existing file.
+    /// If the source file is already in the blobdir, it will be renamed,
+    /// otherwise it will be copied to the blobdir first.
     ///
-    /// Creates a new file in the blob directory.  The name will be
-    /// derived from the platform-agnostic basename of the suggested
-    /// name, followed by a random number and followed by a possible
-    /// extension.  The `data` will be written into the file without
-    /// race-conditions.
-    pub async fn create(
-        context: &'a Context,
-        suggested_name: &str,
-        data: &[u8],
-    ) -> Result<BlobObject<'a>> {
-        let blobdir = context.get_blobdir();
-        let (stem, ext) = BlobObject::sanitise_name(suggested_name);
-        let (name, mut file) = BlobObject::create_new_file(context, blobdir, &stem, &ext).await?;
-        file.write_all(data).await.context("file write failure")?;
-
-        // workaround a bug in async-std
-        // (the executor does not handle blocking operation in Drop correctly,
-        // see <https://github.com/async-rs/async-std/issues/900>)
-        let _ = file.flush().await;
-
-        let blob = BlobObject {
-            blobdir,
-            name: format!("$BLOBDIR/{name}"),
-        };
-        context.emit_event(EventType::NewBlobFile(blob.as_name().to_string()));
-        Ok(blob)
-    }
-
-    // Creates a new file, returning a tuple of the name and the handle.
-    async fn create_new_file(
-        context: &Context,
-        dir: &Path,
-        stem: &str,
-        ext: &str,
-    ) -> Result<(String, fs::File)> {
-        const MAX_ATTEMPT: u32 = 16;
-        let mut attempt = 0;
-        let mut name = format!("{stem}{ext}");
-        loop {
-            attempt += 1;
-            let path = dir.join(&name);
-            match fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&path)
-                .await
-            {
-                Ok(file) => return Ok((name, file)),
-                Err(err) => {
-                    if attempt >= MAX_ATTEMPT {
-                        return Err(err).context("failed to create file");
-                    } else if attempt == 1 && !dir.exists() {
-                        fs::create_dir_all(dir).await.log_err(context).ok();
-                    } else {
-                        name = format!("{}-{}{}", stem, rand::random::<u32>(), ext);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Creates a new blob object with unique name by copying an existing file.
+    /// In order to deduplicate files that contain the same data,
+    /// the file will be named `<hash>.<extension>`, e.g. `ce940175885d7b78f7b7e9f1396611f.jpg`.
+    /// The `original_name` param is only used to get the extension.
     ///
-    /// This creates a new blob as described in [BlobObject::create]
-    /// but also copies an existing file into it.  This is done in a
-    /// in way which avoids race-conditions when multiple files are
+    /// This is done in a in way which avoids race-conditions when multiple files are
     /// concurrently created.
-    pub async fn create_and_copy(context: &'a Context, src: &Path) -> Result<BlobObject<'a>> {
-        let mut src_file = fs::File::open(src)
-            .await
-            .with_context(|| format!("failed to open file {}", src.display()))?;
-        let (stem, ext) = BlobObject::sanitise_name(&src.to_string_lossy());
-        let (name, mut dst_file) =
-            BlobObject::create_new_file(context, context.get_blobdir(), &stem, &ext).await?;
-        let name_for_err = name.clone();
-        if let Err(err) = io::copy(&mut src_file, &mut dst_file).await {
-            // Attempt to remove the failed file, swallow errors resulting from that.
-            let path = context.get_blobdir().join(&name_for_err);
-            fs::remove_file(path).await.ok();
-            return Err(err).context("failed to copy file");
-        }
+    pub fn create_and_deduplicate(
+        context: &'a Context,
+        src: &Path,
+        original_name: &Path,
+    ) -> Result<BlobObject<'a>> {
+        // `create_and_deduplicate{_from_bytes}()` do blocking I/O, but can still be called
+        // from an async context thanks to `block_in_place()`.
+        // Tokio's "async" I/O functions are also just thin wrappers around the blocking I/O syscalls,
+        // so we are doing essentially the same here.
+        task::block_in_place(|| {
+            let temp_path;
+            let src_in_blobdir: &Path;
+            let blobdir = context.get_blobdir();
 
-        // workaround, see create() for details
-        let _ = dst_file.flush().await;
+            if src.starts_with(blobdir) {
+                src_in_blobdir = src;
+            } else {
+                info!(
+                    context,
+                    "Source file not in blobdir. Copying instead of moving in order to prevent moving a file that was still needed."
+                );
+                temp_path = blobdir.join(format!("tmp-{}", rand::random::<u64>()));
+                if std::fs::copy(src, &temp_path).is_err() {
+                    // Maybe the blobdir didn't exist
+                    std::fs::create_dir_all(blobdir).log_err(context).ok();
+                    std::fs::copy(src, &temp_path).context("Copying new blobfile failed")?;
+                };
+                src_in_blobdir = &temp_path;
+            }
 
-        let blob = BlobObject {
-            blobdir: context.get_blobdir(),
-            name: format!("$BLOBDIR/{name}"),
-        };
-        context.emit_event(EventType::NewBlobFile(blob.as_name().to_string()));
-        Ok(blob)
+            let hash = file_hash(src_in_blobdir)?.to_hex();
+            let hash = hash.as_str();
+            let hash = hash.get(0..31).unwrap_or(hash);
+            let new_file =
+                if let Some(extension) = original_name.extension().filter(|e| e.len() <= 32) {
+                    let extension = extension.to_string_lossy().to_lowercase();
+                    let extension = sanitize_filename(&extension);
+                    format!("$BLOBDIR/{hash}.{extension}")
+                } else {
+                    format!("$BLOBDIR/{hash}")
+                };
+
+            let blob = BlobObject {
+                blobdir,
+                name: new_file,
+            };
+            let new_path = blob.to_abs_path();
+
+            // This will also replace an already-existing file.
+            // Renaming is atomic, so this will avoid race conditions.
+            std::fs::rename(src_in_blobdir, &new_path)?;
+
+            context.emit_event(EventType::NewBlobFile(blob.as_name().to_string()));
+            Ok(blob)
+        })
     }
 
-    /// Creates a blob from a file, possibly copying it to the blobdir.
+    /// Creates a new blob object with the file contents in `data`.
+    /// In order to deduplicate files that contain the same data,
+    /// the file will be named `<hash>.<extension>`, e.g. `ce940175885d7b78f7b7e9f1396611f.jpg`.
+    /// The `original_name` param is only used to get the extension.
     ///
-    /// If the source file is not a path to into the blob directory
-    /// the file will be copied into the blob directory first.  If the
-    /// source file is already in the blobdir it will not be copied
-    /// and only be created if it is a valid blobname, that is no
-    /// subdirectory is used and [BlobObject::sanitise_name] does not
-    /// modify the filename.
+    /// The `data` will be written into the file without race-conditions.
     ///
-    /// Paths into the blob directory may be either defined by an absolute path
-    /// or by the relative prefix `$BLOBDIR`.
-    pub async fn new_from_path(context: &'a Context, src: &Path) -> Result<BlobObject<'a>> {
-        if src.starts_with(context.get_blobdir()) {
-            BlobObject::from_path(context, src)
-        } else if src.starts_with("$BLOBDIR/") {
-            BlobObject::from_name(context, src.to_str().unwrap_or_default().to_string())
-        } else {
-            BlobObject::create_and_copy(context, src).await
-        }
+    /// This function does blocking I/O, but it can still be called from an async context
+    /// because `block_in_place()` is used to leave the async runtime if necessary.
+    pub fn create_and_deduplicate_from_bytes(
+        context: &'a Context,
+        data: &[u8],
+        original_name: &str,
+    ) -> Result<BlobObject<'a>> {
+        task::block_in_place(|| {
+            let blobdir = context.get_blobdir();
+            let temp_path = blobdir.join(format!("tmp-{}", rand::random::<u64>()));
+            if std::fs::write(&temp_path, data).is_err() {
+                // Maybe the blobdir didn't exist
+                std::fs::create_dir_all(blobdir).log_err(context).ok();
+                std::fs::write(&temp_path, data).context("writing new blobfile failed")?;
+            };
+
+            BlobObject::create_and_deduplicate(context, &temp_path, Path::new(original_name))
+        })
     }
 
     /// Returns a [BlobObject] for an existing blob from a path.
@@ -170,11 +150,11 @@ impl<'a> BlobObject<'a> {
         let rel_path = path
             .strip_prefix(context.get_blobdir())
             .with_context(|| format!("wrong blobdir: {}", path.display()))?;
-        if !BlobObject::is_acceptible_blob_name(rel_path) {
+        let name = rel_path.to_str().context("wrong name")?;
+        if !BlobObject::is_acceptible_blob_name(name) {
             return Err(format_err!("bad blob name: {}", rel_path.display()));
         }
-        let name = rel_path.to_str().context("wrong name")?;
-        BlobObject::from_name(context, name.to_string())
+        BlobObject::from_name(context, name)
     }
 
     /// Returns a [BlobObject] for an existing blob.
@@ -183,13 +163,13 @@ impl<'a> BlobObject<'a> {
     /// prefixed, as returned by [BlobObject::as_name].  This is how
     /// you want to create a [BlobObject] for a filename read from the
     /// database.
-    pub fn from_name(context: &'a Context, name: String) -> Result<BlobObject<'a>> {
-        let name: String = match name.starts_with("$BLOBDIR/") {
-            true => name.splitn(2, '/').last().unwrap().to_string(),
+    pub fn from_name(context: &'a Context, name: &str) -> Result<BlobObject<'a>> {
+        let name = match name.starts_with("$BLOBDIR/") {
+            true => name.splitn(2, '/').last().unwrap(),
             false => name,
         };
-        if !BlobObject::is_acceptible_blob_name(&name) {
-            return Err(format_err!("not an acceptable blob name: {}", &name));
+        if !BlobObject::is_acceptible_blob_name(name) {
+            return Err(format_err!("not an acceptable blob name: {}", name));
         }
         Ok(BlobObject {
             blobdir: context.get_blobdir(),
@@ -210,19 +190,13 @@ impl<'a> BlobObject<'a> {
     /// this string in the database or [Params].  Eventually even
     /// those conversions should be handled by the type system.
     ///
+    /// Note that this is NOT the user-visible filename,
+    /// which is only stored in Param::Filename on the message.
+    ///
+    #[allow(rustdoc::private_intra_doc_links)]
     /// [Params]: crate::param::Params
     pub fn as_name(&self) -> &str {
         &self.name
-    }
-
-    /// Returns the filename of the blob.
-    pub fn as_file_name(&self) -> &str {
-        self.name.rsplit('/').next().unwrap_or_default()
-    }
-
-    /// The path relative in the blob directory.
-    pub fn as_rel_path(&self) -> &Path {
-        Path::new(self.as_file_name())
     }
 
     /// Returns the extension of the blob.
@@ -231,99 +205,24 @@ impl<'a> BlobObject<'a> {
     /// to be lowercase.
     pub fn suffix(&self) -> Option<&str> {
         let ext = self.name.rsplit('.').next();
-        if ext == Some(&self.name) {
-            None
-        } else {
-            ext
-        }
-    }
-
-    /// Create a safe name based on a messy input string.
-    ///
-    /// The safe name will be a valid filename on Unix and Windows and
-    /// not contain any path separators.  The input can contain path
-    /// segments separated by either Unix or Windows path separators,
-    /// the rightmost non-empty segment will be used as name,
-    /// sanitised for special characters.
-    ///
-    /// The resulting name is returned as a tuple, the first part
-    /// being the stem or basename and the second being an extension,
-    /// including the dot.  E.g. "foo.txt" is returned as `("foo",
-    /// ".txt")` while "bar" is returned as `("bar", "")`.
-    ///
-    /// The extension part will always be lowercased.
-    fn sanitise_name(name: &str) -> (String, String) {
-        let mut name = name;
-        for part in name.rsplit('/') {
-            if !part.is_empty() {
-                name = part;
-                break;
-            }
-        }
-        for part in name.rsplit('\\') {
-            if !part.is_empty() {
-                name = part;
-                break;
-            }
-        }
-        let opts = sanitize_filename::Options {
-            truncate: true,
-            windows: true,
-            replacement: "",
-        };
-
-        let name = sanitize_filename::sanitize_with_options(name, opts);
-        // Let's take a tricky filename,
-        // "file.with_lots_of_characters_behind_point_and_double_ending.tar.gz" as an example.
-        // Assume that the extension is 32 chars maximum.
-        let ext: String = name
-            .chars()
-            .rev()
-            .take_while(|c| !c.is_whitespace())
-            .take(33)
-            .collect::<Vec<_>>()
-            .iter()
-            .rev()
-            .collect();
-        // ext == "nd_point_and_double_ending.tar.gz"
-
-        // Split it into "nd_point_and_double_ending" and "tar.gz":
-        let mut iter = ext.splitn(2, '.');
-        iter.next();
-
-        let ext = iter.next().unwrap_or_default();
-        let ext = if ext.is_empty() {
-            String::new()
-        } else {
-            format!(".{ext}")
-            // ".tar.gz"
-        };
-        let stem = name
-            .strip_suffix(&ext)
-            .unwrap_or_default()
-            .chars()
-            .take(64)
-            .collect();
-        (stem, ext.to_lowercase())
+        if ext == Some(&self.name) { None } else { ext }
     }
 
     /// Checks whether a name is a valid blob name.
     ///
     /// This is slightly less strict than stanitise_name, presumably
     /// someone already created a file with such a name so we just
-    /// ensure it's not actually a path in disguise is actually utf-8.
-    fn is_acceptible_blob_name(name: impl AsRef<OsStr>) -> bool {
-        let uname = match name.as_ref().to_str() {
-            Some(name) => name,
-            None => return false,
-        };
-        if uname.find('/').is_some() {
+    /// ensure it's not actually a path in disguise.
+    ///
+    /// Acceptible blob name always have to be valid utf-8.
+    fn is_acceptible_blob_name(name: &str) -> bool {
+        if name.find('/').is_some() {
             return false;
         }
-        if uname.find('\\').is_some() {
+        if name.find('\\').is_some() {
             return false;
         }
-        if uname.find('\0').is_some() {
+        if name.find('\0').is_some() {
             return false;
         }
         true
@@ -331,53 +230,50 @@ impl<'a> BlobObject<'a> {
 
     /// Returns path to the stored Base64-decoded blob.
     ///
-    /// If `data` represents an image of known format, this adds the corresponding extension to
-    /// `suggested_file_stem`.
-    pub(crate) async fn store_from_base64(
-        context: &Context,
-        data: &str,
-        suggested_file_stem: &str,
-    ) -> Result<String> {
+    /// If `data` represents an image of known format, this adds the corresponding extension.
+    ///
+    /// Even though this function is not async, it's OK to call it from an async context.
+    pub(crate) fn store_from_base64(context: &Context, data: &str) -> Result<String> {
         let buf = base64::engine::general_purpose::STANDARD.decode(data)?;
-        let ext = if let Ok(format) = image::guess_format(&buf) {
+        let name = if let Ok(format) = image::guess_format(&buf) {
             if let Some(ext) = format.extensions_str().first() {
-                format!(".{ext}")
+                format!("file.{ext}")
             } else {
                 String::new()
             }
         } else {
             String::new()
         };
-        let blob =
-            BlobObject::create(context, &format!("{suggested_file_stem}{ext}"), &buf).await?;
+        let blob = BlobObject::create_and_deduplicate_from_bytes(context, &buf, &name)?;
         Ok(blob.as_name().to_string())
     }
 
+    /// Recode image to avatar size.
     pub async fn recode_to_avatar_size(&mut self, context: &Context) -> Result<()> {
-        let blob_abs = self.to_abs_path();
-
-        let img_wh =
+        let (img_wh, max_bytes) =
             match MediaQuality::from_i32(context.get_config_int(Config::MediaQuality).await?)
                 .unwrap_or_default()
             {
-                MediaQuality::Balanced => constants::BALANCED_AVATAR_SIZE,
-                MediaQuality::Worse => constants::WORSE_AVATAR_SIZE,
+                MediaQuality::Balanced => (
+                    constants::BALANCED_AVATAR_SIZE,
+                    constants::BALANCED_AVATAR_BYTES,
+                ),
+                MediaQuality::Worse => {
+                    (constants::WORSE_AVATAR_SIZE, constants::WORSE_AVATAR_BYTES)
+                }
             };
 
         let maybe_sticker = &mut false;
-        let strict_limits = true;
-        // max_bytes is 20_000 bytes: Outlook servers don't allow headers larger than 32k.
-        // 32 / 4 * 3 = 24k if you account for base64 encoding. To be safe, we reduced this to 20k.
-        if let Some(new_name) = self.recode_to_size(
+        let is_avatar = true;
+        self.recode_to_size(
             context,
-            blob_abs,
+            None, // The name of an avatar doesn't matter
             maybe_sticker,
             img_wh,
-            20_000,
-            strict_limits,
-        )? {
-            self.name = new_name;
-        }
+            max_bytes,
+            is_avatar,
+        )?;
+
         Ok(())
     }
 
@@ -391,9 +287,9 @@ impl<'a> BlobObject<'a> {
     pub async fn recode_to_image_size(
         &mut self,
         context: &Context,
+        name: Option<String>,
         maybe_sticker: &mut bool,
-    ) -> Result<()> {
-        let blob_abs = self.to_abs_path();
+    ) -> Result<String> {
         let (img_wh, max_bytes) =
             match MediaQuality::from_i32(context.get_config_int(Config::MediaQuality).await?)
                 .unwrap_or_default()
@@ -404,36 +300,40 @@ impl<'a> BlobObject<'a> {
                 ),
                 MediaQuality::Worse => (constants::WORSE_IMAGE_SIZE, constants::WORSE_IMAGE_BYTES),
             };
-        let strict_limits = false;
-        if let Some(new_name) = self.recode_to_size(
-            context,
-            blob_abs,
-            maybe_sticker,
-            img_wh,
-            max_bytes,
-            strict_limits,
-        )? {
-            self.name = new_name;
-        }
-        Ok(())
+        let is_avatar = false;
+        let new_name =
+            self.recode_to_size(context, name, maybe_sticker, img_wh, max_bytes, is_avatar)?;
+
+        Ok(new_name)
     }
 
-    /// If `!strict_limits`, then if `max_bytes` is exceeded, reduce the image to `img_wh` and just
-    /// proceed with the result.
+    /// Recodes the image so that it fits into limits on width/height and byte size.
+    ///
+    /// If `!is_avatar`, then if `max_bytes` is exceeded, reduces the image to `img_wh` and proceeds
+    /// with the result without rechecking.
+    ///
+    /// This modifies the blob object in-place.
+    ///
+    /// Additionally, if you pass the user-visible filename as `name`
+    /// then the updated user-visible filename will be returned;
+    /// this may be necessary because the format may be changed to JPG,
+    /// i.e. "image.png" -> "image.jpg".
     fn recode_to_size(
         &mut self,
         context: &Context,
-        mut blob_abs: PathBuf,
+        name: Option<String>,
         maybe_sticker: &mut bool,
         mut img_wh: u32,
         max_bytes: usize,
-        strict_limits: bool,
-    ) -> Result<Option<String>> {
+        is_avatar: bool,
+    ) -> Result<String> {
         // Add white background only to avatars to spare the CPU.
-        let mut add_white_bg = img_wh <= constants::BALANCED_AVATAR_SIZE;
+        let mut add_white_bg = is_avatar;
         let mut no_exif = false;
         let no_exif_ref = &mut no_exif;
-        let res = tokio::task::block_in_place(move || {
+        let mut name = name.unwrap_or_else(|| self.name.clone());
+        let original_name = name.clone();
+        let res: Result<String> = tokio::task::block_in_place(move || {
             let mut file = std::fs::File::open(self.to_abs_path())?;
             let (nr_bytes, exif) = image_metadata(&file)?;
             *no_exif_ref = exif.is_none();
@@ -447,7 +347,7 @@ impl<'a> BlobObject<'a> {
                     file.rewind()?;
                     ImageReader::with_format(
                         std::io::BufReader::new(&file),
-                        ImageFormat::from_path(&blob_abs)?,
+                        ImageFormat::from_path(self.to_abs_path())?,
                     )
                 }
             };
@@ -455,7 +355,6 @@ impl<'a> BlobObject<'a> {
             let mut img = imgreader.decode().context("image decode failure")?;
             let orientation = exif.as_ref().map(|exif| exif_orientation(exif, context));
             let mut encoded = Vec::new();
-            let mut changed_name = None;
 
             if *maybe_sticker {
                 let x_max = img.width().saturating_sub(1);
@@ -467,7 +366,7 @@ impl<'a> BlobObject<'a> {
                         || img.get_pixel(x_max, y_max).0[3] == 0);
             }
             if *maybe_sticker && exif.is_none() {
-                return Ok(None);
+                return Ok(name);
             }
 
             img = match orientation {
@@ -500,7 +399,7 @@ impl<'a> BlobObject<'a> {
             // also `Viewtype::Gif` (maybe renamed to `Animation`) should be used for animated
             // images.
             let do_scale = exceeds_max_bytes
-                || strict_limits
+                || is_avatar
                     && (exceeds_wh
                         || exif.is_some() && {
                             if mem::take(&mut add_white_bg) {
@@ -529,7 +428,20 @@ impl<'a> BlobObject<'a> {
                     if mem::take(&mut add_white_bg) {
                         self::add_white_bg(&mut img);
                     }
-                    let new_img = img.thumbnail(img_wh, img_wh);
+
+                    // resize() results in often slightly better quality,
+                    // however, comes at high price of being 4+ times slower than thumbnail().
+                    // for a typical camera image that is sent, this may be a change from "instant" (500ms) to "long time waiting" (3s).
+                    // as we do not have recoding in background while chat has already a preview,
+                    // we vote for speed.
+                    // exception is the avatar image: this is far more often sent than recoded,
+                    // usually has less pixels by cropping, UI that needs to wait anyways,
+                    // and also benefits from slightly better (5%) encoding of Triangle-filtered images.
+                    let new_img = if is_avatar {
+                        img.resize(img_wh, img_wh, image::imageops::FilterType::Triangle)
+                    } else {
+                        img.thumbnail(img_wh, img_wh)
+                    };
 
                     if encoded_img_exceeds_bytes(
                         context,
@@ -537,7 +449,7 @@ impl<'a> BlobObject<'a> {
                         ofmt.clone(),
                         max_bytes,
                         &mut encoded,
-                    )? && strict_limits
+                    )? && is_avatar
                     {
                         if img_wh < 20 {
                             return Err(format_err!(
@@ -564,10 +476,10 @@ impl<'a> BlobObject<'a> {
                 if !matches!(fmt, ImageFormat::Jpeg)
                     && matches!(ofmt, ImageOutputFormat::Jpeg { .. })
                 {
-                    blob_abs = blob_abs.with_extension("jpg");
-                    let file_name = blob_abs.file_name().context("No image file name (???)")?;
-                    let file_name = file_name.to_str().context("Filename is no UTF-8 (???)")?;
-                    changed_name = Some(format!("$BLOBDIR/{file_name}"));
+                    name = Path::new(&name)
+                        .with_extension("jpg")
+                        .to_string_lossy()
+                        .into_owned();
                 }
 
                 if encoded.is_empty() {
@@ -577,21 +489,22 @@ impl<'a> BlobObject<'a> {
                     encode_img(&img, ofmt, &mut encoded)?;
                 }
 
-                std::fs::write(&blob_abs, &encoded)
-                    .context("failed to write recoded blob to file")?;
+                self.name = BlobObject::create_and_deduplicate_from_bytes(context, &encoded, &name)
+                    .context("failed to write recoded blob to file")?
+                    .name;
             }
 
-            Ok(changed_name)
+            Ok(name)
         });
         match res {
             Ok(_) => res,
             Err(err) => {
-                if !strict_limits && no_exif {
+                if !is_avatar && no_exif {
                     warn!(
                         context,
                         "Cannot recode image, using original data: {err:#}.",
                     );
-                    Ok(None)
+                    Ok(original_name)
                 } else {
                     Err(err)
                 }
@@ -600,8 +513,23 @@ impl<'a> BlobObject<'a> {
     }
 }
 
+fn file_hash(src: &Path) -> Result<blake3::Hash> {
+    ensure!(
+        !src.starts_with("$BLOBDIR/"),
+        "Use `get_abs_path()` to get the absolute path of the blobfile"
+    );
+    let mut hasher = blake3::Hasher::new();
+    let mut src_file = std::fs::File::open(src)
+        .with_context(|| format!("Failed to open file {}", src.display()))?;
+    hasher
+        .update_reader(&mut src_file)
+        .context("update_reader")?;
+    let hash = hasher.finalize();
+    Ok(hash)
+}
+
 /// Returns image file size and Exif.
-pub fn image_metadata(file: &std::fs::File) -> Result<(u64, Option<exif::Exif>)> {
+fn image_metadata(file: &std::fs::File) -> Result<(u64, Option<exif::Exif>)> {
     let len = file.metadata()?.len();
     let mut bufreader = std::io::BufReader::new(file);
     let exif = exif::Reader::new().read_from_container(&mut bufreader).ok();
@@ -620,12 +548,6 @@ fn exif_orientation(exif: &exif::Exif, context: &Context) -> i32 {
         }
     }
     0
-}
-
-impl fmt::Display for BlobObject<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "$BLOBDIR/{}", self.name)
-    }
 }
 
 /// All files in the blobdir.
@@ -759,735 +681,4 @@ fn add_white_bg(img: &mut DynamicImage) {
 }
 
 #[cfg(test)]
-mod tests {
-    use fs::File;
-
-    use super::*;
-    use crate::chat::{self, create_group_chat, ProtectionStatus};
-    use crate::message::{Message, Viewtype};
-    use crate::test_utils::{self, TestContext};
-
-    fn check_image_size(path: impl AsRef<Path>, width: u32, height: u32) -> image::DynamicImage {
-        tokio::task::block_in_place(move || {
-            let img = image::open(path).expect("failed to open image");
-            assert_eq!(img.width(), width, "invalid width");
-            assert_eq!(img.height(), height, "invalid height");
-            img
-        })
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create() {
-        let t = TestContext::new().await;
-        let blob = BlobObject::create(&t, "foo", b"hello").await.unwrap();
-        let fname = t.get_blobdir().join("foo");
-        let data = fs::read(fname).await.unwrap();
-        assert_eq!(data, b"hello");
-        assert_eq!(blob.as_name(), "$BLOBDIR/foo");
-        assert_eq!(blob.to_abs_path(), t.get_blobdir().join("foo"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_lowercase_ext() {
-        let t = TestContext::new().await;
-        let blob = BlobObject::create(&t, "foo.TXT", b"hello").await.unwrap();
-        assert_eq!(blob.as_name(), "$BLOBDIR/foo.txt");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_as_file_name() {
-        let t = TestContext::new().await;
-        let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
-        assert_eq!(blob.as_file_name(), "foo.txt");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_as_rel_path() {
-        let t = TestContext::new().await;
-        let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
-        assert_eq!(blob.as_rel_path(), Path::new("foo.txt"));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_suffix() {
-        let t = TestContext::new().await;
-        let blob = BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
-        assert_eq!(blob.suffix(), Some("txt"));
-        let blob = BlobObject::create(&t, "bar", b"world").await.unwrap();
-        assert_eq!(blob.suffix(), None);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_dup() {
-        let t = TestContext::new().await;
-        BlobObject::create(&t, "foo.txt", b"hello").await.unwrap();
-        let foo_path = t.get_blobdir().join("foo.txt");
-        assert!(foo_path.exists());
-        BlobObject::create(&t, "foo.txt", b"world").await.unwrap();
-        let mut dir = fs::read_dir(t.get_blobdir()).await.unwrap();
-        while let Ok(Some(dirent)) = dir.next_entry().await {
-            let fname = dirent.file_name();
-            if fname == foo_path.file_name().unwrap() {
-                assert_eq!(fs::read(&foo_path).await.unwrap(), b"hello");
-            } else {
-                let name = fname.to_str().unwrap();
-                assert!(name.starts_with("foo"));
-                assert!(name.ends_with(".txt"));
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_double_ext_preserved() {
-        let t = TestContext::new().await;
-        BlobObject::create(&t, "foo.tar.gz", b"hello")
-            .await
-            .unwrap();
-        let foo_path = t.get_blobdir().join("foo.tar.gz");
-        assert!(foo_path.exists());
-        BlobObject::create(&t, "foo.tar.gz", b"world")
-            .await
-            .unwrap();
-        let mut dir = fs::read_dir(t.get_blobdir()).await.unwrap();
-        while let Ok(Some(dirent)) = dir.next_entry().await {
-            let fname = dirent.file_name();
-            if fname == foo_path.file_name().unwrap() {
-                assert_eq!(fs::read(&foo_path).await.unwrap(), b"hello");
-            } else {
-                let name = fname.to_str().unwrap();
-                println!("{name}");
-                assert!(name.starts_with("foo"));
-                assert!(name.ends_with(".tar.gz"));
-            }
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_long_names() {
-        let t = TestContext::new().await;
-        let s = "1".repeat(150);
-        let blob = BlobObject::create(&t, &s, b"data").await.unwrap();
-        let blobname = blob.as_name().split('/').last().unwrap();
-        assert!(blobname.len() < 128);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_and_copy() {
-        let t = TestContext::new().await;
-        let src = t.dir.path().join("src");
-        fs::write(&src, b"boo").await.unwrap();
-        let blob = BlobObject::create_and_copy(&t, src.as_ref()).await.unwrap();
-        assert_eq!(blob.as_name(), "$BLOBDIR/src");
-        let data = fs::read(blob.to_abs_path()).await.unwrap();
-        assert_eq!(data, b"boo");
-
-        let whoops = t.dir.path().join("whoops");
-        assert!(BlobObject::create_and_copy(&t, whoops.as_ref())
-            .await
-            .is_err());
-        let whoops = t.get_blobdir().join("whoops");
-        assert!(!whoops.exists());
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_from_path() {
-        let t = TestContext::new().await;
-
-        let src_ext = t.dir.path().join("external");
-        fs::write(&src_ext, b"boo").await.unwrap();
-        let blob = BlobObject::new_from_path(&t, src_ext.as_ref())
-            .await
-            .unwrap();
-        assert_eq!(blob.as_name(), "$BLOBDIR/external");
-        let data = fs::read(blob.to_abs_path()).await.unwrap();
-        assert_eq!(data, b"boo");
-
-        let src_int = t.get_blobdir().join("internal");
-        fs::write(&src_int, b"boo").await.unwrap();
-        let blob = BlobObject::new_from_path(&t, &src_int).await.unwrap();
-        assert_eq!(blob.as_name(), "$BLOBDIR/internal");
-        let data = fs::read(blob.to_abs_path()).await.unwrap();
-        assert_eq!(data, b"boo");
-    }
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_create_from_name_long() {
-        let t = TestContext::new().await;
-        let src_ext = t.dir.path().join("autocrypt-setup-message-4137848473.html");
-        fs::write(&src_ext, b"boo").await.unwrap();
-        let blob = BlobObject::new_from_path(&t, src_ext.as_ref())
-            .await
-            .unwrap();
-        assert_eq!(
-            blob.as_name(),
-            "$BLOBDIR/autocrypt-setup-message-4137848473.html"
-        );
-    }
-
-    #[test]
-    fn test_is_blob_name() {
-        assert!(BlobObject::is_acceptible_blob_name("foo"));
-        assert!(BlobObject::is_acceptible_blob_name("foo.txt"));
-        assert!(BlobObject::is_acceptible_blob_name("f".repeat(128)));
-        assert!(!BlobObject::is_acceptible_blob_name("foo/bar"));
-        assert!(!BlobObject::is_acceptible_blob_name("foo\\bar"));
-        assert!(!BlobObject::is_acceptible_blob_name("foo\x00bar"));
-    }
-
-    #[test]
-    fn test_sanitise_name() {
-        let (stem, ext) =
-            BlobObject::sanitise_name("Я ЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯ.txt");
-        assert_eq!(ext, ".txt");
-        assert!(!stem.is_empty());
-
-        // the extensions are kept together as between stem and extension a number may be added -
-        // and `foo.tar.gz` should become `foo-1234.tar.gz` and not `foo.tar-1234.gz`
-        let (stem, ext) = BlobObject::sanitise_name("wot.tar.gz");
-        assert_eq!(stem, "wot");
-        assert_eq!(ext, ".tar.gz");
-
-        let (stem, ext) = BlobObject::sanitise_name(".foo.bar");
-        assert_eq!(stem, "");
-        assert_eq!(ext, ".foo.bar");
-
-        let (stem, ext) = BlobObject::sanitise_name("foo?.bar");
-        assert!(stem.contains("foo"));
-        assert!(!stem.contains('?'));
-        assert_eq!(ext, ".bar");
-
-        let (stem, ext) = BlobObject::sanitise_name("no-extension");
-        assert_eq!(stem, "no-extension");
-        assert_eq!(ext, "");
-
-        let (stem, ext) = BlobObject::sanitise_name("path/ignored\\this: is* forbidden?.c");
-        assert_eq!(ext, ".c");
-        assert!(!stem.contains("path"));
-        assert!(!stem.contains("ignored"));
-        assert!(stem.contains("this"));
-        assert!(stem.contains("forbidden"));
-        assert!(!stem.contains('/'));
-        assert!(!stem.contains('\\'));
-        assert!(!stem.contains(':'));
-        assert!(!stem.contains('*'));
-        assert!(!stem.contains('?'));
-
-        let (stem, ext) = BlobObject::sanitise_name(
-            "file.with_lots_of_characters_behind_point_and_double_ending.tar.gz",
-        );
-        assert_eq!(
-            stem,
-            "file.with_lots_of_characters_behind_point_and_double_ending"
-        );
-        assert_eq!(ext, ".tar.gz");
-
-        let (stem, ext) = BlobObject::sanitise_name("a. tar.tar.gz");
-        assert_eq!(stem, "a. tar");
-        assert_eq!(ext, ".tar.gz");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_add_white_bg() {
-        let t = TestContext::new().await;
-        let bytes0 = include_bytes!("../test-data/image/logo.png").as_slice();
-        let bytes1 = include_bytes!("../test-data/image/avatar900x900.png").as_slice();
-        for (bytes, color) in [
-            (bytes0, [255u8, 255, 255, 255]),
-            (bytes1, [253u8, 198, 0, 255]),
-        ] {
-            let avatar_src = t.dir.path().join("avatar.png");
-            fs::write(&avatar_src, bytes).await.unwrap();
-
-            let mut blob = BlobObject::new_from_path(&t, &avatar_src).await.unwrap();
-            let img_wh = 128;
-            let maybe_sticker = &mut false;
-            let strict_limits = true;
-            blob.recode_to_size(
-                &t,
-                blob.to_abs_path(),
-                maybe_sticker,
-                img_wh,
-                20_000,
-                strict_limits,
-            )
-            .unwrap();
-            tokio::task::block_in_place(move || {
-                let img = image::open(blob.to_abs_path()).unwrap();
-                assert!(img.width() == img_wh);
-                assert!(img.height() == img_wh);
-                assert_eq!(img.get_pixel(0, 0), Rgba(color));
-            });
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_selfavatar_outside_blobdir() {
-        let t = TestContext::new().await;
-        let avatar_src = t.dir.path().join("avatar.jpg");
-        let avatar_bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
-        fs::write(&avatar_src, avatar_bytes).await.unwrap();
-        let avatar_blob = t.get_blobdir().join("avatar.jpg");
-        assert!(!avatar_blob.exists());
-        t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
-            .await
-            .unwrap();
-        assert!(avatar_blob.exists());
-        assert!(fs::metadata(&avatar_blob).await.unwrap().len() < avatar_bytes.len() as u64);
-        let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
-        assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
-
-        check_image_size(avatar_src, 1000, 1000);
-        check_image_size(
-            &avatar_blob,
-            constants::BALANCED_AVATAR_SIZE,
-            constants::BALANCED_AVATAR_SIZE,
-        );
-
-        async fn file_size(path_buf: &Path) -> u64 {
-            let file = File::open(path_buf).await.unwrap();
-            file.metadata().await.unwrap().len()
-        }
-
-        let mut blob = BlobObject::new_from_path(&t, &avatar_blob).await.unwrap();
-        let maybe_sticker = &mut false;
-        let strict_limits = true;
-        blob.recode_to_size(
-            &t,
-            blob.to_abs_path(),
-            maybe_sticker,
-            1000,
-            3000,
-            strict_limits,
-        )
-        .unwrap();
-        assert!(file_size(&avatar_blob).await <= 3000);
-        assert!(file_size(&avatar_blob).await > 2000);
-        tokio::task::block_in_place(move || {
-            let img = image::open(avatar_blob).unwrap();
-            assert!(img.width() > 130);
-            assert_eq!(img.width(), img.height());
-        });
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_selfavatar_in_blobdir() {
-        let t = TestContext::new().await;
-        let avatar_src = t.get_blobdir().join("avatar.png");
-        fs::write(&avatar_src, test_utils::AVATAR_900x900_BYTES)
-            .await
-            .unwrap();
-
-        check_image_size(&avatar_src, 900, 900);
-
-        t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
-            .await
-            .unwrap();
-        let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap().unwrap();
-        assert_eq!(
-            avatar_cfg,
-            avatar_src.with_extension("png").to_str().unwrap()
-        );
-
-        check_image_size(
-            avatar_cfg,
-            constants::BALANCED_AVATAR_SIZE,
-            constants::BALANCED_AVATAR_SIZE,
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_selfavatar_copy_without_recode() {
-        let t = TestContext::new().await;
-        let avatar_src = t.dir.path().join("avatar.png");
-        let avatar_bytes = include_bytes!("../test-data/image/avatar64x64.png");
-        fs::write(&avatar_src, avatar_bytes).await.unwrap();
-        let avatar_blob = t.get_blobdir().join("avatar.png");
-        assert!(!avatar_blob.exists());
-        t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
-            .await
-            .unwrap();
-        assert!(avatar_blob.exists());
-        assert_eq!(
-            fs::metadata(&avatar_blob).await.unwrap().len(),
-            avatar_bytes.len() as u64
-        );
-        let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
-        assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_recode_image_1() {
-        let bytes = include_bytes!("../test-data/image/avatar1000x1000.jpg");
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "0",
-            bytes,
-            extension: "jpg",
-            has_exif: true,
-            original_width: 1000,
-            original_height: 1000,
-            compressed_width: 1000,
-            compressed_height: 1000,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "1",
-            bytes,
-            extension: "jpg",
-            has_exif: true,
-            original_width: 1000,
-            original_height: 1000,
-            compressed_width: 1000,
-            compressed_height: 1000,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_recode_image_2() {
-        // The "-rotated" files are rotated by 270 degrees using the Exif metadata
-        let bytes = include_bytes!("../test-data/image/rectangle2000x1800-rotated.jpg");
-        let img_rotated = SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "0",
-            bytes,
-            extension: "jpg",
-            has_exif: true,
-            original_width: 2000,
-            original_height: 1800,
-            orientation: 270,
-            compressed_width: 1800,
-            compressed_height: 2000,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-        assert_correct_rotation(&img_rotated);
-
-        let mut buf = Cursor::new(vec![]);
-        img_rotated.write_to(&mut buf, ImageFormat::Jpeg).unwrap();
-        let bytes = buf.into_inner();
-
-        let img_rotated = SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "1",
-            bytes: &bytes,
-            extension: "jpg",
-            original_width: 1800,
-            original_height: 2000,
-            compressed_width: 1800,
-            compressed_height: 2000,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-        assert_correct_rotation(&img_rotated);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_recode_image_balanced_png() {
-        let bytes = include_bytes!("../test-data/image/screenshot.png");
-
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "0",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: 1920,
-            compressed_height: 1080,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "1",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: constants::WORSE_IMAGE_SIZE,
-            compressed_height: constants::WORSE_IMAGE_SIZE * 1080 / 1920,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::File,
-            media_quality_config: "1",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: 1920,
-            compressed_height: 1080,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::File,
-            media_quality_config: "1",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: 1920,
-            compressed_height: 1080,
-            set_draft: true,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-
-        // This will be sent as Image, see [`BlobObject::maybe_sticker`] for explanation.
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Sticker,
-            media_quality_config: "0",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: 1920,
-            compressed_height: 1080,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-    }
-
-    /// Tests that RGBA PNG can be recoded into JPEG
-    /// by dropping alpha channel.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_recode_image_rgba_png_to_jpeg() {
-        let bytes = include_bytes!("../test-data/image/screenshot-rgba.png");
-
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "1",
-            bytes,
-            extension: "png",
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: constants::WORSE_IMAGE_SIZE,
-            compressed_height: constants::WORSE_IMAGE_SIZE * 1080 / 1920,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_recode_image_huge_jpg() {
-        let bytes = include_bytes!("../test-data/image/screenshot.jpg");
-        SendImageCheckMediaquality {
-            viewtype: Viewtype::Image,
-            media_quality_config: "0",
-            bytes,
-            extension: "jpg",
-            has_exif: true,
-            original_width: 1920,
-            original_height: 1080,
-            compressed_width: constants::BALANCED_IMAGE_SIZE,
-            compressed_height: constants::BALANCED_IMAGE_SIZE * 1080 / 1920,
-            ..Default::default()
-        }
-        .test()
-        .await
-        .unwrap();
-    }
-
-    fn assert_correct_rotation(img: &DynamicImage) {
-        // The test images are black in the bottom left corner after correctly applying
-        // the EXIF orientation
-
-        let [luma] = img.get_pixel(10, 10).to_luma().0;
-        assert_eq!(luma, 255);
-        let [luma] = img.get_pixel(img.width() - 10, 10).to_luma().0;
-        assert_eq!(luma, 255);
-        let [luma] = img
-            .get_pixel(img.width() - 10, img.height() - 10)
-            .to_luma()
-            .0;
-        assert_eq!(luma, 255);
-        let [luma] = img.get_pixel(10, img.height() - 10).to_luma().0;
-        assert_eq!(luma, 0);
-    }
-
-    #[derive(Default)]
-    struct SendImageCheckMediaquality<'a> {
-        pub(crate) viewtype: Viewtype,
-        pub(crate) media_quality_config: &'a str,
-        pub(crate) bytes: &'a [u8],
-        pub(crate) extension: &'a str,
-        pub(crate) has_exif: bool,
-        pub(crate) original_width: u32,
-        pub(crate) original_height: u32,
-        pub(crate) orientation: i32,
-        pub(crate) compressed_width: u32,
-        pub(crate) compressed_height: u32,
-        pub(crate) set_draft: bool,
-    }
-
-    impl SendImageCheckMediaquality<'_> {
-        pub(crate) async fn test(self) -> anyhow::Result<DynamicImage> {
-            let viewtype = self.viewtype;
-            let media_quality_config = self.media_quality_config;
-            let bytes = self.bytes;
-            let extension = self.extension;
-            let has_exif = self.has_exif;
-            let original_width = self.original_width;
-            let original_height = self.original_height;
-            let orientation = self.orientation;
-            let compressed_width = self.compressed_width;
-            let compressed_height = self.compressed_height;
-            let set_draft = self.set_draft;
-
-            let alice = TestContext::new_alice().await;
-            let bob = TestContext::new_bob().await;
-            alice
-                .set_config(Config::MediaQuality, Some(media_quality_config))
-                .await?;
-            let file = alice.get_blobdir().join("file").with_extension(extension);
-
-            fs::write(&file, &bytes)
-                .await
-                .context("failed to write file")?;
-            check_image_size(&file, original_width, original_height);
-
-            let (_, exif) = image_metadata(&std::fs::File::open(&file)?)?;
-            if has_exif {
-                let exif = exif.unwrap();
-                assert_eq!(exif_orientation(&exif, &alice), orientation);
-            } else {
-                assert!(exif.is_none());
-            }
-
-            let mut msg = Message::new(viewtype);
-            msg.set_file(file.to_str().unwrap(), None);
-            let chat = alice.create_chat(&bob).await;
-            if set_draft {
-                chat.id.set_draft(&alice, Some(&mut msg)).await.unwrap();
-                msg = chat.id.get_draft(&alice).await.unwrap().unwrap();
-                assert_eq!(msg.get_viewtype(), Viewtype::File);
-            }
-            let sent = alice.send_msg(chat.id, &mut msg).await;
-            let alice_msg = alice.get_last_msg().await;
-            assert_eq!(alice_msg.get_width() as u32, compressed_width);
-            assert_eq!(alice_msg.get_height() as u32, compressed_height);
-            let file_saved = alice
-                .get_blobdir()
-                .join("saved-".to_string() + &alice_msg.get_filename().unwrap());
-            alice_msg.save_file(&alice, &file_saved).await?;
-            check_image_size(file_saved, compressed_width, compressed_height);
-
-            let bob_msg = bob.recv_msg(&sent).await;
-            assert_eq!(bob_msg.get_viewtype(), Viewtype::Image);
-            assert_eq!(bob_msg.get_width() as u32, compressed_width);
-            assert_eq!(bob_msg.get_height() as u32, compressed_height);
-            let file_saved = bob
-                .get_blobdir()
-                .join("saved-".to_string() + &bob_msg.get_filename().unwrap());
-            bob_msg.save_file(&bob, &file_saved).await?;
-            if viewtype == Viewtype::File {
-                assert_eq!(file_saved.extension().unwrap(), extension);
-                let bytes1 = fs::read(&file_saved).await?;
-                assert_eq!(&bytes1, bytes);
-            }
-
-            let (_, exif) = image_metadata(&std::fs::File::open(&file_saved)?)?;
-            assert!(exif.is_none());
-
-            let img = check_image_size(file_saved, compressed_width, compressed_height);
-            Ok(img)
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_send_big_gif_as_image() -> Result<()> {
-        let bytes = include_bytes!("../test-data/image/screenshot.gif");
-        let (width, height) = (1920u32, 1080u32);
-        let alice = TestContext::new_alice().await;
-        let bob = TestContext::new_bob().await;
-        alice
-            .set_config(
-                Config::MediaQuality,
-                Some(&(MediaQuality::Worse as i32).to_string()),
-            )
-            .await?;
-        let file = alice.get_blobdir().join("file").with_extension("gif");
-        fs::write(&file, &bytes)
-            .await
-            .context("failed to write file")?;
-        let mut msg = Message::new(Viewtype::Image);
-        msg.set_file(file.to_str().unwrap(), None);
-        let chat = alice.create_chat(&bob).await;
-        let sent = alice.send_msg(chat.id, &mut msg).await;
-        let bob_msg = bob.recv_msg(&sent).await;
-        // DC must detect the image as GIF and send it w/o reencoding.
-        assert_eq!(bob_msg.get_viewtype(), Viewtype::Gif);
-        assert_eq!(bob_msg.get_width() as u32, width);
-        assert_eq!(bob_msg.get_height() as u32, height);
-        let file_saved = bob
-            .get_blobdir()
-            .join("saved-".to_string() + &bob_msg.get_filename().unwrap());
-        bob_msg.save_file(&bob, &file_saved).await?;
-        let (file_size, _) = image_metadata(&std::fs::File::open(&file_saved)?)?;
-        assert_eq!(file_size, bytes.len() as u64);
-        check_image_size(file_saved, width, height);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_increation_in_blobdir() -> Result<()> {
-        let t = TestContext::new_alice().await;
-        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "abc").await?;
-
-        let file = t.get_blobdir().join("anyfile.dat");
-        fs::write(&file, b"bla").await?;
-        let mut msg = Message::new(Viewtype::File);
-        msg.set_file(file.to_str().unwrap(), None);
-        let prepared_id = chat::prepare_msg(&t, chat_id, &mut msg).await?;
-        assert_eq!(prepared_id, msg.id);
-        assert!(msg.is_increation());
-
-        let msg = Message::load_from_db(&t, prepared_id).await?;
-        assert!(msg.is_increation());
-
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_increation_not_blobdir() -> Result<()> {
-        let t = TestContext::new_alice().await;
-        let chat_id = create_group_chat(&t, ProtectionStatus::Unprotected, "abc").await?;
-        assert_ne!(t.get_blobdir().to_str(), t.dir.path().to_str());
-
-        let file = t.dir.path().join("anyfile.dat");
-        fs::write(&file, b"bla").await?;
-        let mut msg = Message::new(Viewtype::File);
-        msg.set_file(file.to_str().unwrap(), None);
-        assert!(chat::prepare_msg(&t, chat_id, &mut msg).await.is_err());
-
-        Ok(())
-    }
-}
+mod blob_tests;

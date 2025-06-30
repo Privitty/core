@@ -1,6 +1,6 @@
 [package]
 name = "deltachat_ffi"
-version = "1.151.5"
+version = "1.160.0"
 description = "Deltachat FFI"
 edition = "2018"
 readme = "README.md"
@@ -15,7 +15,7 @@ crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
 deltachat = { workspace = true, default-features = false }
-deltachat-jsonrpc = { workspace = true, optional = true }
+deltachat-jsonrpc = { workspace = true }
 libc = { workspace = true }
 human-panic = { version = "2", default-features = false }
 num-traits = { workspace = true }
@@ -24,11 +24,9 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rand = { workspace = true }
-once_cell = { workspace = true }
 yerpc = { workspace = true, features = ["anyhow_expose"] }
 
 [features]
 default = ["vendored"]
 vendored = ["deltachat/vendored", "deltachat-jsonrpc/vendored"]
-jsonrpc = ["dep:deltachat-jsonrpc"]
 

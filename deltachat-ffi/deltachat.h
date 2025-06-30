@@ -220,7 +220,7 @@ typedef struct _dc_event_emitter dc_accounts_event_emitter_t;
  * - Strings in function arguments or return values are usually UTF-8 encoded.
  *
  * - The issue-tracker for the core library is here:
- *   <https://github.com/deltachat/deltachat-core-rust/issues>
+ *   <https://github.com/chatmail/core/issues>
  *
  * If you need further assistance,
  * please do not hesitate to contact us
@@ -440,17 +440,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    also show all mails of confirmed contacts,
  *                    DC_SHOW_EMAILS_ALL (2)=
  *                    also show mails of unconfirmed contacts (default).
- * - `key_gen_type` = DC_KEY_GEN_DEFAULT (0)=
- *                    generate recommended key type (default),
- *                    DC_KEY_GEN_RSA2048 (1)=
- *                    generate RSA 2048 keypair
- *                    DC_KEY_GEN_ED25519 (2)=
- *                    generate Curve25519 keypair
- *                    DC_KEY_GEN_RSA4096 (3)=
- *                    generate RSA 4096 keypair
- * - `save_mime_headers` = 1=save mime headers
- *                    and make dc_get_mime_headers() work for subsequent calls,
- *                    0=do not save mime headers (default)
  * - `delete_device_after` = 0=do not delete messages from device automatically (default),
  *                    >=1=seconds, after which messages are deleted automatically from the device.
  *                    Messages in the "saved messages" chat (see dc_chat_is_self_talk()) are skipped.
@@ -964,54 +953,6 @@ uint32_t        dc_get_chat_id_by_contact_id (dc_context_t* context, uint32_t co
 
 
 /**
- * Prepare a message for sending.
- *
- * Call this function if the file to be sent is still in creation.
- * Once you're done with creating the file, call dc_send_msg() as usual
- * and the message will really be sent.
- *
- * This is useful as the user can already send the next messages while
- * e.g. the recoding of a video is not yet finished. Or the user can even forward
- * the message with the file being still in creation to other groups.
- *
- * Files being sent with the increation-method must be placed in the
- * blob directory, see dc_get_blobdir().
- * If the increation-method is not used - which is probably the normal case -
- * dc_send_msg() copies the file to the blob directory if it is not yet there.
- * To distinguish the two cases, msg->state must be set properly. The easiest
- * way to ensure this is to reuse the same object for both calls.
- *
- * Example:
- * ~~~
- * char* blobdir = dc_get_blobdir(context);
- * char* file_to_send = mprintf("%s/%s", blobdir, "send.mp4")
- *
- * dc_msg_t* msg = dc_msg_new(context, DC_MSG_VIDEO);
- * dc_msg_set_file(msg, file_to_send, NULL);
- * dc_prepare_msg(context, chat_id, msg);
- *
- * // ... create the file ...
- *
- * dc_send_msg(context, chat_id, msg);
- *
- * dc_msg_unref(msg);
- * free(file_to_send);
- * dc_str_unref(file_to_send);
- * ~~~
- *
- * @memberof dc_context_t
- * @param context The context object as returned from dc_context_new().
- * @param chat_id The chat ID to send the message to.
- * @param msg The message object to send to the chat defined by the chat ID.
- *     On success, msg_id and state of the object are set up,
- *     The function does not take ownership of the object,
- *     so you have to free it using dc_msg_unref() as usual.
- * @return The ID of the message that is being prepared.
- */
-uint32_t        dc_prepare_msg               (dc_context_t* context, uint32_t chat_id, dc_msg_t* msg);
-
-
-/**
  * Send a message defined by a dc_msg_t object to a chat.
  *
  * Sends the event #DC_EVENT_MSGS_CHANGED on success.
@@ -1023,7 +964,7 @@ uint32_t        dc_prepare_msg               (dc_context_t* context, uint32_t ch
  * ~~~
  * dc_msg_t* msg = dc_msg_new(context, DC_MSG_IMAGE);
  *
- * dc_msg_set_file(msg, "/file/to/send.jpg", NULL);
+ * dc_msg_set_file_and_deduplicate(msg, "/file/to/send.jpg", NULL, NULL);
  * dc_send_msg(context, chat_id, msg);
  *
  * dc_msg_unref(msg);
@@ -1035,13 +976,11 @@ uint32_t        dc_prepare_msg               (dc_context_t* context, uint32_t ch
  * If that fails, is not possible, or the image is already small enough, the image is sent as original.
  * If you want images to be always sent as the original file, use the #DC_MSG_FILE type.
  *
- * Videos and other file types are currently not recoded by the library,
- * with dc_prepare_msg(), however, you can do that from the UI.
+ * Videos and other file types are currently not recoded by the library.
  *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param chat_id The chat ID to send the message to.
- *     If dc_prepare_msg() was called before, this parameter can be 0.
  * @param msg The message object to send to the chat defined by the chat ID.
  *     On success, msg_id of the object is set up,
  *     The function does not take ownership of the object,
@@ -1058,7 +997,6 @@ uint32_t        dc_send_msg                  (dc_context_t* context, uint32_t ch
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param chat_id The chat ID to send the message to.
- *     If dc_prepare_msg() was called before, this parameter can be 0.
  * @param msg The message object to send to the chat defined by the chat ID.
  *     On success, msg_id of the object is set up,
  *     The function does not take ownership of the object,
@@ -1088,6 +1026,38 @@ uint32_t        dc_send_msg_sync                  (dc_context_t* context, uint32
  * @return The ID of the message that is about being sent.
  */
 uint32_t        dc_send_text_msg             (dc_context_t* context, uint32_t chat_id, const char* text_to_send);
+
+
+/**
+ * Send chat members a request to edit the given message's text.
+ *
+ * Only outgoing messages sent by self can be edited.
+ * Edited messages should be flagged as such in the UI, see dc_msg_is_edited().
+ * UI is informed about changes using the event #DC_EVENT_MSGS_CHANGED.
+ * If the text is not changed, no event and no edit request message are sent.
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param msg_id The message ID of the message to edit.
+ * @param new_text The new text.
+ *      This must not be NULL nor empty.
+ */
+void            dc_send_edit_request         (dc_context_t* context, uint32_t msg_id, const char* new_text);
+
+
+/**
+ * Send chat members a request to delete the given messages.
+ *
+ * Only outgoing messages can be deleted this way
+ * and all messages must be in the same chat.
+ * No tombstone or sth. like that is left.
+ *
+ * @memberof dc_context_t
+ * @param context The context object as returned from dc_context_new().
+ * @param msg_ids An array of uint32_t containing all message IDs to delete.
+ * @param msg_cnt The number of messages IDs in the msg_ids array.
+ */
+ void            dc_send_delete_request       (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
 
 
 /**
@@ -1980,24 +1950,7 @@ void dc_download_full_msg (dc_context_t* context, int msg_id);
 
 
 /**
- * Get the raw mime-headers of the given message.
- * Raw headers are saved for incoming messages
- * only if `dc_set_config(context, "save_mime_headers", "1")`
- * was called before.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param msg_id The message ID, must be the ID of an incoming message.
- * @return Raw headers as a multi-line string, must be released using dc_str_unref() after usage.
- *     Returns NULL if there are no headers saved for the given message,
- *     e.g. because of save_mime_headers is not set
- *     or the message is not incoming.
- */
-char*           dc_get_mime_headers          (dc_context_t* context, uint32_t msg_id);
-
-
-/**
- * Delete messages. The messages are deleted on the current device and
+ * Delete messages. The messages are deleted on all devices and
  * on the IMAP server.
  *
  * @memberof dc_context_t
@@ -2023,6 +1976,36 @@ void            dc_delete_msgs               (dc_context_t* context, const uint3
  * @param chat_id The destination chat ID.
  */
 void            dc_forward_msgs              (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt, uint32_t chat_id);
+
+
+/**
+ * Save a copy of messages in "Saved Messages".
+ *
+ * In contrast to forwarding messages,
+ * information as author, date and origin are preserved.
+ * The action completes locally, so "Saved Messages" do not show sending errors in case one is offline.
+ * Still, a sync message is emitted, so that other devices will save the same message,
+ * as long as not deleted before.
+ *
+ * To check if a message was saved, use dc_msg_get_saved_msg_id(),
+ * UI may show an indicator and offer an "Unsave" instead of a "Save" button then.
+ *
+ * The other way round, from inside the "Saved Messages" chat,
+ * UI may show the indicator and "Unsave" button checking dc_msg_get_original_msg_id()
+ * and offer a button to go the original message.
+ *
+ * "Unsave" is done by deleting the saved message.
+ * Webxdc updates are not copied on purpose.
+ *
+ * For performance reasons, esp. when saving lots of messages,
+ * UI should call this function from a background thread.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param msg_ids An array of uint32_t containing all message IDs that should be saved.
+ * @param msg_cnt The number of messages IDs in the msg_ids array.
+ */
+void            dc_save_msgs                 (dc_context_t* context, const uint32_t* msg_ids, int msg_cnt);
 
 
 /**
@@ -2149,7 +2132,10 @@ uint32_t        dc_lookup_contact_id_by_addr (dc_context_t* context, const char*
 uint32_t        dc_create_contact            (dc_context_t* context, const char* name, const char* addr);
 
 
-#define         DC_GCL_VERIFIED_ONLY         0x01
+
+// Deprecated 2025-05-20, setting this flag is a no-op.
+#define         DC_GCL_DEPRECATED_VERIFIED_ONLY         0x01
+
 #define         DC_GCL_ADD_SELF              0x02
 
 
@@ -2180,6 +2166,29 @@ int             dc_add_address_book          (dc_context_t* context, const char*
 
 
 /**
+ * Make a vCard.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param contact_id The ID of the contact to make the vCard of.
+ * @return vCard, must be released using dc_str_unref() after usage.
+ */
+char*           dc_make_vcard                (dc_context_t* context, uint32_t contact_id);
+
+
+/**
+ * Import a vCard.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param vcard vCard contents.
+ * @return Returns the IDs of the contacts in the order they appear in the vCard.
+ *         Must be dc_array_unref()'d after usage.
+ */
+dc_array_t*     dc_import_vcard              (dc_context_t* context, const char* vcard);
+
+
+/**
  * Returns known and unblocked contacts.
  *
  * To get information about a single contact, see dc_get_contact().
@@ -2188,8 +2197,6 @@ int             dc_add_address_book          (dc_context_t* context, const char*
  * @param context The context object.
  * @param flags A combination of flags:
  *     - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
- *     - if the flag DC_GCL_VERIFIED_ONLY is set, only verified contacts are returned.
- *       if DC_GCL_VERIFIED_ONLY is not set, verified and unverified contacts are returned.
  * @param query A string to filter the list. Typically used to implement an
  *     incremental search. NULL for no filtering.
  * @return An array containing all contact IDs. Must be dc_array_unref()'d
@@ -2480,8 +2487,9 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_FPR_MISMATCH           220 // id=contact
 #define         DC_QR_FPR_WITHOUT_ADDR       230 // test1=formatted fingerprint
 #define         DC_QR_ACCOUNT                250 // text1=domain
-#define         DC_QR_BACKUP                 251
+#define         DC_QR_BACKUP                 251 // deprecated
 #define         DC_QR_BACKUP2                252
+#define         DC_QR_BACKUP_TOO_NEW         255
 #define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain, text2=instance pattern
 #define         DC_QR_PROXY                  271 // text1=address (e.g. "127.0.0.1:9050")
 #define         DC_QR_ADDR                   320 // id=contact
@@ -2528,10 +2536,13 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  *   ask the user if they want to create an account on the given domain,
  *   if so, call dc_set_config_from_qr() and then dc_configure().
  *
- * - DC_QR_BACKUP:
  * - DC_QR_BACKUP2:
  *   ask the user if they want to set up a new device.
  *   If so, pass the qr-code to dc_receive_backup().
+ *
+ * - DC_QR_BACKUP_TOO_NEW:
+ *   show a hint to the user that this backup comes from a newer Delta Chat version
+ *   and this device needs an update
  *
  * - DC_QR_WEBRTC_INSTANCE with dc_lot_t::text1=domain:
  *   ask the user if they want to use the given service for video chats;
@@ -3828,6 +3839,21 @@ int             dc_chat_is_protected         (const dc_chat_t* chat);
 
 
 /**
+ * Check if the chat is encrypted.
+ *
+ * 1:1 chats with key-contacts and group chats with key-contacts
+ * are encrypted.
+ * 1:1 chats with emails contacts and ad-hoc groups
+ * created for email threads are not encrypted.
+ *
+ * @memberof dc_chat_t
+ * @param chat The chat object.
+ * @return 1=chat is encrypted, 0=chat is not encrypted.
+ */
+int             dc_chat_is_encrypted         (const dc_chat_t *chat);
+
+
+/**
  * Checks if the chat was protected, and then an incoming message broke this protection.
  *
  * This function is only useful if the UI enabled the `verified_one_on_one_chats` feature flag,
@@ -3985,7 +4011,7 @@ int             dc_msg_get_viewtype           (const dc_msg_t* msg);
  *
  * Outgoing message states:
  * - @ref DC_STATE_OUT_PREPARING - For files which need time to be prepared before they can be sent,
- *   the message enters this state before @ref DC_STATE_OUT_PENDING.
+ *   the message enters this state before @ref DC_STATE_OUT_PENDING. Deprecated.
  * - @ref DC_STATE_OUT_DRAFT - Message saved as draft using dc_set_draft()
  * - @ref DC_STATE_OUT_PENDING - The user has pressed the "send" button but the
  *   message is not yet sent and is pending in some way. Maybe we're offline (no checkmark).
@@ -4454,6 +4480,20 @@ int             dc_msg_is_forwarded           (const dc_msg_t* msg);
 
 
 /**
+ * Check if the message was edited.
+ *
+ * Edited messages should be marked by the UI as such,
+ * e.g. by the text "Edited" beside the time.
+ * To edit messages, use dc_send_edit_request().
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return 1=message is edited, 0=message not edited.
+ */
+ int             dc_msg_is_edited             (const dc_msg_t* msg);
+
+
+/**
  * Check if the message is an informational message, created by the
  * device or by another users. Such messages are not "typed" by the user but
  * created due to other actions,
@@ -4482,12 +4522,21 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * UIs can display e.g. an icon based upon the type.
  *
  * Currently, the following types are defined:
+ * - DC_INFO_GROUP_NAME_CHANGED (2) - "Group name changd from OLD to BY by CONTACT"
+ * - DC_INFO_GROUP_IMAGE_CHANGED (3) - "Group image changd by CONTACT"
+ * - DC_INFO_MEMBER_ADDED_TO_GROUP (4) - "Member CONTACT added by OTHER_CONTACT"
+ * - DC_INFO_MEMBER_REMOVED_FROM_GROUP (5) - "Member CONTACT removed by OTHER_CONTACT"
+ * - DC_INFO_EPHEMERAL_TIMER_CHANGED (10) - "Disappearing messages CHANGED_TO by CONTACT"
  * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is now protected"
  * - DC_INFO_PROTECTION_DISABLED (12) - Info-message for "Chat is no longer protected"
  * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
  *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
+ *
+ * For the messages that refer to a CONTACT,
+ * dc_msg_get_info_contact_id() returns the contact ID.
+ * The UI should open the contact's profile when tapping the info message.
  *
  * Even when you display an icon,
  * you should still display the text of the informational message using dc_msg_get_text()
@@ -4499,6 +4548,29 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  *     or that the message is not an info-message.
  */
 int             dc_msg_get_info_type          (const dc_msg_t* msg);
+
+
+/**
+ * Return the contact ID of the profile to open when tapping the info message.
+ *
+ * - For DC_INFO_MEMBER_ADDED_TO_GROUP and DC_INFO_MEMBER_REMOVED_FROM_GROUP,
+ *   this is the contact being added/removed.
+ *   The contact that did the adding/removal is usually only a tap away
+ *   (as introducer and/or atop of the memberlist),
+ *   and usually more known anyways.
+ * - For DC_INFO_GROUP_NAME_CHANGED, DC_INFO_GROUP_IMAGE_CHANGED and DC_INFO_EPHEMERAL_TIMER_CHANGED
+ *   this is the contact who did the change.
+ *
+ * No need to check additionally for dc_msg_get_info_type(),
+ * unless you e.g. want to show the info message in another style.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object.
+ * @return If the info message refers to a contact,
+ *     this contact ID or DC_CONTACT_ID_SELF is returned.
+ *     Otherwise 0.
+ */
+uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 
 
 // DC_INFO* uses the same values as SystemMessage in rust-land
@@ -4534,20 +4606,6 @@ int             dc_msg_get_info_type          (const dc_msg_t* msg);
  *     Returns NULL if there is no link attached to the info message and on errors.
  */
 char*           dc_msg_get_webxdc_href        (const dc_msg_t* msg);
-
-/**
- * Check if a message is still in creation. A message is in creation between
- * the calls to dc_prepare_msg() and dc_send_msg().
- *
- * Typically, this is used for videos that are recoded by the UI before
- * they can be sent.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return 1=message is still in creation (dc_send_msg() was not called yet),
- *     0=message no longer in creation.
- */
-int             dc_msg_is_increation          (const dc_msg_t* msg);
 
 
 /**
@@ -4777,23 +4835,33 @@ void            dc_msg_set_override_sender_name(dc_msg_t* msg, const char* name)
 
 
 /**
- * Set the file associated with a message object.
- * This does not alter any information in the database
- * nor copy or move the file or checks if the file exist.
- * All this can be done with dc_send_msg() later.
+ * Sets the file associated with a message.
+ *
+ * If `name` is non-null, it is used as the file name
+ * and the actual current name of the file is ignored.
+ *
+ * If the source file is already in the blobdir, it will be renamed,
+ * otherwise it will be copied to the blobdir first.
+ *
+ * In order to deduplicate files that contain the same data,
+ * the file will be named `<hash>.<extension>`, e.g. `ce940175885d7b78f7b7e9f1396611f.jpg`.
+ *
+ * NOTE:
+ * - This function will rename the file. To get the new file path, call `get_file()`.
+ * - The file must not be modified after this function was called.
  *
  * @memberof dc_msg_t
- * @param msg The message object.
- * @param file If the message object is used in dc_send_msg() later,
- *     this must be the full path of the image file to send.
+ * @param msg The message object. Must not be NULL.
+ * @param file The path of the file to attach. Must not be NULL.
+ * @param name The original filename of the attachment. If NULL, the current name of `file` will be used instead.
  * @param filemime The MIME type of the file. NULL if you don't know or don't care.
  */
-void            dc_msg_set_file               (dc_msg_t* msg, const char* file, const char* filemime);
+void            dc_msg_set_file_and_deduplicate(dc_msg_t* msg, const char* file, const char* name, const char* filemime);
 
 
 /**
  * Set the dimensions associated with message object.
- * Typically this is the width and the height of an image or video associated using dc_msg_set_file().
+ * Typically this is the width and the height of an image or video associated using dc_msg_set_file_and_deduplicate().
  * This does not alter any information in the database; this may be done by dc_send_msg() later.
  *
  * @memberof dc_msg_t
@@ -4806,7 +4874,7 @@ void            dc_msg_set_dimension          (dc_msg_t* msg, int width, int hei
 
 /**
  * Set the duration associated with message object.
- * Typically this is the duration of an audio or video associated using dc_msg_set_file().
+ * Typically this is the duration of an audio or video associated using dc_msg_set_file_and_deduplicate().
  * This does not alter any information in the database; this may be done by dc_send_msg() later.
  *
  * @memberof dc_msg_t
@@ -4931,6 +4999,35 @@ dc_msg_t*       dc_msg_get_quoted_msg         (const dc_msg_t* msg);
  *     Must be freed using dc_msg_unref() after usage.
  */
 dc_msg_t*       dc_msg_get_parent             (const dc_msg_t* msg);
+
+
+/**
+ * Get original message ID for a saved message from the "Saved Messages" chat.
+ *
+ * Can be used by UI to show a button to go the original message
+ * and an option to "Unsave" the message.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object. Usually, this refers to a a message inside "Saved Messages".
+ * @return The message ID of the original message.
+ *     0 if the given message object is not a "Saved Message"
+ *     or if the original message does no longer exist.
+ */
+uint32_t        dc_msg_get_original_msg_id    (const dc_msg_t* msg);
+
+
+/**
+ * Check if a message was saved and return its ID inside "Saved Messages".
+ *
+ * Deleting the returned message will un-save the message.
+ * The state "is saved" can be used to show some icon to indicate that a message was saved.
+ *
+ * @memberof dc_msg_t
+ * @param msg The message object. Usually, this refers to a a message outside "Saved Messages".
+ * @return The message ID inside "Saved Messages", if any.
+ *     0 if the given message object is not saved.
+ */
+uint32_t        dc_msg_get_saved_msg_id     (const dc_msg_t* msg);
 
 
 /**
@@ -5416,7 +5513,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
  * If you want to define the type of a dc_msg_t object for sending,
  * use dc_msg_new().
  * Depending on the type, you will set more properties using e.g.
- * dc_msg_set_text() or dc_msg_set_file().
+ * dc_msg_set_text() or dc_msg_set_file_and_deduplicate().
  * To finally send the message, use dc_send_msg().
  *
  * To get the types of dc_msg_t objects received, use dc_msg_get_viewtype().
@@ -5437,7 +5534,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * Image message.
  * If the image is an animated GIF, the type #DC_MSG_GIF should be used.
- * File, width, and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+ * File, width, and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
  * and retrieved via dc_msg_get_file(), dc_msg_get_width(), and dc_msg_get_height().
  *
  * Before sending, the image is recoded to an reasonable size,
@@ -5450,7 +5547,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Animated GIF message.
- * File, width, and height are set via dc_msg_set_file(), dc_msg_set_dimension()
+ * File, width, and height are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension()
  * and retrieved via dc_msg_get_file(), dc_msg_get_width(), and dc_msg_get_height().
  */
 #define DC_MSG_GIF       21
@@ -5458,6 +5555,8 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing a sticker, similar to image.
+ * NB: When sending, the message viewtype may be changed to `Image` by some heuristics like checking
+ * for transparent pixels.
  * If possible, the UI should display the image without borders in a transparent way.
  * A click on a sticker will offer to install the sticker set in some future.
  */
@@ -5466,7 +5565,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing an audio file.
- * File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+ * File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
  * and retrieved via dc_msg_get_file(), and dc_msg_get_duration().
  */
 #define DC_MSG_AUDIO     40
@@ -5475,7 +5574,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * A voice message that was directly recorded by the user.
  * For all other audio messages, the type #DC_MSG_AUDIO should be used.
- * File and duration are set via dc_msg_set_file(), dc_msg_set_duration()
+ * File and duration are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_duration()
  * and retrieved via dc_msg_get_file(), and dc_msg_get_duration().
  */
 #define DC_MSG_VOICE     41
@@ -5484,7 +5583,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 /**
  * Video messages.
  * File, width, height, and duration
- * are set via dc_msg_set_file(), dc_msg_set_dimension(), dc_msg_set_duration()
+ * are set via dc_msg_set_file_and_deduplicate(), dc_msg_set_dimension(), dc_msg_set_duration()
  * and retrieved via
  * dc_msg_get_file(), dc_msg_get_width(),
  * dc_msg_get_height(), and dc_msg_get_duration().
@@ -5494,7 +5593,7 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Message containing any file, e.g. a PDF.
- * The file is set via dc_msg_set_file()
+ * The file is set via dc_msg_set_file_and_deduplicate()
  * and retrieved via dc_msg_get_file().
  */
 #define DC_MSG_FILE      60
@@ -5562,6 +5661,8 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 /**
  * Outgoing message being prepared. See dc_msg_get_state() for details.
+ *
+ * @deprecated 2024-12-07
  */
 #define         DC_STATE_OUT_PREPARING       18
 
@@ -6257,6 +6358,18 @@ void dc_event_unref(dc_event_t* event);
 
 
 /**
+ * Chat was deleted.
+ * This event is emitted in response to dc_delete_chat()
+ * called on this or another device.
+ * The event is a good place to remove notifications or homescreen shortcuts.
+ *
+ * @param data1 (int) chat_id
+ * @param data2 (int) 0
+ */
+#define DC_EVENT_CHAT_DELETED             2023
+
+
+/**
  * Contact(s) created, renamed, verified, blocked or deleted.
  *
  * @param data1 (int) contact_id of the changed contact or 0 on batch-changes or deletion.
@@ -6494,15 +6607,6 @@ void dc_event_unref(dc_event_t* event);
  */
 #define DC_MEDIA_QUALITY_BALANCED 0
 #define DC_MEDIA_QUALITY_WORSE    1
-
-
-/*
- * Values for dc_get|set_config("key_gen_type")
- */
-#define DC_KEY_GEN_DEFAULT 0
-#define DC_KEY_GEN_RSA2048 1
-#define DC_KEY_GEN_ED25519 2
-#define DC_KEY_GEN_RSA4096 3
 
 
 /**
@@ -6797,6 +6901,7 @@ void dc_event_unref(dc_event_t* event);
 /// "End-to-end encryption preferred."
 ///
 /// Used to build the string returned by dc_get_contact_encrinfo().
+/// @deprecated 2025-06-05
 #define DC_STR_E2E_PREFERRED              34
 
 /// "%1$s verified"
@@ -6809,12 +6914,14 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact that cannot be verified
+/// @deprecated 2025-06-05
 #define DC_STR_CONTACT_NOT_VERIFIED       36
 
 /// "Changed setup for %1$s."
 ///
 /// Used in status messages.
 /// - %1$s will be replaced by the name of the contact with the changed setup
+/// @deprecated 2025-06-05
 #define DC_STR_CONTACT_SETUP_CHANGED      37
 
 /// "Archived chats"
@@ -6824,12 +6931,12 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Autocrypt Setup Message"
 ///
-/// Used in subjects of outgoing Autocrypt Setup Messages.
+/// @deprecated 2025-04
 #define DC_STR_AC_SETUP_MSG_SUBJECT       42
 
 /// "This is the Autocrypt Setup Message, open it in a compatible client to use your setup"
 ///
-/// Used as message text of outgoing Autocrypt Setup Messages.
+/// @deprecated 2025-04
 #define DC_STR_AC_SETUP_MSG_BODY          43
 
 /// "Cannot login as %1$s."
@@ -6911,7 +7018,7 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Failed to send message to %1$s."
 ///
-/// Used in status messages.
+/// Unused. Was used in group chat status messages.
 /// - %1$s will be replaced by the name of the contact the message cannot be sent to
 #define DC_STR_FAILED_SENDING_TO          74
 
@@ -7204,6 +7311,7 @@ void dc_event_unref(dc_event_t* event);
 /// "%1$s changed their address from %2$s to %3$s"
 ///
 /// Used as an info message to chats with contacts that changed their address.
+/// @deprecated 2025-06-05
 #define DC_STR_AEAP_ADDR_CHANGED          122
 
 /// "You changed your email address from %1$s to %2$s.
@@ -7504,8 +7612,14 @@ void dc_event_unref(dc_event_t* event);
 
 /// "Could not yet establish guaranteed end-to-end encryption, but you may already send a message."
 ///
-/// Used as info message.
+/// @deprecated 2025-03
 #define DC_STR_SECUREJOIN_WAIT_TIMEOUT 191
+
+/// "The contact must be online to proceed. This process will continue automatically in background."
+///
+/// Used as info message.
+/// @deprecated 2025-06-05
+#define DC_STR_SECUREJOIN_TAKES_LONGER 192
 
 /// "Contact". Deprecated, currently unused.
 #define DC_STR_CONTACT 200

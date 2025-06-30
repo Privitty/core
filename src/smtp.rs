@@ -3,16 +3,17 @@
 mod connect;
 pub mod send;
 
-use anyhow::{bail, format_err, Context as _, Error, Result};
+use anyhow::{Context as _, Error, Result, bail, format_err};
 use async_smtp::response::{Category, Code, Detail};
 use async_smtp::{EmailAddress, SmtpTransport};
 use tokio::task;
 
-use crate::chat::{add_info_msg_with_cmd, ChatId};
+use crate::chat::{ChatId, add_info_msg_with_cmd};
 use crate::config::Config;
 use crate::contact::{Contact, ContactId};
 use crate::context::Context;
 use crate::events::EventType;
+use crate::log::{error, info, warn};
 use crate::login_param::prioritize_server_login_params;
 use crate::login_param::{ConfiguredLoginParam, ConfiguredServerLoginParam};
 use crate::message::Message;
@@ -21,7 +22,6 @@ use crate::mimefactory::MimeFactory;
 use crate::net::proxy::ProxyConfig;
 use crate::net::session::SessionBufStream;
 use crate::scheduler::connectivity::ConnectivityStore;
-use crate::sql;
 use crate::stock_str::unencrypted_email;
 use crate::tools::{self, time_elapsed};
 
@@ -91,20 +91,21 @@ impl Smtp {
         let lp = ConfiguredLoginParam::load(context)
             .await?
             .context("Not configured")?;
+        let proxy_config = ProxyConfig::load(context).await?;
         self.connect(
             context,
             &lp.smtp,
             &lp.smtp_password,
-            &lp.proxy_config,
+            &proxy_config,
             &lp.addr,
-            lp.strict_tls(),
+            lp.strict_tls(proxy_config.is_some()),
             lp.oauth2,
         )
         .await
     }
 
     /// Connect using the provided login params.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(clippy::too_many_arguments)]
     pub async fn connect(
         &mut self,
         context: &Context,
@@ -230,7 +231,10 @@ pub(crate) async fn smtp_send(
                     };
 
                     if maybe_transient {
-                        info!(context, "Permanent error that is likely to actually be transient, postponing retry for later.");
+                        info!(
+                            context,
+                            "Permanent error that is likely to actually be transient, postponing retry for later."
+                        );
                         SendResult::Retry
                     } else {
                         info!(context, "Permanent error, message sending failed.");
@@ -439,6 +443,7 @@ pub(crate) async fn send_msg_to_smtp(
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                 };
@@ -585,18 +590,16 @@ async fn send_mdn_rfc724_mid(
             info!(context, "Successfully sent MDN for {rfc724_mid}.");
             context
                 .sql
-                .execute("DELETE FROM smtp_mdns WHERE rfc724_mid = ?", (rfc724_mid,))
+                .transaction(|transaction| {
+                    let mut stmt =
+                        transaction.prepare("DELETE FROM smtp_mdns WHERE rfc724_mid = ?")?;
+                    stmt.execute((rfc724_mid,))?;
+                    for additional_rfc724_mid in additional_rfc724_mids {
+                        stmt.execute((additional_rfc724_mid,))?;
+                    }
+                    Ok(())
+                })
                 .await?;
-            if !additional_rfc724_mids.is_empty() {
-                let q = format!(
-                    "DELETE FROM smtp_mdns WHERE rfc724_mid IN({})",
-                    sql::repeat_vars(additional_rfc724_mids.len())
-                );
-                context
-                    .sql
-                    .execute(&q, rusqlite::params_from_iter(additional_rfc724_mids))
-                    .await?;
-            }
             Ok(true)
         }
         SendResult::Retry => {

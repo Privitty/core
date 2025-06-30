@@ -5,14 +5,14 @@
 use std::fmt;
 use std::pin::Pin;
 
-use anyhow::{bail, format_err, Context as _, Result};
+use anyhow::{Context as _, Result, bail, format_err};
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
-use fast_socks5::client::Socks5Stream;
-use fast_socks5::util::target_addr::ToTargetAddr;
 use fast_socks5::AuthenticationMethod;
 use fast_socks5::Socks5Command;
-use percent_encoding::{percent_encode, utf8_percent_encode, NON_ALPHANUMERIC};
+use fast_socks5::client::Socks5Stream;
+use fast_socks5::util::target_addr::ToTargetAddr;
+use percent_encoding::{NON_ALPHANUMERIC, percent_encode, utf8_percent_encode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_io_timeout::TimeoutStream;
@@ -154,18 +154,22 @@ impl Socks5Config {
     }
 }
 
+/// Configuration for the proxy through which all traffic
+/// (except for iroh p2p connections)
+/// will be sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[expect(clippy::large_enum_variant)]
 pub enum ProxyConfig {
-    // HTTP proxy.
+    /// HTTP proxy.
     Http(HttpConfig),
 
-    // HTTPS proxy.
+    /// HTTPS proxy.
     Https(HttpConfig),
 
-    // SOCKS5 proxy.
+    /// SOCKS5 proxy.
     Socks5(Socks5Config),
 
-    // Shadowsocks proxy.
+    /// Shadowsocks proxy.
     Shadowsocks(ShadowsocksConfig),
 }
 
@@ -246,7 +250,7 @@ where
 
 impl ProxyConfig {
     /// Creates a new proxy configuration by parsing given proxy URL.
-    pub(crate) fn from_url(url: &str) -> Result<Self> {
+    pub fn from_url(url: &str) -> Result<Self> {
         let url = Url::parse(url).context("Cannot parse proxy URL")?;
         match url.scheme() {
             "http" => {
@@ -305,7 +309,7 @@ impl ProxyConfig {
     ///
     /// This function can be used to normalize proxy URL
     /// by parsing it and serializing back.
-    pub(crate) fn to_url(&self) -> String {
+    pub fn to_url(&self) -> String {
         match self {
             Self::Http(http_config) => http_config.to_url("http"),
             Self::Https(http_config) => http_config.to_url("https"),
@@ -391,7 +395,7 @@ impl ProxyConfig {
 
     /// If `load_dns_cache` is true, loads cached DNS resolution results.
     /// Use this only if the connection is going to be protected with TLS checks.
-    pub async fn connect(
+    pub(crate) async fn connect(
         &self,
         context: &Context,
         target_host: &str,
@@ -620,7 +624,10 @@ mod tests {
 
     #[test]
     fn test_http_connect_request() {
-        assert_eq!(http_connect_request("example.org", 143, Some(("aladdin", "opensesame"))), "CONNECT example.org:143 HTTP/1.1\r\nHost: example.org:143\r\nProxy-Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l\r\n\r\n");
+        assert_eq!(
+            http_connect_request("example.org", 143, Some(("aladdin", "opensesame"))),
+            "CONNECT example.org:143 HTTP/1.1\r\nHost: example.org:143\r\nProxy-Authorization: Basic YWxhZGRpbjpvcGVuc2VzYW1l\r\n\r\n"
+        );
         assert_eq!(
             http_connect_request("example.net", 587, None),
             "CONNECT example.net:587 HTTP/1.1\r\nHost: example.net:587\r\n\r\n"
@@ -640,6 +647,9 @@ mod tests {
     fn test_invalid_proxy_url() {
         assert!(ProxyConfig::from_url("foobar://127.0.0.1:9050").is_err());
         assert!(ProxyConfig::from_url("abc").is_err());
+
+        // This caused panic before shadowsocks 1.22.0.
+        assert!(ProxyConfig::from_url("ss://foo:bar@127.0.0.1:9999").is_err());
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

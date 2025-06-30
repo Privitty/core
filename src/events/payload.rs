@@ -95,8 +95,14 @@ pub enum EventType {
         contact_id: ContactId,
     },
 
-    /// Reactions for the message changed.
+    /// A reaction to one's own sent message received.
+    /// Typically, the UI will show a notification for that.
+    ///
+    /// In addition to this event, ReactionsChanged is emitted.
     IncomingReaction {
+        /// ID of the chat which the message belongs to.
+        chat_id: ChatId,
+
         /// ID of the contact whose reaction set is changed.
         contact_id: ContactId,
 
@@ -109,6 +115,9 @@ pub enum EventType {
 
     /// A webxdc wants an info message or a changed summary to be notified.
     IncomingWebxdcNotify {
+        /// ID of the chat.
+        chat_id: ChatId,
+
         /// ID of the contact sending.
         contact_id: ContactId,
 
@@ -208,6 +217,12 @@ pub enum EventType {
 
         /// New ephemeral timer value.
         timer: EphemeralTimer,
+    },
+
+    /// Chat was deleted.
+    ChatDeleted {
+        /// Chat ID.
+        chat_id: ChatId,
     },
 
     /// Contact(s) created, renamed, blocked, deleted or changed their "recently seen" status.

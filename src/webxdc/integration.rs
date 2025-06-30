@@ -1,10 +1,12 @@
-use crate::chat::{send_msg, ChatId};
+use std::path::Path;
+
+use crate::chat::{ChatId, send_msg};
 use crate::config::Config;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::param::Param;
-use crate::webxdc::{maps_integration, StatusUpdateItem, StatusUpdateSerial};
+use crate::webxdc::{StatusUpdateItem, StatusUpdateSerial, maps_integration};
 use anyhow::Result;
 
 impl Context {
@@ -13,7 +15,7 @@ impl Context {
     pub async fn set_webxdc_integration(&self, file: &str) -> Result<()> {
         let chat_id = ChatId::create_for_contact(self, ContactId::SELF).await?;
         let mut msg = Message::new(Viewtype::Webxdc);
-        msg.set_file(file, None);
+        msg.set_file_and_deduplicate(self, Path::new(&file), None, None)?;
         msg.hidden = true;
         msg.param.set_int(Param::WebxdcIntegration, 1);
         msg.param.set_int(Param::GuaranteeE2ee, 1); // needed to pass `internet_access` requirements
@@ -190,8 +192,7 @@ mod tests {
             "mapstest.xdc",
             include_bytes!("../../test-data/webxdc/mapstest-integration-unset.xdc"),
             None,
-        )
-        .await?;
+        )?;
         t.send_msg(self_chat.id, &mut msg).await;
         assert_integration(&t, "with some icon").await?; // still the default integration
 
@@ -202,8 +203,7 @@ mod tests {
             "mapstest.xdc",
             include_bytes!("../../test-data/webxdc/mapstest-integration-set.xdc"),
             None,
-        )
-        .await?;
+        )?;
         let sent = t.send_msg(self_chat.id, &mut msg).await;
         let info = msg.get_webxdc_info(&t).await?;
         assert!(info.summary.contains("Used as map"));

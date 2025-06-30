@@ -1,19 +1,41 @@
 <p align="center">
-  <img alt="Delta Chat Logo" height="200px" src="https://raw.githubusercontent.com/deltachat/deltachat-pages/master/assets/blog/rust-delta.png">
+<img alt="Chatmail logo" src="https://github.com/user-attachments/assets/25742da7-a837-48cd-a503-b303af55f10d" width="300" style="float:middle;" />
 </p>
 
 <p align="center">
-  <a href="https://github.com/deltachat/deltachat-core-rust/actions/workflows/ci.yml">
-    <img alt="Rust CI" src="https://github.com/deltachat/deltachat-core-rust/actions/workflows/ci.yml/badge.svg">
+  <a href="https://github.com/chatmail/core/actions/workflows/ci.yml">
+    <img alt="Rust CI" src="https://github.com/chatmail/core/actions/workflows/ci.yml/badge.svg">
   </a>
-  <a href="https://deps.rs/repo/github/deltachat/deltachat-core-rust">
-    <img alt="dependency status" src="https://deps.rs/repo/github/deltachat/deltachat-core-rust/status.svg">
+  <a href="https://deps.rs/repo/github/chatmail/core">
+    <img alt="dependency status" src="https://deps.rs/repo/github/chatmail/core/status.svg">
   </a>
 </p>
 
-<p align="center">
-The core library for Delta Chat, written in Rust
-</p>
+The chatmail core library implements low-level network and encryption protocols, 
+integrated by many chat bots and higher level applications, 
+allowing to securely participate in the globally scaled e-mail server network. 
+We provide reproducibly-built `deltachat-rpc-server` static binaries
+that offer a stdio-based high-level JSON-RPC API for instant messaging purposes. 
+
+The following protocols are handled without requiring API users to know much about them: 
+
+- secure TLS setup with DNS caching and shadowsocks/proxy support 
+
+- robust [SMTP](https://github.com/chatmail/async-imap) 
+  and [IMAP](https://github.com/chatmail/async-smtp) handling
+
+- safe and interoperable [MIME parsing](https://github.com/staktrace/mailparse) 
+  and [MIME building](https://github.com/stalwartlabs/mail-builder). 
+
+- security-audited end-to-end encryption with [rPGP](https://github.com/rpgp/rpgp)
+  and [Autocrypt and SecureJoin protocols](https://securejoin.rtfd.io)
+
+- ephemeral [Peer-to-Peer networking using Iroh](https://iroh.computer) for multi-device setup and
+  [webxdc realtime data](https://delta.chat/en/2024-11-20-webxdc-realtime). 
+
+- a simulation- and real-world tested [P2P group membership
+  protocol without requiring server state](https://github.com/chatmail/models/tree/main/group-membership). 
+
 
 ## Installing Rust and Cargo
 
@@ -27,12 +49,12 @@ $ curl https://sh.rustup.rs -sSf | sh
 
 ## Using the CLI client
 
-Compile and run Delta Chat Core command line utility, using `cargo`:
+Compile and run the command line utility, using `cargo`:
 
 ```
-$ cargo run --locked -p deltachat-repl -- ~/deltachat-db
+$ cargo run --locked -p deltachat-repl -- ~/profile-db
 ```
-where ~/deltachat-db is the database file. Delta Chat will create it if it does not exist.
+where ~/profile-db is the database file. The utility will create it if it does not exist.
 
 Optionally, install `deltachat-repl` binary with
 ```
@@ -40,13 +62,13 @@ $ cargo install --locked --path deltachat-repl/
 ```
 and run as
 ```
-$ deltachat-repl ~/deltachat-db
+$ deltachat-repl ~/profile-db
 ```
 
 Configure your account (if not already configured):
 
 ```
-Delta Chat Core is awaiting your commands.
+Chatmail is awaiting your commands.
 > set addr your@email.org
 > set mail_pw yourpassword
 > configure
@@ -84,11 +106,6 @@ Single#10: yourfriends@email.org [yourfriends@email.org]
 Message sent.
 ```
 
-If `yourfriend@email.org` uses DeltaChat, but does not receive message just
-sent, it is advisable to check `Spam` folder. It is known that at least
-`gmx.com` treat such test messages as spam, unless told otherwise with web
-interface.
-
 List messages when inside a chat:
 
 ```
@@ -104,7 +121,7 @@ For more commands type:
 ## Installing libdeltachat system wide
 
 ```
-$ git clone https://github.com/deltachat/deltachat-core-rust.git
+$ git clone https://github.com/chatmail/core.git
 $ cd deltachat-core-rust
 $ cmake -B build . -DCMAKE_INSTALL_PREFIX=/usr
 $ cmake --build build
@@ -145,18 +162,13 @@ $ cargo install cargo-bolero
 Run fuzzing tests with
 ```sh
 $ cd fuzz
-$ cargo bolero test fuzz_mailparse --release=false -s NONE
+$ cargo bolero test fuzz_mailparse -s NONE
 ```
 
 Corpus is created at `fuzz/fuzz_targets/corpus`,
 you can add initial inputs there.
 For `fuzz_mailparse` target corpus can be populated with
 `../test-data/message/*.eml`.
-
-To run with AFL instead of libFuzzer:
-```sh
-$ cargo bolero test fuzz_format_flowed --release=false -e afl -s NONE
-```
 
 ## Features
 
@@ -165,20 +177,16 @@ $ cargo bolero test fuzz_format_flowed --release=false -e afl -s NONE
 ## Update Provider Data
 
 To add the updates from the
-[provider-db](https://github.com/deltachat/provider-db) to the core, run:
-
-```
-./src/provider/update.py ../provider-db/_providers/ > src/provider/data.rs
-```
+[provider-db](https://github.com/chatmail/provider-db) to the core,
+check line `REV=` inside `./scripts/update-provider-database.sh`
+and then run the script.
 
 ## Language bindings and frontend projects
 
 Language bindings are available for:
 
 - **C** \[[📂 source](./deltachat-ffi) | [📚 docs](https://c.delta.chat)\]
-- **Node.js** 
-  - over cffi: \[[📂 source](./node) | [📦 npm](https://www.npmjs.com/package/deltachat-node) | [📚 docs](https://js.delta.chat)\]
-  - over jsonrpc built with napi.rs (experimental): \[[📂 source](https://github.com/deltachat/napi-jsonrpc) | [📦 npm](https://www.npmjs.com/package/@deltachat/napi-jsonrpc)\]
+- **JS**: \[[📂 source](./deltachat-rpc-client) | [📦 npm](https://www.npmjs.com/package/@deltachat/jsonrpc-client) | [📚 docs](https://js.jsonrpc.delta.chat/)\]
 - **Python** \[[📂 source](./python) | [📦 pypi](https://pypi.org/project/deltachat) | [📚 docs](https://py.delta.chat)\]
 - **Go**
   - over jsonrpc: \[[📂 source](https://github.com/deltachat/deltachat-rpc-client-go/)\]

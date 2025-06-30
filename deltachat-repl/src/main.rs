@@ -5,7 +5,6 @@
 //! Usage:  cargo run --example repl --release -- <databasefile>
 //! All further options can be set using the set-command (type ? for help).
 
-#[macro_use]
 extern crate deltachat;
 
 use std::borrow::Cow::{self, Borrowed, Owned};
@@ -22,7 +21,7 @@ use log::{error, info, warn};
 use nu_ansi_term::Color;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
-use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
+use rustyline::highlight::{CmdKind as HighlightCmdKind, Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
 use rustyline::validate::Validator;
 use rustyline::{
@@ -41,25 +40,25 @@ fn receive_event(event: EventType) {
     match event {
         EventType::Info(msg) => {
             /* do not show the event as this would fill the screen */
-            info!("{}", msg);
+            info!("{msg}");
         }
         EventType::SmtpConnected(msg) => {
-            info!("[SMTP_CONNECTED] {}", msg);
+            info!("[SMTP_CONNECTED] {msg}");
         }
         EventType::ImapConnected(msg) => {
-            info!("[IMAP_CONNECTED] {}", msg);
+            info!("[IMAP_CONNECTED] {msg}");
         }
         EventType::SmtpMessageSent(msg) => {
-            info!("[SMTP_MESSAGE_SENT] {}", msg);
+            info!("[SMTP_MESSAGE_SENT] {msg}");
         }
         EventType::Warning(msg) => {
-            warn!("{}", msg);
+            warn!("{msg}");
         }
         EventType::Error(msg) => {
-            error!("{}", msg);
+            error!("{msg}");
         }
         EventType::ErrorSelfNotInGroup(msg) => {
-            error!("[SELF_NOT_IN_GROUP] {}", msg);
+            error!("[SELF_NOT_IN_GROUP] {msg}");
         }
         EventType::MsgsChanged { chat_id, msg_id } => {
             info!(
@@ -124,7 +123,7 @@ fn receive_event(event: EventType) {
             );
         }
         _ => {
-            info!("Received {:?}", event);
+            info!("Received {event:?}");
         }
     }
 }
@@ -298,8 +297,8 @@ impl Highlighter for DcHelper {
         self.highlighter.highlight(line, pos)
     }
 
-    fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
-        self.highlighter.highlight_char(line, pos, forced)
+    fn highlight_char(&self, line: &str, pos: usize, kind: HighlightCmdKind) -> bool {
+        self.highlighter.highlight_char(line, pos, kind)
     }
 }
 
@@ -323,7 +322,7 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
         }
     });
 
-    println!("Delta Chat Core is awaiting your commands.");
+    println!("Chatmail is awaiting your commands.");
 
     let config = Config::builder()
         .history_ignore_space(true)

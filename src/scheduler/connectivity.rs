@@ -3,11 +3,12 @@ use std::cmp::min;
 use std::{iter::once, ops::Deref, sync::Arc};
 
 use anyhow::Result;
-use humansize::{format_size, BINARY};
+use humansize::{BINARY, format_size};
 use tokio::sync::Mutex;
 
 use crate::events::EventType;
-use crate::imap::{scan_folders::get_watched_folder_configs, FolderMeaning};
+use crate::imap::{FolderMeaning, scan_folders::get_watched_folder_configs};
+use crate::log::info;
 use crate::quota::{QUOTA_ERROR_THRESHOLD_PERCENTAGE, QUOTA_WARN_THRESHOLD_PERCENTAGE};
 use crate::stock_str;
 use crate::{context::Context, log::LogExt};
@@ -241,7 +242,6 @@ pub(crate) async fn maybe_network_lost(context: &Context, stores: Vec<Connectivi
         ) {
             *connectivity_lock = DetailedConnectivity::Error("Connection lost".to_string());
         }
-        drop(connectivity_lock);
     }
     context.emit_event(EventType::ConnectivityChanged);
 }
@@ -509,7 +509,9 @@ impl Context {
                                     "green"
                                 };
                                 let div_width_percent = min(100, percent);
-                                ret += &format!("<div class=\"bar\"><div class=\"progress {color}\" style=\"width: {div_width_percent}%\">{percent}%</div></div>");
+                                ret += &format!(
+                                    "<div class=\"bar\"><div class=\"progress {color}\" style=\"width: {div_width_percent}%\">{percent}%</div></div>"
+                                );
 
                                 ret += "</li>";
                             }
@@ -535,7 +537,7 @@ impl Context {
     }
 
     /// Returns true if all background work is done.
-    pub async fn all_work_done(&self) -> bool {
+    async fn all_work_done(&self) -> bool {
         let lock = self.scheduler.inner.read().await;
         let stores: Vec<_> = match *lock {
             InnerSchedulerState::Started(ref sched) => sched
@@ -554,5 +556,24 @@ impl Context {
             }
         }
         true
+    }
+
+    /// Waits until background work is finished.
+    pub async fn wait_for_all_work_done(&self) {
+        // Ideally we could wait for connectivity change events,
+        // but sleep loop is good enough.
+
+        // First 100 ms sleep in chunks of 10 ms.
+        for _ in 0..10 {
+            if self.all_work_done().await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // If we are not finished in 100 ms, keep waking up every 100 ms.
+        while !self.all_work_done().await {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
     }
 }

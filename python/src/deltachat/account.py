@@ -280,6 +280,12 @@ class Account:
         :param name: (optional) display name for this contact
         :returns: :class:`deltachat.contact.Contact` instance.
         """
+        if isinstance(obj, Account):
+            if not obj.is_configured():
+                raise ValueError("Can only add configured accounts as contacts")
+            assert name is None
+            vcard = obj.get_self_contact().make_vcard()
+            return self.import_vcard(vcard)[0]
         (name, addr) = self.get_contact_addr_and_name(obj, name)
         name_c = as_dc_charpointer(name)
         addr_c = as_dc_charpointer(addr)
@@ -287,6 +293,8 @@ class Account:
         return Contact(self, contact_id)
 
     def get_contact(self, obj) -> Optional[Contact]:
+        if isinstance(obj, Account):
+            return self.create_contact(obj)
         if isinstance(obj, Contact):
             return obj
         (_, addr) = self.get_contact_addr_and_name(obj)
@@ -349,23 +357,24 @@ class Account:
         self,
         query: Optional[str] = None,
         with_self: bool = False,
-        only_verified: bool = False,
     ) -> List[Contact]:
         """get a (filtered) list of contacts.
 
         :param query: if a string is specified, only return contacts
                       whose name or e-mail matches query.
-        :param only_verified: if true only return verified contacts.
         :param with_self: if true the self-contact is also returned.
         :returns: list of :class:`deltachat.contact.Contact` objects.
         """
         flags = 0
         query_c = as_dc_charpointer(query)
-        if only_verified:
-            flags |= const.DC_GCL_VERIFIED_ONLY
         if with_self:
             flags |= const.DC_GCL_ADD_SELF
         dc_array = ffi.gc(lib.dc_get_contacts(self._dc_context, flags, query_c), lib.dc_array_unref)
+        return list(iter_array(dc_array, lambda x: Contact(self, x)))
+
+    def import_vcard(self, vcard):
+        """Import a vCard and return an array of contacts."""
+        dc_array = ffi.gc(lib.dc_import_vcard(self._dc_context, as_dc_charpointer(vcard)), lib.dc_array_unref)
         return list(iter_array(dc_array, lambda x: Contact(self, x)))
 
     def get_fresh_messages(self) -> Generator[Message, None, None]:

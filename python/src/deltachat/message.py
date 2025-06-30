@@ -2,7 +2,6 @@
 
 import json
 import os
-import re
 from datetime import datetime, timezone
 from typing import Optional, Union
 
@@ -108,7 +107,9 @@ class Message:
 
     @props.with_doc
     def filename(self):
-        """filename if there was an attachment, otherwise empty string."""
+        """file path if there was an attachment, otherwise empty string.
+        If you want to get the file extension or a user-visible string,
+        use `basename` instead."""
         return from_dc_charpointer(lib.dc_msg_get_file(self._dc_msg))
 
     def set_file(self, path, mime_type=None):
@@ -116,11 +117,12 @@ class Message:
         mtype = ffi.NULL if mime_type is None else as_dc_charpointer(mime_type)
         if not os.path.exists(path):
             raise ValueError(f"path does not exist: {path!r}")
-        lib.dc_msg_set_file(self._dc_msg, as_dc_charpointer(path), mtype)
+        lib.dc_msg_set_file_and_deduplicate(self._dc_msg, as_dc_charpointer(path), ffi.NULL, mtype)
 
     @props.with_doc
     def basename(self) -> str:
-        """basename of the attachment if it exists, otherwise empty string."""
+        """The user-visible name of the attachment (incl. extension)
+        if it exists, otherwise empty string."""
         # FIXME, it does not return basename
         return from_dc_charpointer(lib.dc_msg_get_filename(self._dc_msg))
 
@@ -212,7 +214,7 @@ class Message:
         """extract key and use it as primary key for this account."""
         res = lib.dc_continue_key_transfer(self.account._dc_context, self.id, as_dc_charpointer(setup_code))
         if res == 0:
-            raise ValueError("could not decrypt")
+            raise ValueError("Importing the key from Autocrypt Setup Message failed")
 
     @props.with_doc
     def time_sent(self):
@@ -281,23 +283,6 @@ class Message:
     def force_plaintext(self) -> None:
         """Force the message to be sent in plain text."""
         lib.dc_msg_force_plaintext(self._dc_msg)
-
-    def get_mime_headers(self):
-        """return mime-header object for an incoming message.
-
-        This only returns a non-None object if ``save_mime_headers``
-        config option was set and the message is incoming.
-
-        :returns: email-mime message object (with headers only, no body).
-        """
-        import email
-
-        mime_headers = lib.dc_get_mime_headers(self.account._dc_context, self.id)
-        if mime_headers:
-            s = ffi.string(ffi.gc(mime_headers, lib.dc_str_unref))
-            if isinstance(s, bytes):
-                return email.message_from_bytes(s)
-            return email.message_from_string(s)
 
     @property
     def error(self) -> Optional[str]:
@@ -518,56 +503,3 @@ def get_viewtype_code_from_name(view_type_name):
     raise ValueError(
         f"message typecode not found for {view_type_name!r}, available {list(_view_type_mapping.keys())!r}",
     )
-
-
-#
-# some helper code for turning system messages into hook events
-#
-
-
-def map_system_message(msg):
-    if msg.is_system_message():
-        res = parse_system_add_remove(msg.text)
-        if not res:
-            return None
-        action, affected, actor = res
-        affected = msg.account.get_contact_by_addr(affected)
-        actor = None if actor == "me" else msg.account.get_contact_by_addr(actor)
-        d = {"chat": msg.chat, "contact": affected, "actor": actor, "message": msg}
-        return "ac_member_" + res[0], d
-
-
-def extract_addr(text):
-    m = re.match(r".*\((.+@.+)\)", text)
-    if m:
-        text = m.group(1)
-    text = text.rstrip(".")
-    return text.strip()
-
-
-def parse_system_add_remove(text):
-    """return add/remove info from parsing the given system message text.
-
-    returns a (action, affected, actor) triple
-    """
-    # You removed member a@b.
-    # You added member a@b.
-    # Member Me (x@y) removed by a@b.
-    # Member x@y added by a@b
-    # Member With space (tmp1@x.org) removed by tmp2@x.org.
-    # Member With space (tmp1@x.org) removed by Another member (tmp2@x.org).",
-    # Group left by some one (tmp1@x.org).
-    # Group left by tmp1@x.org.
-    text = text.lower()
-    m = re.match(r"member (.+) (removed|added) by (.+)", text)
-    if m:
-        affected, action, actor = m.groups()
-        return action, extract_addr(affected), extract_addr(actor)
-    m = re.match(r"you (removed|added) member (.+)", text)
-    if m:
-        action, affected = m.groups()
-        return action, extract_addr(affected), "me"
-    if text.startswith("group left by "):
-        addr = extract_addr(text[13:])
-        if addr:
-            return "removed", addr, addr

@@ -4,10 +4,13 @@ pub(crate) mod data;
 
 use anyhow::Result;
 use deltachat_contact_tools::EmailAddress;
-use hickory_resolver::{config, AsyncResolver, TokioAsyncResolver};
+use hickory_resolver::name_server::TokioConnectionProvider;
+use hickory_resolver::{Resolver, TokioResolver, config};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::context::Context;
+use crate::log::warn;
 use crate::provider::data::{PROVIDER_DATA, PROVIDER_IDS};
 
 /// Provider status according to manual testing.
@@ -37,7 +40,19 @@ pub enum Protocol {
 }
 
 /// Socket security.
-#[derive(Debug, Default, Display, PartialEq, Eq, Copy, Clone, FromPrimitive, ToPrimitive)]
+#[derive(
+    Debug,
+    Default,
+    Display,
+    PartialEq,
+    Eq,
+    Copy,
+    Clone,
+    FromPrimitive,
+    ToPrimitive,
+    Serialize,
+    Deserialize,
+)]
 #[repr(u8)]
 pub enum Socket {
     /// Unspecified socket security, select automatically.
@@ -165,15 +180,15 @@ impl ProviderOptions {
 /// We first try to read the system's resolver from `/etc/resolv.conf`.
 /// This does not work at least on some Androids, therefore we fallback
 /// to the default `ResolverConfig` which uses eg. to google's `8.8.8.8` or `8.8.4.4`.
-fn get_resolver() -> Result<TokioAsyncResolver> {
-    if let Ok(resolver) = AsyncResolver::tokio_from_system_conf() {
-        return Ok(resolver);
+fn get_resolver() -> Result<TokioResolver> {
+    if let Ok(resolver) = TokioResolver::builder_tokio() {
+        return Ok(resolver.build());
     }
-    let resolver = AsyncResolver::tokio(
+    let resolver = Resolver::builder_with_config(
         config::ResolverConfig::default(),
-        config::ResolverOpts::default(),
+        TokioConnectionProvider::default(),
     );
-    Ok(resolver)
+    Ok(resolver.build())
 }
 
 /// Returns provider for the given an e-mail address.
@@ -341,17 +356,21 @@ mod tests {
         let t = TestContext::new().await;
         assert!(get_provider_info(&t, "", false).await.is_none());
         assert!(get_provider_info(&t, "google.com", false).await.unwrap().id == "gmail");
-        assert!(get_provider_info(&t, "example@google.com", false)
-            .await
-            .is_none());
+        assert!(
+            get_provider_info(&t, "example@google.com", false)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_get_provider_info_by_addr() -> Result<()> {
         let t = TestContext::new().await;
-        assert!(get_provider_info_by_addr(&t, "google.com", false)
-            .await
-            .is_err());
+        assert!(
+            get_provider_info_by_addr(&t, "google.com", false)
+                .await
+                .is_err()
+        );
         assert!(
             get_provider_info_by_addr(&t, "example@google.com", false)
                 .await?

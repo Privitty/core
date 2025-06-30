@@ -23,29 +23,26 @@
 //!    (scoped per WebXDC app instance/message-id). The other peers can then join the gossip with `joinRealtimeChannel().setListener()`
 //!    and `joinRealtimeChannel().send()` just like the other peers.
 
-use anyhow::{anyhow, bail, Context as _, Result};
-use email::Header;
+use anyhow::{Context as _, Result, anyhow, bail};
+use data_encoding::BASE32_NOPAD;
 use futures_lite::StreamExt;
-use iroh_gossip::net::{Event, Gossip, GossipEvent, JoinOptions, GOSSIP_ALPN};
+use iroh::{Endpoint, NodeAddr, NodeId, PublicKey, RelayMode, RelayUrl, SecretKey};
+use iroh_gossip::net::{Event, GOSSIP_ALPN, Gossip, GossipEvent, JoinOptions};
 use iroh_gossip::proto::TopicId;
-use iroh_net::key::{PublicKey, SecretKey};
-use iroh_net::relay::{RelayMap, RelayUrl};
-use iroh_net::{relay::RelayMode, Endpoint};
-use iroh_net::{NodeAddr, NodeId};
 use parking_lot::Mutex;
 use std::collections::{BTreeSet, HashMap};
 use std::env;
-use tokio::sync::{oneshot, RwLock};
+use tokio::sync::{RwLock, oneshot};
 use tokio::task::JoinHandle;
 use url::Url;
 
+use crate::EventType;
 use crate::chat::send_msg;
 use crate::config::Config;
 use crate::context::Context;
-use crate::headerdef::HeaderDef;
+use crate::log::{info, warn};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
-use crate::EventType;
 
 /// The length of an ed25519 `PublicKey`, in bytes.
 const PUBLIC_KEY_LENGTH: usize = 32;
@@ -54,8 +51,8 @@ const PUBLIC_KEY_STUB: &[u8] = "static_string".as_bytes();
 /// Store iroh peer channels for the context.
 #[derive(Debug)]
 pub struct Iroh {
-    /// [Endpoint] needed for iroh peer channels.
-    pub(crate) endpoint: Endpoint,
+    /// iroh router  needed for iroh peer channels.
+    pub(crate) router: iroh::protocol::Router,
 
     /// [Gossip] needed for iroh peer channels.
     pub(crate) gossip: Gossip,
@@ -75,15 +72,12 @@ pub struct Iroh {
 impl Iroh {
     /// Notify the endpoint that the network has changed.
     pub(crate) async fn network_change(&self) {
-        self.endpoint.network_change().await
+        self.router.endpoint().network_change().await
     }
 
     /// Closes the QUIC endpoint.
     pub(crate) async fn close(self) -> Result<()> {
-        self.endpoint
-            .close(0u32.into(), b"")
-            .await
-            .context("Closing iroh endpoint failed")
+        self.router.shutdown().await.context("Closing iroh failed")
     }
 
     /// Join a topic and create the subscriber loop for it.
@@ -120,8 +114,8 @@ impl Iroh {
 
         // Inform iroh of potentially new node addresses
         for node_addr in &peers {
-            if !node_addr.info.is_empty() {
-                self.endpoint.add_node_addr(node_addr.clone())?;
+            if !node_addr.is_empty() {
+                self.router.endpoint().add_node_addr(node_addr.clone())?;
             }
         }
 
@@ -129,7 +123,7 @@ impl Iroh {
 
         let (gossip_sender, gossip_receiver) = self
             .gossip
-            .join_with_opts(topic, JoinOptions::with_bootstrap(node_ids))
+            .subscribe_with_opts(topic, JoinOptions::with_bootstrap(node_ids))
             .split();
 
         let ctx = ctx.clone();
@@ -148,10 +142,10 @@ impl Iroh {
     pub async fn maybe_add_gossip_peers(&self, topic: TopicId, peers: Vec<NodeAddr>) -> Result<()> {
         if self.iroh_channels.read().await.get(&topic).is_some() {
             for peer in &peers {
-                self.endpoint.add_node_addr(peer.clone())?;
+                self.router.endpoint().add_node_addr(peer.clone())?;
             }
 
-            self.gossip.join_with_opts(
+            self.gossip.subscribe_with_opts(
                 topic,
                 JoinOptions::with_bootstrap(peers.into_iter().map(|peer| peer.node_id)),
             );
@@ -198,8 +192,8 @@ impl Iroh {
 
     /// Get the iroh [NodeAddr] without direct IP addresses.
     pub(crate) async fn get_node_addr(&self) -> Result<NodeAddr> {
-        let mut addr = self.endpoint.node_addr().await?;
-        addr.info.direct_addresses = BTreeSet::new();
+        let mut addr = self.router.endpoint().node_addr().await?;
+        addr.direct_addresses = BTreeSet::new();
         Ok(addr)
     }
 
@@ -242,7 +236,7 @@ impl Context {
     /// Create iroh endpoint and gossip.
     async fn init_peer_channels(&self) -> Result<Iroh> {
         info!(self, "Initializing peer channels.");
-        let secret_key = SecretKey::generate();
+        let secret_key = SecretKey::generate(rand::rngs::OsRng);
         let public_key = secret_key.public();
 
         let relay_mode = if let Some(relay_url) = self
@@ -252,7 +246,7 @@ impl Context {
             .as_ref()
             .and_then(|conf| conf.iroh_relay.clone())
         {
-            RelayMode::Custom(RelayMap::from_url(RelayUrl::from(relay_url)))
+            RelayMode::Custom(RelayUrl::from(relay_url).into())
         } else {
             // FIXME: this should be RelayMode::Disabled instead.
             // Currently using default relays because otherwise Rust tests fail.
@@ -260,6 +254,7 @@ impl Context {
         };
 
         let endpoint = Endpoint::builder()
+            .tls_x509() // For compatibility with iroh <0.34.0
             .secret_key(secret_key)
             .alpns(vec![GOSSIP_ALPN.to_vec()])
             .relay_mode(relay_mode)
@@ -267,24 +262,21 @@ impl Context {
             .await?;
 
         // create gossip
-        let my_addr = endpoint.node_addr().await?;
-        let gossip_config = iroh_gossip::proto::topic::Config {
-            // Allow messages up to 128 KB in size.
-            // We set the limit to 128 KiB to account for internal overhead,
-            // but only guarantee 128 KB of payload to WebXDC developers.
-            max_message_size: 128 * 1024,
-            ..Default::default()
-        };
-        let gossip = Gossip::from_endpoint(endpoint.clone(), gossip_config, &my_addr.info);
+        // Allow messages up to 128 KB in size.
+        // We set the limit to 128 KiB to account for internal overhead,
+        // but only guarantee 128 KB of payload to WebXDC developers.
 
-        // spawn endpoint loop that forwards incoming connections to the gossiper
-        let context = self.clone();
+        let gossip = Gossip::builder()
+            .max_message_size(128 * 1024)
+            .spawn(endpoint.clone())
+            .await?;
 
-        // Shuts down on deltachat shutdown
-        tokio::spawn(endpoint_loop(context, endpoint.clone(), gossip.clone()));
+        let router = iroh::protocol::Router::builder(endpoint)
+            .accept(GOSSIP_ALPN, gossip.clone())
+            .spawn();
 
         Ok(Iroh {
-            endpoint,
+            router,
             gossip,
             sequence_numbers: Mutex::new(HashMap::new()),
             iroh_channels: RwLock::new(HashMap::new()),
@@ -417,7 +409,6 @@ async fn get_iroh_gossip_peers(ctx: &Context, msg_id: MsgId) -> Result<Vec<NodeA
                     ))
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(Into::into)
             },
         )
         .await
@@ -504,55 +495,11 @@ fn create_random_topic() -> TopicId {
 
 /// Creates `Iroh-Gossip-Header` with a new random topic
 /// and stores the topic for the message.
-pub(crate) async fn create_iroh_header(ctx: &Context, msg_id: MsgId) -> Result<Header> {
+pub(crate) async fn create_iroh_header(ctx: &Context, msg_id: MsgId) -> Result<String> {
     let topic = create_random_topic();
     insert_topic_stub(ctx, msg_id, topic).await?;
-    Ok(Header::new(
-        HeaderDef::IrohGossipTopic.get_headername().to_string(),
-        topic.to_string(),
-    ))
-}
-
-async fn endpoint_loop(context: Context, endpoint: Endpoint, gossip: Gossip) {
-    while let Some(conn) = endpoint.accept().await {
-        let conn = match conn.accept() {
-            Ok(conn) => conn,
-            Err(err) => {
-                warn!(context, "Failed to accept iroh connection: {err:#}.");
-                continue;
-            }
-        };
-        info!(context, "IROH_REALTIME: accepting iroh connection");
-        let gossip = gossip.clone();
-        let context = context.clone();
-        tokio::spawn(async move {
-            if let Err(err) = handle_connection(&context, conn, gossip).await {
-                warn!(context, "IROH_REALTIME: iroh connection error: {err}");
-            }
-        });
-    }
-}
-
-async fn handle_connection(
-    context: &Context,
-    mut conn: iroh_net::endpoint::Connecting,
-    gossip: Gossip,
-) -> anyhow::Result<()> {
-    let alpn = conn.alpn().await?;
-    let conn = conn.await?;
-    let peer_id = iroh_net::endpoint::get_remote_node_id(&conn)?;
-
-    match alpn.as_slice() {
-        GOSSIP_ALPN => gossip
-            .handle_connection(conn)
-            .await
-            .context(format!("Gossip connection to {peer_id} failed"))?,
-        _ => warn!(
-            context,
-            "Ignoring connection from {peer_id}: unsupported ALPN protocol"
-        ),
-    }
-    Ok(())
+    let topic_string = BASE32_NOPAD.encode(topic.as_bytes()).to_ascii_lowercase();
+    Ok(topic_string)
 }
 
 async fn subscribe_loop(
@@ -607,10 +554,10 @@ async fn subscribe_loop(
 mod tests {
     use super::*;
     use crate::{
+        EventType,
         chat::send_msg,
         message::{Message, Viewtype},
         test_utils::TestContextManager,
-        EventType,
     };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -629,7 +576,6 @@ mod tests {
                 include_bytes!("../test-data/webxdc/minimal.xdc"),
                 None,
             )
-            .await
             .unwrap();
 
         send_msg(alice, alice_chat.id, &mut instance).await.unwrap();
@@ -787,10 +733,12 @@ mod tests {
         let alice = &mut tcm.alice().await;
         let bob = &mut tcm.bob().await;
 
-        assert!(alice
-            .get_config_bool(Config::WebxdcRealtimeEnabled)
-            .await
-            .unwrap());
+        assert!(
+            alice
+                .get_config_bool(Config::WebxdcRealtimeEnabled)
+                .await
+                .unwrap()
+        );
         // Alice sends webxdc to bob
         let alice_chat = alice.create_chat(bob).await;
         let mut instance = Message::new(Viewtype::File);
@@ -801,7 +749,6 @@ mod tests {
                 include_bytes!("../test-data/webxdc/minimal.xdc"),
                 None,
             )
-            .await
             .unwrap();
 
         send_msg(alice, alice_chat.id, &mut instance).await.unwrap();
@@ -956,17 +903,19 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(alice
-            .iroh
-            .read()
-            .await
-            .as_ref()
-            .unwrap()
-            .iroh_channels
-            .read()
-            .await
-            .get(&topic)
-            .is_none());
+        assert!(
+            alice
+                .iroh
+                .read()
+                .await
+                .as_ref()
+                .unwrap()
+                .iroh_channels
+                .read()
+                .await
+                .get(&topic)
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -985,7 +934,6 @@ mod tests {
                 include_bytes!("../test-data/webxdc/minimal.xdc"),
                 None,
             )
-            .await
             .unwrap();
         send_msg(alice, alice_chat.id, &mut instance).await.unwrap();
         let alice_webxdc = alice.get_last_msg().await;

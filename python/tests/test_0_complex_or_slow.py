@@ -1,7 +1,6 @@
 import sys
 import time
 
-import pytest
 import deltachat as dc
 
 
@@ -17,8 +16,6 @@ class TestGroupStressTests:
         lp.sec("ac1: send message to new group chat")
         msg1 = chat.send_text("hello")
         assert msg1.is_encrypted()
-        gossiped_timestamp = chat.get_summary()["gossiped_timestamp"]
-        assert gossiped_timestamp > 0
 
         assert chat.num_contacts() == 3 + 1
 
@@ -47,19 +44,13 @@ class TestGroupStressTests:
         assert to_remove.addr in sysmsg.text
         assert sysmsg.chat.num_contacts() == 3
 
-        # Receiving message about removed contact does not reset gossip
-        assert chat.get_summary()["gossiped_timestamp"] == gossiped_timestamp
-
         lp.sec("ac1: sending another message to the chat")
         chat.send_text("hello2")
         msg = ac2._evtracker.wait_next_incoming_message()
         assert msg.text == "hello2"
-        assert chat.get_summary()["gossiped_timestamp"] == gossiped_timestamp
 
         lp.sec("ac1: adding fifth member to the chat")
         chat.add_contact(ac5)
-        # Adding contact to chat resets gossiped_timestamp
-        assert chat.get_summary()["gossiped_timestamp"] >= gossiped_timestamp
 
         lp.sec("ac2: receiving system message about contact addition")
         sysmsg = ac2._evtracker.wait_next_incoming_message()
@@ -196,195 +187,6 @@ def test_qr_verified_group_and_chatting(acfactory, lp):
     assert msg.is_encrypted()
 
 
-@pytest.mark.parametrize("mvbox_move", [False, True])
-def test_fetch_existing(acfactory, lp, mvbox_move):
-    """Delta Chat reads the recipients from old emails sent by the user and adds them as contacts.
-    This way, we can already offer them some email addresses they can write to.
-
-    Also, the newest existing emails from each folder are fetched during onboarding.
-
-    Additionally tests that bcc_self messages moved to the mvbox/sentbox are marked as read."""
-
-    def assert_folders_configured(ac):
-        """There was a bug that scan_folders() set the configured folders to None under some circumstances.
-        So, check that they are still configured:"""
-        assert ac.get_config("configured_sentbox_folder") == "Sent"
-        if mvbox_move:
-            assert ac.get_config("configured_mvbox_folder")
-
-    ac1 = acfactory.new_online_configuring_account(mvbox_move=mvbox_move)
-    ac2 = acfactory.new_online_configuring_account()
-    acfactory.wait_configured(ac1)
-    ac1.direct_imap.create_folder("Sent")
-    ac1.set_config("sentbox_watch", "1")
-
-    # We need to reconfigure to find the new "Sent" folder.
-    # `scan_folders()`, which runs automatically shortly after `start_io()` is invoked,
-    # would also find the "Sent" folder, but it would be too late:
-    # The sentbox thread, started by `start_io()`, would have seen that there is no
-    # ConfiguredSentboxFolder and do nothing.
-    acfactory._acsetup.start_configure(ac1)
-    acfactory.bring_accounts_online()
-    assert_folders_configured(ac1)
-
-    lp.sec("send out message with bcc to ourselves")
-    ac1.set_config("bcc_self", "1")
-    chat = acfactory.get_accepted_chat(ac1, ac2)
-    chat.send_text("message text")
-
-    lp.sec("wait until the bcc_self message arrives in correct folder and is marked seen")
-    if mvbox_move:
-        ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder DeltaChat as seen.")
-    else:
-        ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder INBOX as seen.")
-    assert_folders_configured(ac1)
-
-    lp.sec("create a cloned ac1 and fetch contact history during configure")
-    ac1_clone = acfactory.new_online_configuring_account(cloned_from=ac1)
-    ac1_clone.set_config("fetch_existing_msgs", "1")
-    acfactory.wait_configured(ac1_clone)
-    ac1_clone.start_io()
-    assert_folders_configured(ac1_clone)
-
-    lp.sec("check that ac2 contact was fetched during configure")
-    ac1_clone._evtracker.get_matching("DC_EVENT_CONTACTS_CHANGED")
-    ac2_addr = ac2.get_config("addr")
-    assert any(c.addr == ac2_addr for c in ac1_clone.get_contacts())
-    assert_folders_configured(ac1_clone)
-
-    lp.sec("check that messages changed events arrive for the correct message")
-    msg = ac1_clone._evtracker.wait_next_messages_changed()
-    assert msg.text == "message text"
-    assert_folders_configured(ac1)
-    assert_folders_configured(ac1_clone)
-
-
-def test_fetch_existing_msgs_group_and_single(acfactory, lp):
-    """There was a bug concerning fetch-existing-msgs:
-
-    A sent a message to you, adding you to a group. This created a contact request.
-    You wrote a message to A, creating a chat.
-    ...but the group stayed blocked.
-    So, after fetch-existing-msgs you have one contact request and one chat with the same person.
-
-    See https://github.com/deltachat/deltachat-core-rust/issues/2097"""
-    ac1 = acfactory.new_online_configuring_account()
-    ac2 = acfactory.new_online_configuring_account()
-
-    acfactory.bring_accounts_online()
-
-    lp.sec("receive a message")
-    ac2.create_group_chat("group name", contacts=[ac1]).send_text("incoming, unencrypted group message")
-    ac1._evtracker.wait_next_incoming_message()
-
-    lp.sec("send out message with bcc to ourselves")
-    ac1.set_config("bcc_self", "1")
-    ac1_ac2_chat = ac1.create_chat(ac2)
-    ac1_ac2_chat.send_text("outgoing, encrypted direct message, creating a chat")
-
-    # wait until the bcc_self message arrives
-    ac1._evtracker.get_info_contains("Marked messages [0-9]+ in folder INBOX as seen.")
-
-    lp.sec("Clone online account and let it fetch the existing messages")
-    ac1_clone = acfactory.new_online_configuring_account(cloned_from=ac1)
-    ac1_clone.set_config("fetch_existing_msgs", "1")
-    acfactory.wait_configured(ac1_clone)
-
-    ac1_clone.start_io()
-    ac1_clone._evtracker.wait_idle_inbox_ready()
-
-    chats = ac1_clone.get_chats()
-    assert len(chats) == 4  # two newly created chats + self-chat + device-chat
-    group_chat = [c for c in chats if c.get_name() == "group name"][0]
-    assert group_chat.is_group()
-    (private_chat,) = [c for c in chats if c.get_name() == ac1_ac2_chat.get_name()]
-    assert not private_chat.is_group()
-
-    group_messages = group_chat.get_messages()
-    assert len(group_messages) == 1
-    assert group_messages[0].text == "incoming, unencrypted group message"
-    private_messages = private_chat.get_messages()
-    # We can't decrypt the message in this chat, so the chat is empty:
-    assert len(private_messages) == 0
-
-
-def test_undecipherable_group(acfactory, lp):
-    """Test how group messages that cannot be decrypted are
-    handled.
-
-    Group name is encrypted and plaintext subject is set to "..." in
-    this case, so we should assign the messages to existing chat
-    instead of creating a new one. Since there is no existing group
-    chat, the messages should be assigned to 1-1 chat with the sender
-    of the message.
-    """
-
-    lp.sec("creating and configuring three accounts")
-    ac1, ac2, ac3 = acfactory.get_online_accounts(3)
-
-    acfactory.introduce_each_other([ac1, ac2, ac3])
-
-    lp.sec("ac3 reinstalls DC and generates a new key")
-    ac3.stop_io()
-    acfactory.remove_preconfigured_keys()
-    ac4 = acfactory.new_online_configuring_account(cloned_from=ac3)
-    acfactory.wait_configured(ac4)
-    # Create contacts to make sure incoming messages are not treated as contact requests
-    chat41 = ac4.create_chat(ac1)
-    chat42 = ac4.create_chat(ac2)
-    ac4.start_io()
-    ac4._evtracker.wait_idle_inbox_ready()
-
-    lp.sec("ac1: creating group chat with 2 other members")
-    chat = ac1.create_group_chat("title", contacts=[ac2, ac3])
-
-    lp.sec("ac1: send message to new group chat")
-    msg = chat.send_text("hello")
-
-    lp.sec("ac2: checking that the chat arrived correctly")
-    msg = ac2._evtracker.wait_next_incoming_message()
-    assert msg.text == "hello"
-    assert msg.is_encrypted(), "Message is not encrypted"
-
-    # ac4 cannot decrypt the message.
-    # Error message should be assigned to the chat with ac1.
-    lp.sec("ac4: checking that message is assigned to the sender chat")
-    error_msg = ac4._evtracker.wait_next_incoming_message()
-    assert error_msg.error  # There is an error decrypting the message
-    assert error_msg.chat == chat41
-
-    lp.sec("ac2: sending a reply to the chat")
-    msg.chat.send_text("reply")
-    reply = ac1._evtracker.wait_next_incoming_message()
-    assert reply.text == "reply"
-    assert reply.is_encrypted(), "Reply is not encrypted"
-
-    lp.sec("ac4: checking that reply is assigned to ac2 chat")
-    error_reply = ac4._evtracker.wait_next_incoming_message()
-    assert error_reply.error  # There is an error decrypting the message
-    assert error_reply.chat == chat42
-
-    # Test that ac4 replies to error messages don't appear in the
-    # group chat on ac1 and ac2.
-    lp.sec("ac4: replying to ac1 and ac2")
-
-    # Otherwise reply becomes a contact request.
-    chat41.send_text("I can't decrypt your message, ac1!")
-    chat42.send_text("I can't decrypt your message, ac2!")
-
-    msg = ac1._evtracker.wait_next_incoming_message()
-    assert msg.error is None
-    assert msg.text == "I can't decrypt your message, ac1!"
-    assert msg.is_encrypted(), "Message is not encrypted"
-    assert msg.chat == ac1.create_chat(ac3)
-
-    msg = ac2._evtracker.wait_next_incoming_message()
-    assert msg.error is None
-    assert msg.text == "I can't decrypt your message, ac2!"
-    assert msg.is_encrypted(), "Message is not encrypted"
-    assert msg.chat == ac2.create_chat(ac4)
-
-
 def test_ephemeral_timer(acfactory, lp):
     ac1, ac2 = acfactory.get_online_accounts(2)
 
@@ -444,63 +246,6 @@ def test_ephemeral_timer(acfactory, lp):
     assert chat1.get_ephemeral_timer() == 0
 
 
-def test_multidevice_sync_seen(acfactory, lp):
-    """Test that message marked as seen on one device is marked as seen on another."""
-    ac1 = acfactory.new_online_configuring_account()
-    ac2 = acfactory.new_online_configuring_account()
-    ac1_clone = acfactory.new_online_configuring_account(cloned_from=ac1)
-    acfactory.bring_accounts_online()
-
-    ac1.set_config("bcc_self", "1")
-    ac1_clone.set_config("bcc_self", "1")
-
-    ac1_chat = ac1.create_chat(ac2)
-    ac1_clone_chat = ac1_clone.create_chat(ac2)
-    ac2_chat = ac2.create_chat(ac1)
-
-    lp.sec("Send a message from ac2 to ac1 and check that it's 'fresh'")
-    ac2_chat.send_text("Hi")
-    ac1_message = ac1._evtracker.wait_next_incoming_message()
-    ac1_clone_message = ac1_clone._evtracker.wait_next_incoming_message()
-    assert ac1_chat.count_fresh_messages() == 1
-    assert ac1_clone_chat.count_fresh_messages() == 1
-    assert ac1_message.is_in_fresh
-    assert ac1_clone_message.is_in_fresh
-
-    lp.sec("ac1 marks message as seen on the first device")
-    ac1.mark_seen_messages([ac1_message])
-    assert ac1_message.is_in_seen
-
-    lp.sec("ac1 clone detects that message is marked as seen")
-    ev = ac1_clone._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
-    assert ev.data1 == ac1_clone_chat.id
-    assert ac1_clone_message.is_in_seen
-
-    lp.sec("Send an ephemeral message from ac2 to ac1")
-    ac2_chat.set_ephemeral_timer(60)
-    ac1._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")
-    ac1._evtracker.wait_next_incoming_message()
-    ac1_clone._evtracker.get_matching("DC_EVENT_CHAT_EPHEMERAL_TIMER_MODIFIED")
-    ac1_clone._evtracker.wait_next_incoming_message()
-
-    ac2_chat.send_text("Foobar")
-    ac1_message = ac1._evtracker.wait_next_incoming_message()
-    ac1_clone_message = ac1_clone._evtracker.wait_next_incoming_message()
-    assert "Ephemeral timer: 60\n" in ac1_message.get_message_info()
-    assert "Expires: " not in ac1_clone_message.get_message_info()
-    assert "Ephemeral timer: 60\n" in ac1_message.get_message_info()
-    assert "Expires: " not in ac1_clone_message.get_message_info()
-
-    ac1.mark_seen_messages([ac1_message])
-    assert ac1_message.is_in_seen
-    assert "Expires: " in ac1_message.get_message_info()
-    ev = ac1_clone._evtracker.get_matching("DC_EVENT_MSGS_NOTICED")
-    assert ev.data1 == ac1_clone_chat.id
-    assert ac1_clone_message.is_in_seen
-    # Test that the timer is started on the second device after synchronizing the seen status.
-    assert "Expires: " in ac1_clone_message.get_message_info()
-
-
 def test_see_new_verified_member_after_going_online(acfactory, tmp_path, lp):
     """The test for the bug #3836:
     - Alice has two devices, the second is offline.
@@ -510,6 +255,7 @@ def test_see_new_verified_member_after_going_online(acfactory, tmp_path, lp):
     """
     ac1, ac2 = acfactory.get_online_accounts(2)
     ac2_addr = ac2.get_config("addr")
+    acfactory.remove_preconfigured_keys()
     ac1_offl = acfactory.new_online_configuring_account(cloned_from=ac1)
     for ac in [ac1, ac1_offl]:
         ac.set_config("bcc_self", "1")
@@ -560,6 +306,7 @@ def test_use_new_verified_group_after_going_online(acfactory, data, tmp_path, lp
       missing, cannot encrypt".
     """
     ac1, ac2 = acfactory.get_online_accounts(2)
+    acfactory.remove_preconfigured_keys()
     ac2_offl = acfactory.new_online_configuring_account(cloned_from=ac2)
     for ac in [ac2, ac2_offl]:
         ac.set_config("bcc_self", "1")
@@ -610,11 +357,13 @@ def test_verified_group_vs_delete_server_after(acfactory, tmp_path, lp):
     - First device of the user downloads "member added" from the group.
     - First device removes "member added" from the server.
     - Some new messages are sent to the group.
-    - Second device comes online, receives these new messages. The result is a verified group with unverified members.
+    - Second device comes online, receives these new messages.
+      The result is an unverified group with unverified members.
     - First device re-gossips Autocrypt keys to the group.
-    - Now the seconds device has all members verified.
+    - Now the second device has all members and group verified.
     """
     ac1, ac2 = acfactory.get_online_accounts(2)
+    acfactory.remove_preconfigured_keys()
     ac2_offl = acfactory.new_online_configuring_account(cloned_from=ac2)
     for ac in [ac2, ac2_offl]:
         ac.set_config("bcc_self", "1")
@@ -649,12 +398,12 @@ def test_verified_group_vs_delete_server_after(acfactory, tmp_path, lp):
     ac2_offl.start_io()
     msg_in = ac2_offl._evtracker.wait_next_incoming_message()
     assert not msg_in.is_system_message()
-    assert msg_in.text.startswith("[The message was sent with non-verified encryption")
+    assert msg_in.text == "hi"
     ac2_offl_ac1_contact = msg_in.get_sender_contact()
     assert ac2_offl_ac1_contact.addr == ac1.get_config("addr")
     assert not ac2_offl_ac1_contact.is_verified()
     chat2_offl = msg_in.chat
-    assert chat2_offl.is_protected()
+    assert not chat2_offl.is_protected()
 
     lp.sec("ac2: sending message re-gossiping Autocrypt keys")
     chat2.send_text("hi2")
@@ -675,6 +424,7 @@ def test_verified_group_vs_delete_server_after(acfactory, tmp_path, lp):
     assert msg_in.text == "hi2"
     assert msg_in.chat == chat2_offl
     assert msg_in.get_sender_contact().addr == ac2.get_config("addr")
+    assert msg_in.chat.is_protected()
     assert ac2_offl_ac1_contact.is_verified()
 
 

@@ -20,7 +20,6 @@ use deltachat::log::LogExt;
 use deltachat::message::{self, Message, MessageState, MsgId, Viewtype};
 use deltachat::mimeparser::SystemMessage;
 use deltachat::peer_channels::{send_webxdc_realtime_advertisement, send_webxdc_realtime_data};
-use deltachat::peerstate::*;
 use deltachat::qr::*;
 use deltachat::qr_code_generator::create_qr_svg;
 use deltachat::reaction::send_reaction;
@@ -35,14 +34,6 @@ use tokio::fs;
 /// e.g. bitmask 7 triggers actions defined with bits 1, 2 and 4.
 async fn reset_tables(context: &Context, bits: i32) {
     println!("Resetting tables ({bits})...");
-    if 0 != bits & 2 {
-        context
-            .sql()
-            .execute("DELETE FROM acpeerstates;", ())
-            .await
-            .unwrap();
-        println!("(2) Peerstates reset.");
-    }
     if 0 != bits & 4 {
         context
             .sql()
@@ -92,7 +83,7 @@ async fn reset_tables(context: &Context, bits: i32) {
     context.emit_msgs_changed_without_ids();
 }
 
-async fn poke_eml_file(context: &Context, filename: impl AsRef<Path>) -> Result<()> {
+async fn poke_eml_file(context: &Context, filename: &Path) -> Result<()> {
     let data = read_file(context, filename).await?;
 
     if let Err(err) = receive_imf(context, &data, false).await {
@@ -120,13 +111,13 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
     } else {
         let rs = context.sql().get_raw_config("import_spec").await.unwrap();
         if rs.is_none() {
-            error!(context, "Import: No file or folder given.");
+            eprintln!("Import: No file or folder given.");
             return false;
         }
         real_spec = rs.unwrap();
     }
     if let Some(suffix) = get_filesuffix_lc(&real_spec) {
-        if suffix == "eml" && poke_eml_file(context, &real_spec).await.is_ok() {
+        if suffix == "eml" && poke_eml_file(context, Path::new(&real_spec)).await.is_ok() {
             read_cnt += 1
         }
     } else {
@@ -140,13 +131,16 @@ async fn poke_spec(context: &Context, spec: Option<&str>) -> bool {
                 if name.ends_with(".eml") {
                     let path_plus_name = format!("{}/{}", &real_spec, name);
                     println!("Import: {path_plus_name}");
-                    if poke_eml_file(context, path_plus_name).await.is_ok() {
+                    if poke_eml_file(context, Path::new(&path_plus_name))
+                        .await
+                        .is_ok()
+                    {
                         read_cnt += 1
                     }
                 }
             }
         } else {
-            error!(context, "Import: Cannot open directory \"{}\".", &real_spec);
+            eprintln!("Import: Cannot open directory \"{}\".", &real_spec);
             return false;
         }
     }
@@ -274,7 +268,7 @@ async fn log_msglist(context: &Context, msglist: &[MsgId]) -> Result<()> {
 
 async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()> {
     for contact_id in contacts {
-        let mut line2 = "".to_string();
+        let line2 = "".to_string();
         let contact = Contact::get_by_id(context, *contact_id).await?;
         let name = contact.get_display_name();
         let addr = contact.get_addr();
@@ -293,15 +287,6 @@ async fn log_contactlist(context: &Context, contacts: &[ContactId]) -> Result<()
             verified_str,
             if !addr.is_empty() { addr } else { "addr unset" }
         );
-        let peerstate = Peerstate::from_addr(context, addr)
-            .await
-            .expect("peerstate error");
-        if peerstate.is_some() && *contact_id != ContactId::SELF {
-            line2 = format!(
-                ", prefer-encrypt={}",
-                peerstate.as_ref().unwrap().prefer_encrypt
-            );
-        }
 
         println!("Contact#{}: {}{}", *contact_id, line, line2);
     }
@@ -490,7 +475,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "send-backup" => {
             let provider = BackupProvider::prepare(&context).await?;
             let qr = format_backup(&provider.qr())?;
-            println!("QR code: {}", qr);
+            println!("QR code: {qr}");
             qr2term::print_qr(qr.as_str())?;
             provider.await?;
         }
@@ -511,7 +496,10 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(poke_spec(&context, Some(arg1)).await, "Poke failed");
         }
         "reset" => {
-            ensure!(!arg1.is_empty(), "Argument <bits> missing: 1=jobs, 2=peerstates, 4=private keys, 8=rest but server config");
+            ensure!(
+                !arg1.is_empty(),
+                "Argument <bits> missing: 4=private keys, 8=rest but server config"
+            );
             let bits: i32 = arg1.parse()?;
             ensure!(bits < 16, "<bits> must be lower than 16.");
             reset_tables(&context, bits).await;
@@ -939,7 +927,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             } else {
                 Viewtype::File
             });
-            msg.set_file(arg1, None);
+            msg.set_file_and_deduplicate(&context, Path::new(arg1), None, None)?;
             msg.set_text(arg2.to_string());
             chat::send_msg(&context, sel_chat.as_ref().unwrap().get_id(), &mut msg).await?;
         }
@@ -1159,17 +1147,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let reaction = arg2;
             send_reaction(&context, msg_id, reaction).await?;
         }
-        "listcontacts" | "contacts" | "listverified" => {
-            let contacts = Contact::get_all(
-                &context,
-                if arg0 == "listverified" {
-                    DC_GCL_VERIFIED_ONLY | DC_GCL_ADD_SELF
-                } else {
-                    DC_GCL_ADD_SELF
-                },
-                Some(arg1),
-            )
-            .await?;
+        "listcontacts" | "contacts" => {
+            let contacts = Contact::get_all(&context, DC_GCL_ADD_SELF, Some(arg1)).await?;
             log_contactlist(&context, &contacts).await?;
             println!("{} contacts.", contacts.len());
         }
@@ -1278,7 +1257,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "fileinfo" => {
             ensure!(!arg1.is_empty(), "Argument <file> missing.");
 
-            if let Ok(buf) = read_file(&context, &arg1).await {
+            if let Ok(buf) = read_file(&context, Path::new(arg1)).await {
                 let (width, height) = get_filemeta(&buf)?;
                 println!("width={width}, height={height}");
             } else {

@@ -1,11 +1,12 @@
 #![recursion_limit = "256"]
+use std::hint::black_box;
 use std::path::Path;
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
+use deltachat::Events;
 use deltachat::chatlist::Chatlist;
 use deltachat::context::Context;
 use deltachat::stock_str::StockStrings;
-use deltachat::Events;
 
 async fn get_chat_list_benchmark(context: &Context) {
     Chatlist::try_load(context, 0, None, None).await.unwrap();

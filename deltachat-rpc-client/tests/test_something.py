@@ -61,61 +61,102 @@ def test_acfactory(acfactory) -> None:
 
 
 def test_configure_starttls(acfactory) -> None:
-    account = acfactory.new_preconfigured_account()
-
-    # Use STARTTLS
-    account.set_config("mail_security", "2")
-    account.set_config("send_security", "2")
-    account.configure()
+    addr, password = acfactory.get_credentials()
+    account = acfactory.get_unconfigured_account()
+    account.add_or_update_transport(
+        {
+            "addr": addr,
+            "password": password,
+            "imapSecurity": "starttls",
+            "smtpSecurity": "starttls",
+        },
+    )
     assert account.is_configured()
 
 
+def test_lowercase_address(acfactory) -> None:
+    addr, password = acfactory.get_credentials()
+    addr_upper = addr.upper()
+    account = acfactory.get_unconfigured_account()
+    account.add_or_update_transport(
+        {
+            "addr": addr_upper,
+            "password": password,
+        },
+    )
+    assert account.is_configured()
+    assert addr_upper != addr
+    assert account.get_config("configured_addr") == addr
+    assert account.list_transports()[0]["addr"] == addr
+
+    for param in [
+        account.get_info()["used_account_settings"],
+        account.get_info()["entered_account_settings"],
+    ]:
+        assert addr in param
+        assert addr_upper not in param
+
+
 def test_configure_ip(acfactory) -> None:
-    account = acfactory.new_preconfigured_account()
+    addr, password = acfactory.get_credentials()
+    account = acfactory.get_unconfigured_account()
+    ip_address = socket.gethostbyname(addr.rsplit("@")[-1])
 
-    domain = account.get_config("addr").rsplit("@")[-1]
-    ip_address = socket.gethostbyname(domain)
-
-    # This should fail TLS check.
-    account.set_config("mail_server", ip_address)
     with pytest.raises(JsonRpcError):
-        account.configure()
+        account.add_or_update_transport(
+            {
+                "addr": addr,
+                "password": password,
+                # This should fail TLS check.
+                "imapServer": ip_address,
+            },
+        )
 
 
 def test_configure_alternative_port(acfactory) -> None:
     """Test that configuration with alternative port 443 works."""
-    account = acfactory.new_preconfigured_account()
+    addr, password = acfactory.get_credentials()
+    account = acfactory.get_unconfigured_account()
+    account.add_or_update_transport(
+        {
+            "addr": addr,
+            "password": password,
+            "imapPort": 443,
+            "smtpPort": 443,
+        },
+    )
+    assert account.is_configured()
 
-    account.set_config("mail_port", "443")
-    account.set_config("send_port", "443")
 
-    account.configure()
-
-
-def test_configure_username(acfactory) -> None:
-    account = acfactory.new_preconfigured_account()
-
-    addr = account.get_config("addr")
-    account.set_config("mail_user", addr)
-    account.configure()
-
-    assert account.get_config("configured_mail_user") == addr
+def test_list_transports(acfactory) -> None:
+    addr, password = acfactory.get_credentials()
+    account = acfactory.get_unconfigured_account()
+    account.add_or_update_transport(
+        {
+            "addr": addr,
+            "password": password,
+            "imapUser": addr,
+        },
+    )
+    transports = account.list_transports()
+    assert len(transports) == 1
+    params = transports[0]
+    assert params["addr"] == addr
+    assert params["password"] == password
+    assert params["imapUser"] == addr
 
 
 def test_account(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
     bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
 
-    while True:
-        event = bob.wait_for_event()
-        if event.kind == EventType.INCOMING_MSG:
-            chat_id = event.chat_id
-            msg_id = event.msg_id
-            break
+    event = bob.wait_for_incoming_msg_event()
+    chat_id = event.chat_id
+    msg_id = event.msg_id
 
     message = bob.get_message_by_id(msg_id)
     snapshot = message.get_snapshot()
@@ -129,7 +170,7 @@ def test_account(acfactory) -> None:
     assert alice.get_size()
     assert alice.is_configured()
     assert not alice.get_avatar()
-    assert alice.get_contact_by_addr(bob_addr) == alice_contact_bob
+    assert alice.get_contact_by_addr(bob_addr) is None  # There is no address-contact, only key-contact
     assert alice.get_contacts()
     assert alice.get_contacts(snapshot=True)
     assert alice.self_contact
@@ -174,8 +215,7 @@ def test_account(acfactory) -> None:
 def test_chat(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
 
@@ -231,7 +271,9 @@ def test_chat(acfactory) -> None:
     group.get_fresh_message_count()
     group.mark_noticed()
     assert group.get_contacts()
-    group.remove_contact(alice_chat_bob)
+    assert group.get_past_contacts() == []
+    group.remove_contact(alice_contact_bob)
+    assert len(group.get_past_contacts()) == 1
     group.get_locations()
 
 
@@ -239,13 +281,12 @@ def test_contact(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
     bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
 
     assert alice_contact_bob == alice.get_contact_by_id(alice_contact_bob.id)
     assert repr(alice_contact_bob)
     alice_contact_bob.block()
     alice_contact_bob.unblock()
-    alice_contact_bob.reset_encryption()
     alice_contact_bob.set_name("new name")
     alice_contact_bob.get_encryption_info()
     snapshot = alice_contact_bob.get_snapshot()
@@ -256,8 +297,7 @@ def test_contact(acfactory) -> None:
 def test_message(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
     alice_chat_bob.send_text("Hello!")
 
@@ -285,28 +325,74 @@ def test_message(acfactory) -> None:
     assert reactions == snapshot.reactions
 
 
+def test_selfavatar_sync(acfactory, data, log) -> None:
+    alice = acfactory.get_online_account()
+
+    log.section("Alice adds a second device")
+    alice2 = alice.clone()
+
+    log.section("Second device goes online")
+    alice2.start_io()
+
+    log.section("First device changes avatar")
+    image = data.get_path("image/avatar1000x1000.jpg")
+    alice.set_config("selfavatar", image)
+    avatar_config = alice.get_config("selfavatar")
+    avatar_hash = os.path.basename(avatar_config)
+    print("Info: avatar hash is ", avatar_hash)
+
+    log.section("First device receives avatar change")
+    alice2.wait_for_event(EventType.SELFAVATAR_CHANGED)
+    avatar_config2 = alice2.get_config("selfavatar")
+    avatar_hash2 = os.path.basename(avatar_config2)
+    print("Info: avatar hash on second device is ", avatar_hash2)
+    assert avatar_hash == avatar_hash2
+    assert avatar_config != avatar_config2
+
+
+def test_reaction_seen_on_another_dev(acfactory) -> None:
+    alice, bob = acfactory.get_online_accounts(2)
+    alice2 = alice.clone()
+    alice2.start_io()
+
+    alice_contact_bob = alice.create_contact(bob, "Bob")
+    alice_chat_bob = alice_contact_bob.create_chat()
+    alice_chat_bob.send_text("Hello!")
+
+    event = bob.wait_for_incoming_msg_event()
+    msg_id = event.msg_id
+
+    message = bob.get_message_by_id(msg_id)
+    snapshot = message.get_snapshot()
+    snapshot.chat.accept()
+    message.send_reaction("😎")
+    for a in [alice, alice2]:
+        a.wait_for_event(EventType.INCOMING_REACTION)
+
+    alice2.clear_all_events()
+    alice_chat_bob.mark_noticed()
+    chat_id = alice2.wait_for_event(EventType.MSGS_NOTICED).chat_id
+    alice2_chat_bob = alice2.create_chat(bob)
+    assert chat_id == alice2_chat_bob.id
+
+
 def test_is_bot(acfactory) -> None:
     """Test that we can recognize messages submitted by bots."""
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
     alice_chat_bob = alice_contact_bob.create_chat()
 
     # Alice becomes a bot.
     alice.set_config("bot", "1")
     alice_chat_bob.send_text("Hello!")
 
-    while True:
-        event = bob.wait_for_event()
-        if event.kind == EventType.INCOMING_MSG:
-            msg_id = event.msg_id
-            message = bob.get_message_by_id(msg_id)
-            snapshot = message.get_snapshot()
-            assert snapshot.chat_id == event.chat_id
-            assert snapshot.text == "Hello!"
-            assert snapshot.is_bot
-            break
+    event = bob.wait_for_incoming_msg_event()
+    message = bob.get_message_by_id(event.msg_id)
+    snapshot = message.get_snapshot()
+    assert snapshot.chat_id == event.chat_id
+    assert snapshot.text == "Hello!"
+    assert snapshot.is_bot
 
 
 def test_bot(acfactory) -> None:
@@ -353,9 +439,11 @@ def test_wait_next_messages(acfactory) -> None:
     alice = acfactory.new_configured_account()
 
     # Create a bot account so it does not receive device messages in the beginning.
-    bot = acfactory.new_preconfigured_account()
+    addr, password = acfactory.get_credentials()
+    bot = acfactory.get_unconfigured_account()
     bot.set_config("bot", "1")
-    bot.configure()
+    bot.add_or_update_transport({"addr": addr, "password": password})
+    assert bot.is_configured()
 
     # There are no old messages and the call returns immediately.
     assert not bot.wait_next_messages()
@@ -364,8 +452,7 @@ def test_wait_next_messages(acfactory) -> None:
         # Bot starts waiting for messages.
         next_messages_task = executor.submit(bot.wait_next_messages)
 
-        bot_addr = bot.get_config("addr")
-        alice_contact_bot = alice.create_contact(bot_addr, "Bot")
+        alice_contact_bot = alice.create_contact(bot, "Bot")
         alice_chat_bot = alice_contact_bot.create_chat()
         alice_chat_bot.send_text("Hello!")
 
@@ -389,9 +476,7 @@ def test_import_export_backup(acfactory, tmp_path) -> None:
 def test_import_export_keys(acfactory, tmp_path) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
-    alice_chat_bob = alice_contact_bob.create_chat()
+    alice_chat_bob = alice.create_chat(bob)
     alice_chat_bob.send_text("Hello Bob!")
 
     snapshot = bob.get_message_by_id(bob.wait_for_incoming_msg_event().msg_id).get_snapshot()
@@ -441,9 +526,7 @@ def test_provider_info(rpc) -> None:
 def test_mdn_doesnt_break_autocrypt(acfactory) -> None:
     alice, bob = acfactory.get_online_accounts(2)
 
-    bob_addr = bob.get_config("addr")
-
-    alice_contact_bob = alice.create_contact(bob_addr, "Bob")
+    alice_contact_bob = alice.create_contact(bob, "Bob")
 
     # Bob creates chat manually so chat with Alice is accepted.
     alice_chat_bob = alice_contact_bob.create_chat()
@@ -467,10 +550,7 @@ def test_mdn_doesnt_break_autocrypt(acfactory) -> None:
 
     # Alice reads Bob's message.
     message.mark_seen()
-    while True:
-        event = bob.wait_for_event()
-        if event.kind == EventType.MSG_READ:
-            break
+    bob.wait_for_event(EventType.MSG_READ)
 
     # Bob sends a message to Alice, it should also be encrypted.
     bob_chat_alice.send_text("Hi Alice!")
@@ -542,9 +622,13 @@ def test_reactions_for_a_reordering_move(acfactory, direct_imap):
     messages they refer to and thus dropped.
     """
     (ac1,) = acfactory.get_online_accounts(1)
-    ac2 = acfactory.new_preconfigured_account()
-    ac2.configure()
+
+    addr, password = acfactory.get_credentials()
+    ac2 = acfactory.get_unconfigured_account()
+    ac2.add_or_update_transport({"addr": addr, "password": password})
     ac2.set_config("mvbox_move", "1")
+    assert ac2.is_configured()
+
     ac2.bring_online()
     chat1 = acfactory.get_accepted_chat(ac1, ac2)
     ac2.stop_io()
@@ -588,9 +672,7 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
         chat.send_text("Hello Alice!")
         assert alice.get_message_by_id(alice.wait_for_incoming_msg_event().msg_id).get_snapshot().text == "Hello Alice!"
 
-        contact_addr = account.get_config("addr")
-        contact = alice.create_contact(contact_addr, "")
-
+        contact = alice.create_contact(account)
         alice_group.add_contact(contact)
 
     if n_accounts == 2:
@@ -621,7 +703,7 @@ def test_download_limit_chat_assignment(acfactory, tmp_path, n_accounts):
             assert snapshot.chat == bob_chat_alice
 
 
-def test_markseen_contact_request(acfactory, tmp_path):
+def test_markseen_contact_request(acfactory):
     """
     Test that seen status is synchronized for contact request messages
     even though read receipt is not sent.
@@ -629,10 +711,7 @@ def test_markseen_contact_request(acfactory, tmp_path):
     alice, bob = acfactory.get_online_accounts(2)
 
     # Bob sets up a second device.
-    bob.export_backup(tmp_path)
-    files = list(tmp_path.glob("*.tar"))
-    bob2 = acfactory.get_unconfigured_account()
-    bob2.import_backup(files[0])
+    bob2 = bob.clone()
     bob2.start_io()
 
     alice_chat_bob = alice.create_chat(bob)
@@ -643,10 +722,7 @@ def test_markseen_contact_request(acfactory, tmp_path):
     assert message2.get_snapshot().state == MessageState.IN_FRESH
 
     message.mark_seen()
-    while True:
-        event = bob2.wait_for_event()
-        if event.kind == EventType.MSGS_NOTICED:
-            break
+    bob2.wait_for_event(EventType.MSGS_NOTICED)
     assert message2.get_snapshot().state == MessageState.IN_SEEN
 
 
@@ -659,12 +735,11 @@ def test_get_http_response(acfactory):
 
 def test_configured_imap_certificate_checks(acfactory):
     alice = acfactory.new_configured_account()
-    configured_certificate_checks = alice.get_config("configured_imap_certificate_checks")
 
     # Certificate checks should be configured (not None)
-    assert configured_certificate_checks
+    assert "cert_automatic" in alice.get_info().used_account_settings
 
-    # 0 is the value old Delta Chat core versions used
+    # "cert_old_automatic" is the value old Delta Chat core versions used
     # to mean user entered "imap_certificate_checks=0" (Automatic)
     # and configuration failed to use strict TLS checks
     # so it switched strict TLS checks off.
@@ -675,4 +750,99 @@ def test_configured_imap_certificate_checks(acfactory):
     #
     # Core 1.142.4, 1.142.5 and 1.142.6 saved this value due to bug.
     # This test is a regression test to prevent this happening again.
-    assert configured_certificate_checks != "0"
+    assert "cert_old_automatic" not in alice.get_info().used_account_settings
+
+
+def test_no_old_msg_is_fresh(acfactory):
+    ac1, ac2 = acfactory.get_online_accounts(2)
+    ac1_clone = ac1.clone()
+    ac1_clone.start_io()
+
+    ac1.create_chat(ac2)
+    ac1_clone_chat = ac1_clone.create_chat(ac2)
+
+    ac1.get_device_chat().mark_noticed()
+
+    logging.info("Send a first message from ac2 to ac1 and check that it's 'fresh'")
+    first_msg = ac2.create_chat(ac1).send_text("Hi")
+    ac1.wait_for_incoming_msg_event()
+    assert ac1.create_chat(ac2).get_fresh_message_count() == 1
+    assert len(list(ac1.get_fresh_messages())) == 1
+
+    ac1.wait_for_event(EventType.IMAP_INBOX_IDLE)
+
+    logging.info("Send a message from ac1_clone to ac2 and check that ac1 marks the first message as 'noticed'")
+    ac1_clone_chat.send_text("Hi back")
+    ev = ac1.wait_for_msgs_noticed_event()
+
+    assert ev.chat_id == first_msg.get_snapshot().chat_id
+    assert ac1.create_chat(ac2).get_fresh_message_count() == 0
+    assert len(list(ac1.get_fresh_messages())) == 0
+
+
+def test_rename_synchronization(acfactory):
+    """Test synchronization of contact renaming."""
+    alice, bob = acfactory.get_online_accounts(2)
+    alice2 = alice.clone()
+    alice2.bring_online()
+
+    bob.set_config("displayname", "Bob")
+    bob.create_chat(alice).send_text("Hello!")
+    alice_msg = alice.wait_for_incoming_msg().get_snapshot()
+    alice2_msg = alice2.wait_for_incoming_msg().get_snapshot()
+
+    assert alice2_msg.sender.get_snapshot().display_name == "Bob"
+    alice_msg.sender.set_name("Bobby")
+    alice2.wait_for_event(EventType.CONTACTS_CHANGED)
+    assert alice2_msg.sender.get_snapshot().display_name == "Bobby"
+
+
+def test_rename_group(acfactory):
+    """Test renaming the group."""
+    alice, bob = acfactory.get_online_accounts(2)
+
+    alice_group = alice.create_group("Test group")
+    alice_contact_bob = alice.create_contact(bob)
+    alice_group.add_contact(alice_contact_bob)
+    alice_group.send_text("Hello!")
+
+    bob_msg = bob.wait_for_incoming_msg()
+    bob_chat = bob_msg.get_snapshot().chat
+    assert bob_chat.get_basic_snapshot().name == "Test group"
+
+    for name in ["Baz", "Foo bar", "Xyzzy"]:
+        alice_group.set_name(name)
+        bob.wait_for_incoming_msg_event()
+        assert bob_chat.get_basic_snapshot().name == name
+
+
+def test_get_all_accounts_deadlock(rpc):
+    """Regression test for get_all_accounts deadlock."""
+    for _ in range(100):
+        all_accounts = rpc.get_all_accounts.future()
+        rpc.add_account()
+        all_accounts()
+
+
+def test_delete_deltachat_folder(acfactory, direct_imap):
+    """Test that DeltaChat folder is recreated if user deletes it manually."""
+    ac1 = acfactory.new_configured_account()
+    ac1.set_config("mvbox_move", "1")
+    ac1.bring_online()
+
+    ac1_direct_imap = direct_imap(ac1)
+    ac1_direct_imap.conn.folder.delete("DeltaChat")
+    assert "DeltaChat" not in ac1_direct_imap.list_folders()
+
+    # Wait until new folder is created and UIDVALIDITY is updated.
+    while True:
+        event = ac1.wait_for_event()
+        if event.kind == EventType.INFO and "uid/validity change folder DeltaChat" in event.msg:
+            break
+
+    ac2 = acfactory.get_online_account()
+    ac2.create_chat(ac1).send_text("hello")
+    msg = ac1.wait_for_incoming_msg().get_snapshot()
+    assert msg.text == "hello"
+
+    assert "DeltaChat" in ac1_direct_imap.list_folders()

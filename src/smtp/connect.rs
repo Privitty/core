@@ -2,11 +2,12 @@
 
 use std::net::SocketAddr;
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{Context as _, Result, bail};
 use async_smtp::{SmtpClient, SmtpTransport};
 use tokio::io::{AsyncBufRead, AsyncWrite, BufStream};
 
 use crate::context::Context;
+use crate::log::{info, warn};
 use crate::login_param::{ConnectionCandidate, ConnectionSecurity};
 use crate::net::dns::{lookup_host_with_cache, update_connect_timestamp};
 use crate::net::proxy::ProxyConfig;
@@ -45,7 +46,7 @@ async fn new_smtp_transport<S: AsyncBufRead + AsyncWrite + Unpin>(
     Ok(transport)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub(crate) async fn connect_and_auth(
     context: &Context,
     proxy_config: &Option<ProxyConfig>,

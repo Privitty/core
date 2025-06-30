@@ -1,7 +1,7 @@
 //! # Synchronize items between devices.
 
 use anyhow::Result;
-use lettre_email::PartBuilder;
+use mail_builder::mime::MimePart;
 use serde::{Deserialize, Serialize};
 
 use crate::chat::{self, ChatId};
@@ -10,13 +10,15 @@ use crate::constants::Blocked;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::log::LogExt;
+use crate::log::{info, warn};
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::param::Param;
 use crate::sync::SyncData::{AddQrToken, AlterChat, DeleteQrToken};
 use crate::token::Namespace;
 use crate::tools::time;
-use crate::{stock_str, token};
+use crate::{message, stock_str, token};
+use std::collections::HashSet;
 
 /// Whether to send device sync messages. Aimed for usage in the internal API.
 #[derive(Debug, PartialEq)]
@@ -61,6 +63,13 @@ pub(crate) enum SyncData {
     Config {
         key: Config,
         val: String,
+    },
+    SaveMessage {
+        src: String,  // RFC724 id (i.e. "Message-Id" header)
+        dest: String, // RFC724 id (i.e. "Message-Id" header)
+    },
+    DeleteMessages {
+        msgs: Vec<String>, // RFC724 id (i.e. "Message-Id" header)
     },
 }
 
@@ -161,7 +170,7 @@ impl Context {
     ///
     /// Mustn't be called from multiple tasks in parallel to avoid sending the same sync items twice
     /// because sync items are removed from the db only after successful sending. We guarantee this
-    /// by calling `send_sync_msg()` only from the SMTP loop.
+    /// by calling `send_sync_msg()` only from the inbox loop.
     pub async fn send_sync_msg(&self) -> Result<Option<MsgId>> {
         if let Some((json, ids)) = self.build_sync_json().await? {
             let chat_id =
@@ -223,14 +232,8 @@ impl Context {
         }
     }
 
-    pub(crate) fn build_sync_part(&self, json: String) -> PartBuilder {
-        PartBuilder::new()
-            .content_type(&"application/json".parse::<mime::Mime>().unwrap())
-            .header((
-                "Content-Disposition",
-                "attachment; filename=\"multi-device-sync.json\"",
-            ))
-            .body(json)
+    pub(crate) fn build_sync_part(&self, json: String) -> MimePart<'static> {
+        MimePart::new("application/json", json).attachment("multi-device-sync.json")
     }
 
     /// Takes a JSON string created by `build_sync_json()`
@@ -259,6 +262,8 @@ impl Context {
                     DeleteQrToken(token) => self.delete_qr_token(token).await,
                     AlterChat { id, action } => self.sync_alter_chat(id, action).await,
                     SyncData::Config { key, val } => self.sync_config(key, val).await,
+                    SyncData::SaveMessage { src, dest } => self.save_message(src, dest).await,
+                    SyncData::DeleteMessages { msgs } => self.sync_message_deletion(msgs).await,
                 },
                 SyncDataOrUnknown::Unknown(data) => {
                     warn!(self, "Ignored unknown sync item: {data}.");
@@ -267,6 +272,15 @@ impl Context {
             }
             .log_err(self)
             .ok();
+        }
+
+        // Since there was a sync message, we know that there is a second device.
+        // Set BccSelf to true if it isn't already.
+        if !items.items.is_empty() && !self.get_config_bool(Config::BccSelf).await.unwrap_or(true) {
+            self.set_config_ex(Sync::Nosync, Config::BccSelf, Some("1"))
+                .await
+                .log_err(self)
+                .ok();
         }
     }
 
@@ -282,6 +296,33 @@ impl Context {
         token::delete(self, Namespace::Auth, &token.auth).await?;
         Ok(())
     }
+
+    async fn save_message(&self, src_rfc724_mid: &str, dest_rfc724_mid: &String) -> Result<()> {
+        if let Some((src_msg_id, _)) = message::rfc724_mid_exists(self, src_rfc724_mid).await? {
+            chat::save_copy_in_self_talk(self, src_msg_id, dest_rfc724_mid).await?;
+        }
+        Ok(())
+    }
+
+    async fn sync_message_deletion(&self, msgs: &Vec<String>) -> Result<()> {
+        let mut modified_chat_ids = HashSet::new();
+        let mut msg_ids = Vec::new();
+        for rfc724_mid in msgs {
+            if let Some((msg_id, _)) = message::rfc724_mid_exists(self, rfc724_mid).await? {
+                if let Some(msg) = Message::load_from_db_optional(self, msg_id).await? {
+                    message::delete_msg_locally(self, &msg).await?;
+                    msg_ids.push(msg.id);
+                    modified_chat_ids.insert(msg.chat_id);
+                } else {
+                    warn!(self, "Sync message delete: Database entry does not exist.");
+                }
+            } else {
+                warn!(self, "Sync message delete: {rfc724_mid:?} not found.");
+            }
+        }
+        message::delete_msgs_locally_done(self, &msg_ids, modified_chat_ids).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -291,7 +332,7 @@ mod tests {
     use anyhow::bail;
 
     use super::*;
-    use crate::chat::{remove_contact_from_chat, Chat, ProtectionStatus};
+    use crate::chat::{Chat, ProtectionStatus, remove_contact_from_chat};
     use crate::chatlist::Chatlist;
     use crate::contact::{Contact, Origin};
     use crate::securejoin::get_securejoin_qr;
@@ -566,11 +607,71 @@ mod tests {
         assert!(token::exists(&alice2, token::Namespace::Auth, "testtoken").await?);
         assert_eq!(Chatlist::try_load(&alice2, 0, None, None).await?.len(), 0);
 
+        // Sync messages are "auto-generated", but they mustn't make the self-contact a bot.
+        let self_contact = alice2.add_or_lookup_contact(&alice2).await;
+        assert!(!self_contact.is_bot());
+
         // the same sync message sent to bob must not be executed
         let bob = TestContext::new_bob().await;
-        bob.recv_msg(&sent_msg).await;
+        bob.recv_msg_trash(&sent_msg).await;
         assert!(!token::exists(&bob, token::Namespace::Auth, "testtoken").await?);
 
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_send_sync_msg_enables_bccself() -> Result<()> {
+        for (chatmail, sync_message_sent) in
+            [(false, false), (false, true), (true, false), (true, true)]
+        {
+            let alice1 = TestContext::new_alice().await;
+            let alice2 = TestContext::new_alice().await;
+
+            // SyncMsgs defaults to true on real devices, but in tests it defaults to false,
+            // so we need to enable it
+            alice1.set_config_bool(Config::SyncMsgs, true).await?;
+            alice2.set_config_bool(Config::SyncMsgs, true).await?;
+
+            if chatmail {
+                alice1.set_config_bool(Config::IsChatmail, true).await?;
+                alice2.set_config_bool(Config::IsChatmail, true).await?;
+            } else {
+                alice2.set_config_bool(Config::BccSelf, false).await?;
+            }
+
+            alice1.set_config_bool(Config::BccSelf, true).await?;
+
+            let sent_msg = if sync_message_sent {
+                alice1
+                    .add_sync_item(SyncData::AddQrToken(QrTokenData {
+                        invitenumber: "in".to_string(),
+                        auth: "testtoken".to_string(),
+                        grpid: None,
+                    }))
+                    .await?;
+                alice1.send_sync_msg().await?.unwrap();
+                alice1.pop_sent_sync_msg().await
+            } else {
+                let chat = alice1.get_self_chat().await;
+                alice1.send_text(chat.id, "Hi").await
+            };
+
+            // On chatmail accounts, BccSelf defaults to false.
+            // When receiving a sync message from another device,
+            // there obviously is a multi-device-setup, and BccSelf
+            // should be enabled.
+            assert_eq!(alice2.get_config_bool(Config::BccSelf).await?, false);
+
+            alice2.recv_msg_opt(&sent_msg).await;
+            assert_eq!(
+                alice2.get_config_bool(Config::BccSelf).await?,
+                // BccSelf should be enabled when receiving a sync message,
+                // but not when receiving another outgoing message
+                // because we might have forgotten it and it then it might have been forwarded to us again
+                // (though of course this is very unlikely).
+                sync_message_sent
+            );
+        }
         Ok(())
     }
 
@@ -643,10 +744,7 @@ mod tests {
         let fiona = &tcm.fiona().await;
         tcm.exec_securejoin_qr(fiona, alice2, &qr).await;
         let msg = fiona.get_last_msg().await;
-        assert_eq!(
-            msg.text,
-            "Member Me (fiona@example.net) added by alice@example.org."
-        );
+        assert_eq!(msg.text, "Member Me added by alice@example.org.");
         Ok(())
     }
 }

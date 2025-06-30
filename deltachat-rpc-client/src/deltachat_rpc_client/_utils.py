@@ -1,4 +1,5 @@
 import argparse
+import os
 import re
 import sys
 from threading import Thread
@@ -89,8 +90,8 @@ def _run_cli(
         help="accounts folder (default: current working directory)",
         nargs="?",
     )
-    parser.add_argument("--email", action="store", help="email address")
-    parser.add_argument("--password", action="store", help="password")
+    parser.add_argument("--email", action="store", help="email address", default=os.getenv("DELTACHAT_EMAIL"))
+    parser.add_argument("--password", action="store", help="password", default=os.getenv("DELTACHAT_PASSWORD"))
     args = parser.parse_args(argv[1:])
 
     with Rpc(accounts_dir=args.accounts_dir, **kwargs) as rpc:
@@ -114,7 +115,7 @@ def _run_cli(
 
 
 def extract_addr(text: str) -> str:
-    """extract email address from the given text."""
+    """Extract email address from the given text."""
     match = re.match(r".*\((.+@.+)\)", text)
     if match:
         text = match.group(1)
@@ -123,7 +124,7 @@ def extract_addr(text: str) -> str:
 
 
 def parse_system_image_changed(text: str) -> Optional[Tuple[str, bool]]:
-    """return image changed/deleted info from parsing the given system message text."""
+    """Return image changed/deleted info from parsing the given system message text."""
     text = text.lower()
     match = re.match(r"group image (changed|deleted) by (.+).", text)
     if match:
@@ -142,7 +143,7 @@ def parse_system_title_changed(text: str) -> Optional[Tuple[str, str]]:
 
 
 def parse_system_add_remove(text: str) -> Optional[Tuple[str, str, str]]:
-    """return add/remove info from parsing the given system message text.
+    """Return add/remove info from parsing the given system message text.
 
     returns a (action, affected, actor) tuple.
     """

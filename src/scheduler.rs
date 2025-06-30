@@ -3,26 +3,28 @@ use std::iter::{self, once};
 use std::num::NonZeroUsize;
 use std::sync::atomic::Ordering;
 
-use anyhow::{bail, Context as _, Error, Result};
+use anyhow::{Context as _, Error, Result, bail};
 use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use rand::Rng;
-use tokio::sync::{oneshot, RwLock, RwLockWriteGuard};
+use tokio::sync::{RwLock, RwLockWriteGuard, oneshot};
 use tokio::task;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use self::connectivity::ConnectivityStore;
 use crate::config::{self, Config};
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
-use crate::download::{download_msg, DownloadState};
+use crate::download::{DownloadState, download_msg};
 use crate::ephemeral::{self, delete_expired_imap_messages};
 use crate::events::EventType;
-use crate::imap::{session::Session, FolderMeaning, Imap};
+use crate::imap::{FolderMeaning, Imap, session::Session};
 use crate::location;
-use crate::log::LogExt;
+use crate::log::{LogExt, error, info, warn};
 use crate::message::MsgId;
-use crate::smtp::{send_smtp_messages, Smtp};
+use crate::smtp::{Smtp, send_smtp_messages};
 use crate::sql;
 use crate::tools::{self, duration_to_str, maybe_add_time_based_warnings, time, time_elapsed};
 
@@ -386,17 +388,17 @@ async fn inbox_loop(
 ) {
     use futures::future::FutureExt;
 
-    info!(ctx, "starting inbox loop");
+    info!(ctx, "Starting inbox loop.");
     let ImapConnectionHandlers {
         mut connection,
-        stop_receiver,
+        stop_token,
     } = inbox_handlers;
 
     let ctx1 = ctx.clone();
     let fut = async move {
         let ctx = ctx1;
         if let Err(()) = started.send(()) {
-            warn!(ctx, "inbox loop, missing started receiver");
+            warn!(ctx, "Inbox loop, missing started receiver.");
             return;
         };
 
@@ -405,9 +407,10 @@ async fn inbox_loop(
             let session = if let Some(session) = old_session.take() {
                 session
             } else {
+                info!(ctx, "Preparing new IMAP session for inbox.");
                 match connection.prepare(&ctx).await {
                     Err(err) => {
-                        warn!(ctx, "Failed to prepare INBOX connection: {:#}.", err);
+                        warn!(ctx, "Failed to prepare inbox connection: {err:#}.");
                         continue;
                     }
                     Ok(session) => session,
@@ -415,18 +418,22 @@ async fn inbox_loop(
             };
 
             match inbox_fetch_idle(&ctx, &mut connection, session).await {
-                Err(err) => warn!(ctx, "Failed fetch_idle: {err:#}"),
+                Err(err) => warn!(ctx, "Failed inbox fetch_idle: {err:#}."),
                 Ok(session) => {
+                    info!(
+                        ctx,
+                        "IMAP loop iteration for inbox finished, keeping the session."
+                    );
                     old_session = Some(session);
                 }
             }
         }
     };
 
-    stop_receiver
-        .recv()
+    stop_token
+        .cancelled()
         .map(|_| {
-            info!(ctx, "shutting down inbox loop");
+            info!(ctx, "Shutting down inbox loop.");
         })
         .race(fut)
         .await;
@@ -671,7 +678,10 @@ async fn fetch_idle(
         return Ok(session);
     }
 
-    info!(ctx, "IMAP session supports IDLE, using it.");
+    info!(
+        ctx,
+        "IMAP session in folder {watch_folder:?} supports IDLE, using it."
+    );
     let session = session
         .idle(
             ctx,
@@ -692,10 +702,10 @@ async fn simple_imap_loop(
 ) {
     use futures::future::FutureExt;
 
-    info!(ctx, "starting simple loop for {}", folder_meaning);
+    info!(ctx, "Starting simple loop for {folder_meaning}.");
     let ImapConnectionHandlers {
         mut connection,
-        stop_receiver,
+        stop_token,
     } = inbox_handlers;
 
     let ctx1 = ctx.clone();
@@ -703,7 +713,10 @@ async fn simple_imap_loop(
     let fut = async move {
         let ctx = ctx1;
         if let Err(()) = started.send(()) {
-            warn!(&ctx, "simple imap loop, missing started receiver");
+            warn!(
+                ctx,
+                "Simple imap loop for {folder_meaning}, missing started receiver."
+            );
             return;
         }
 
@@ -712,6 +725,7 @@ async fn simple_imap_loop(
             let session = if let Some(session) = old_session.take() {
                 session
             } else {
+                info!(ctx, "Preparing new IMAP session for {folder_meaning}.");
                 match connection.prepare(&ctx).await {
                     Err(err) => {
                         warn!(
@@ -727,16 +741,20 @@ async fn simple_imap_loop(
             match fetch_idle(&ctx, &mut connection, session, folder_meaning).await {
                 Err(err) => warn!(ctx, "Failed fetch_idle: {err:#}"),
                 Ok(session) => {
+                    info!(
+                        ctx,
+                        "IMAP loop iteration for {folder_meaning} finished, keeping the session"
+                    );
                     old_session = Some(session);
                 }
             }
         }
     };
 
-    stop_receiver
-        .recv()
+    stop_token
+        .cancelled()
         .map(|_| {
-            info!(ctx, "shutting down simple loop");
+            info!(ctx, "Shutting down IMAP loop for {folder_meaning}.");
         })
         .race(fut)
         .await;
@@ -752,7 +770,7 @@ async fn smtp_loop(
     info!(ctx, "Starting SMTP loop.");
     let SmtpConnectionHandlers {
         mut connection,
-        stop_receiver,
+        stop_token,
         idle_interrupt_receiver,
     } = smtp_handlers;
 
@@ -820,8 +838,8 @@ async fn smtp_loop(
         }
     };
 
-    stop_receiver
-        .recv()
+    stop_token
+        .cancelled()
         .map(|_| {
             info!(ctx, "Shutting down SMTP loop.");
         })
@@ -966,22 +984,32 @@ impl Scheduler {
     pub(crate) async fn stop(self, context: &Context) {
         // Send stop signals to tasks so they can shutdown cleanly.
         for b in self.boxes() {
-            b.conn_state.stop().await.log_err(context).ok();
+            b.conn_state.stop();
         }
-        self.smtp.stop().await.log_err(context).ok();
+        self.smtp.stop();
 
         // Actually shutdown tasks.
         let timeout_duration = std::time::Duration::from_secs(30);
+
+        let tracker = TaskTracker::new();
         for b in once(self.inbox).chain(self.oboxes) {
-            tokio::time::timeout(timeout_duration, b.handle)
-                .await
-                .log_err(context)
-                .ok();
+            let context = context.clone();
+            tracker.spawn(async move {
+                tokio::time::timeout(timeout_duration, b.handle)
+                    .await
+                    .log_err(&context)
+            });
         }
-        tokio::time::timeout(timeout_duration, self.smtp_handle)
-            .await
-            .log_err(context)
-            .ok();
+        {
+            let context = context.clone();
+            tracker.spawn(async move {
+                tokio::time::timeout(timeout_duration, self.smtp_handle)
+                    .await
+                    .log_err(&context)
+            });
+        }
+        tracker.close();
+        tracker.wait().await;
 
         // Abort tasks, then await them to ensure the `Future` is dropped.
         // Just aborting the task may keep resources such as `Context` clone
@@ -998,8 +1026,8 @@ impl Scheduler {
 /// Connection state logic shared between imap and smtp connections.
 #[derive(Debug)]
 struct ConnectionState {
-    /// Channel to interrupt the whole connection.
-    stop_sender: Sender<()>,
+    /// Cancellation token to interrupt the whole connection.
+    stop_token: CancellationToken,
     /// Channel to interrupt idle.
     idle_interrupt_sender: Sender<()>,
     /// Mutex to pass connectivity info between IMAP/SMTP threads and the API
@@ -1008,13 +1036,9 @@ struct ConnectionState {
 
 impl ConnectionState {
     /// Shutdown this connection completely.
-    async fn stop(&self) -> Result<()> {
+    fn stop(&self) {
         // Trigger shutdown of the run loop.
-        self.stop_sender
-            .send(())
-            .await
-            .context("failed to stop, missing receiver")?;
-        Ok(())
+        self.stop_token.cancel();
     }
 
     fn interrupt(&self) {
@@ -1030,17 +1054,17 @@ pub(crate) struct SmtpConnectionState {
 
 impl SmtpConnectionState {
     fn new() -> (Self, SmtpConnectionHandlers) {
-        let (stop_sender, stop_receiver) = channel::bounded(1);
+        let stop_token = CancellationToken::new();
         let (idle_interrupt_sender, idle_interrupt_receiver) = channel::bounded(1);
 
         let handlers = SmtpConnectionHandlers {
             connection: Smtp::new(),
-            stop_receiver,
+            stop_token: stop_token.clone(),
             idle_interrupt_receiver,
         };
 
         let state = ConnectionState {
-            stop_sender,
+            stop_token,
             idle_interrupt_sender,
             connectivity: handlers.connection.connectivity.clone(),
         };
@@ -1056,15 +1080,14 @@ impl SmtpConnectionState {
     }
 
     /// Shutdown this connection completely.
-    async fn stop(&self) -> Result<()> {
-        self.state.stop().await?;
-        Ok(())
+    fn stop(&self) {
+        self.state.stop();
     }
 }
 
 struct SmtpConnectionHandlers {
     connection: Smtp,
-    stop_receiver: Receiver<()>,
+    stop_token: CancellationToken,
     idle_interrupt_receiver: Receiver<()>,
 }
 
@@ -1076,16 +1099,16 @@ pub(crate) struct ImapConnectionState {
 impl ImapConnectionState {
     /// Construct a new connection.
     async fn new(context: &Context) -> Result<(Self, ImapConnectionHandlers)> {
-        let (stop_sender, stop_receiver) = channel::bounded(1);
+        let stop_token = CancellationToken::new();
         let (idle_interrupt_sender, idle_interrupt_receiver) = channel::bounded(1);
 
         let handlers = ImapConnectionHandlers {
             connection: Imap::new_configured(context, idle_interrupt_receiver).await?,
-            stop_receiver,
+            stop_token: stop_token.clone(),
         };
 
         let state = ConnectionState {
-            stop_sender,
+            stop_token,
             idle_interrupt_sender,
             connectivity: handlers.connection.connectivity.clone(),
         };
@@ -1101,14 +1124,13 @@ impl ImapConnectionState {
     }
 
     /// Shutdown this connection completely.
-    async fn stop(&self) -> Result<()> {
-        self.state.stop().await?;
-        Ok(())
+    fn stop(&self) {
+        self.state.stop();
     }
 }
 
 #[derive(Debug)]
 struct ImapConnectionHandlers {
     connection: Imap,
-    stop_receiver: Receiver<()>,
+    stop_token: CancellationToken,
 }

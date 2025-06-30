@@ -4,21 +4,18 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::io::Cursor;
 
-use anyhow::{bail, ensure, Context as _, Result};
+use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
 use deltachat_contact_tools::EmailAddress;
-use num_traits::FromPrimitive;
 use pgp::composed::Deserializable;
 pub use pgp::composed::{SignedPublicKey, SignedSecretKey};
 use pgp::ser::Serialize;
-use pgp::types::{PublicKeyTrait, SecretKeyTrait};
+use pgp::types::{KeyDetails, KeyId, Password};
 use rand::thread_rng;
 use tokio::runtime::Handle;
 
-use crate::config::Config;
-use crate::constants::KeyGenType;
 use crate::context::Context;
-use crate::log::LogExt;
+use crate::log::{LogExt, info};
 use crate::pgp::KeyPair;
 use crate::tools::{self, time_elapsed};
 
@@ -27,10 +24,42 @@ use crate::tools::{self, time_elapsed};
 /// This trait is implemented for rPGP's [SignedPublicKey] and
 /// [SignedSecretKey] types and makes working with them a little
 /// easier in the deltachat world.
-pub(crate) trait DcKey: Serialize + Deserializable + PublicKeyTrait + Clone {
+pub(crate) trait DcKey: Serialize + Deserializable + Clone {
     /// Create a key from some bytes.
     fn from_slice(bytes: &[u8]) -> Result<Self> {
-        Ok(<Self as Deserializable>::from_bytes(Cursor::new(bytes))?)
+        let res = <Self as Deserializable>::from_bytes(Cursor::new(bytes));
+        if let Ok(res) = res {
+            return Ok(res);
+        }
+
+        // Workaround for keys imported using
+        // Delta Chat core < 1.0.0.
+        // Old Delta Chat core had a bug
+        // that resulted in treating CRC24 checksum
+        // as part of the key when reading ASCII Armor.
+        // Some users that started using Delta Chat in 2019
+        // have such corrupted keys with garbage bytes at the end.
+        //
+        // Garbage is at least 3 bytes long
+        // and may be longer due to padding
+        // at the end of the real key data
+        // and importing the key multiple times.
+        //
+        // If removing 10 bytes is not enough,
+        // the key is likely actually corrupted.
+        for garbage_bytes in 3..std::cmp::min(bytes.len(), 10) {
+            let res = <Self as Deserializable>::from_bytes(Cursor::new(
+                bytes
+                    .get(..bytes.len().saturating_sub(garbage_bytes))
+                    .unwrap_or_default(),
+            ));
+            if let Ok(res) = res {
+                return Ok(res);
+            }
+        }
+
+        // Removing garbage bytes did not help, return the error.
+        Ok(res?)
     }
 
     /// Create a key from a base64 string.
@@ -49,7 +78,7 @@ pub(crate) trait DcKey: Serialize + Deserializable + PublicKeyTrait + Clone {
         let bytes = data.as_bytes();
         let res = Self::from_armor_single(Cursor::new(bytes));
         let (key, headers) = match res {
-            Err(pgp::errors::Error::NoMatchingPacket) => match Self::is_private() {
+            Err(pgp::errors::Error::NoMatchingPacket { .. }) => match Self::is_private() {
                 true => bail!("No private key packet found"),
                 false => bail!("No public key packet found"),
             },
@@ -94,15 +123,17 @@ pub(crate) trait DcKey: Serialize + Deserializable + PublicKeyTrait + Clone {
     fn to_asc(&self, header: Option<(&str, &str)>) -> String;
 
     /// The fingerprint for the key.
-    fn dc_fingerprint(&self) -> Fingerprint {
-        PublicKeyTrait::fingerprint(self).into()
-    }
+    fn dc_fingerprint(&self) -> Fingerprint;
 
     fn is_private() -> bool;
+    fn key_id(&self) -> KeyId;
 }
 
-pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
-    let public_key = context
+/// Attempts to load own public key.
+///
+/// Returns `None` if no key is generated yet.
+pub(crate) async fn load_self_public_key_opt(context: &Context) -> Result<Option<SignedPublicKey>> {
+    let Some(public_key_bytes) = context
         .sql
         .query_row_optional(
             "SELECT public_key
@@ -114,9 +145,20 @@ pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPubl
                 Ok(bytes)
             },
         )
-        .await?;
-    match public_key {
-        Some(bytes) => SignedPublicKey::from_slice(&bytes),
+        .await?
+    else {
+        return Ok(None);
+    };
+    let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+    Ok(Some(public_key))
+}
+
+/// Loads own public key.
+///
+/// If no key is generated yet, generates a new one.
+pub(crate) async fn load_self_public_key(context: &Context) -> Result<SignedPublicKey> {
+    match load_self_public_key_opt(context).await? {
+        Some(public_key) => Ok(public_key),
         None => {
             let keypair = generate_keypair(context).await?;
             Ok(keypair.public)
@@ -141,6 +183,38 @@ pub(crate) async fn load_self_public_keyring(context: &Context) -> Result<Vec<Si
         .filter_map(|bytes| SignedPublicKey::from_slice(&bytes).log_err(context).ok())
         .collect();
     Ok(keys)
+}
+
+/// Returns own public key fingerprint in (not human-readable) hex representation.
+/// This is the fingerprint format that is used in the database.
+///
+/// If no key is generated yet, generates a new one.
+///
+/// For performance reasons, the fingerprint is cached after the first invocation.
+pub(crate) async fn self_fingerprint(context: &Context) -> Result<&str> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(fp)
+    } else {
+        let fp = load_self_public_key(context).await?.dc_fingerprint().hex();
+        Ok(context.self_fingerprint.get_or_init(|| fp))
+    }
+}
+
+/// Returns own public key fingerprint in (not human-readable) hex representation.
+/// This is the fingerprint format that is used in the database.
+///
+/// Returns `None` if no key is generated yet.
+///
+/// For performance reasons, the fingerprint is cached after the first invocation.
+pub(crate) async fn self_fingerprint_opt(context: &Context) -> Result<Option<&str>> {
+    if let Some(fp) = context.self_fingerprint.get() {
+        Ok(Some(fp))
+    } else if let Some(key) = load_self_public_key_opt(context).await? {
+        let fp = key.dc_fingerprint().hex();
+        Ok(Some(context.self_fingerprint.get_or_init(|| fp)))
+    } else {
+        Ok(None)
+    }
 }
 
 pub(crate) async fn load_self_secret_key(context: &Context) -> Result<SignedSecretKey> {
@@ -201,6 +275,14 @@ impl DcKey for SignedPublicKey {
     fn is_private() -> bool {
         false
     }
+
+    fn dc_fingerprint(&self) -> Fingerprint {
+        self.fingerprint().into()
+    }
+
+    fn key_id(&self) -> KeyId {
+        KeyDetails::key_id(self)
+    }
 }
 
 impl DcKey for SignedSecretKey {
@@ -220,6 +302,14 @@ impl DcKey for SignedSecretKey {
     fn is_private() -> bool {
         true
     }
+
+    fn dc_fingerprint(&self) -> Fingerprint {
+        self.fingerprint().into()
+    }
+
+    fn key_id(&self) -> KeyId {
+        KeyDetails::key_id(&**self)
+    }
 }
 
 /// Deltachat extension trait for secret keys.
@@ -233,9 +323,14 @@ pub(crate) trait DcSecretKey {
 impl DcSecretKey for SignedSecretKey {
     fn split_public_key(&self) -> Result<SignedPublicKey> {
         self.verify()?;
-        let unsigned_pubkey = SecretKeyTrait::public_key(self);
+        let unsigned_pubkey = self.public_key();
         let mut rng = thread_rng();
-        let signed_pubkey = unsigned_pubkey.sign(&mut rng, self, || "".into())?;
+        let signed_pubkey = unsigned_pubkey.sign(
+            &mut rng,
+            &self.primary_key,
+            self.primary_key.public_key(),
+            &Password::empty(),
+        )?;
         Ok(signed_pubkey)
     }
 }
@@ -250,14 +345,12 @@ async fn generate_keypair(context: &Context) -> Result<KeyPair> {
         Some(key_pair) => Ok(key_pair),
         None => {
             let start = tools::Time::now();
-            let keytype = KeyGenType::from_i32(context.get_config_int(Config::KeyGenType).await?)
-                .unwrap_or_default();
-            info!(context, "Generating keypair with type {}", keytype);
+            info!(context, "Generating keypair.");
             let keypair = Handle::current()
-                .spawn_blocking(move || crate::pgp::create_keypair(addr, keytype))
+                .spawn_blocking(move || crate::pgp::create_keypair(addr))
                 .await??;
 
-            store_self_keypair(context, &keypair, KeyPairUse::Default).await?;
+            store_self_keypair(context, &keypair).await?;
             info!(
                 context,
                 "Keypair generated in {:.3}s.",
@@ -294,18 +387,6 @@ pub(crate) async fn load_keypair(context: &Context) -> Result<Option<KeyPair>> {
     })
 }
 
-/// Use of a key pair for encryption or decryption.
-///
-/// This is used by `store_self_keypair` to know what kind of key is
-/// being saved.
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub enum KeyPairUse {
-    /// The default key used to encrypt new messages.
-    Default,
-    /// Only used to decrypt existing message.
-    ReadOnly,
-}
-
 /// Store the keypair as an owned keypair for addr in the database.
 ///
 /// This will save the keypair as keys for the given address.  The
@@ -318,11 +399,7 @@ pub enum KeyPairUse {
 /// same key again overwrites it.
 ///
 /// [Config::ConfiguredAddr]: crate::config::Config::ConfiguredAddr
-pub(crate) async fn store_self_keypair(
-    context: &Context,
-    keypair: &KeyPair,
-    default: KeyPairUse,
-) -> Result<()> {
+pub(crate) async fn store_self_keypair(context: &Context, keypair: &KeyPair) -> Result<()> {
     let mut config_cache_lock = context.sql.config_cache.write().await;
     let new_key_id = context
         .sql
@@ -330,29 +407,28 @@ pub(crate) async fn store_self_keypair(
             let public_key = DcKey::to_bytes(&keypair.public);
             let secret_key = DcKey::to_bytes(&keypair.secret);
 
-            let is_default = match default {
-                KeyPairUse::Default => true,
-                KeyPairUse::ReadOnly => false,
-            };
-
+            // private_key and public_key columns
+            // are UNIQUE since migration 107,
+            // so this fails if we already have this key.
             transaction
                 .execute(
-                    "INSERT OR REPLACE INTO keypairs (public_key, private_key)
+                    "INSERT INTO keypairs (public_key, private_key)
                      VALUES (?,?)",
                     (&public_key, &secret_key),
                 )
                 .context("Failed to insert keypair")?;
 
-            if is_default {
-                let new_key_id = transaction.last_insert_rowid();
-                transaction.execute(
-                    "INSERT OR REPLACE INTO config (keyname, value) VALUES ('key_id', ?)",
-                    (new_key_id,),
-                )?;
-                Ok(Some(new_key_id))
-            } else {
-                Ok(None)
-            }
+            let new_key_id = transaction.last_insert_rowid();
+
+            // This will fail if we already have `key_id`.
+            //
+            // Setting default key is only possible if we don't
+            // have a key already.
+            transaction.execute(
+                "INSERT INTO config (keyname, value) VALUES ('key_id', ?)",
+                (new_key_id,),
+            )?;
+            Ok(Some(new_key_id))
         })
         .await?;
 
@@ -373,7 +449,7 @@ pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Resul
     let secret = SignedSecretKey::from_asc(secret_data)?.0;
     let public = secret.split_public_key()?;
     let keypair = KeyPair { public, secret };
-    store_self_keypair(context, &keypair, KeyPairUse::Default).await?;
+    store_self_keypair(context, &keypair).await?;
     Ok(())
 }
 
@@ -446,14 +522,13 @@ impl std::str::FromStr for Fingerprint {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use once_cell::sync::Lazy;
+    use std::sync::{Arc, LazyLock};
 
     use super::*;
-    use crate::test_utils::{alice_keypair, TestContext};
+    use crate::config::Config;
+    use crate::test_utils::{TestContext, alice_keypair};
 
-    static KEYPAIR: Lazy<KeyPair> = Lazy::new(alice_keypair);
+    static KEYPAIR: LazyLock<KeyPair> = LazyLock::new(alice_keypair);
 
     #[test]
     fn test_from_armored_string() {
@@ -565,22 +640,42 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         }
     }
 
+    /// Tests workaround for Delta Chat core < 1.0.0
+    /// which parsed CRC24 at the end of ASCII Armor
+    /// as the part of the key.
+    /// Depending on the alignment and the number of
+    /// `=` characters at the end of the key,
+    /// this resulted in various number of garbage
+    /// octets at the end of the key, starting from 3 octets,
+    /// but possibly 4 or 5 and maybe more octets
+    /// if the key is imported or transferred
+    /// using Autocrypt Setup Message multiple times.
+    #[test]
+    fn test_ignore_trailing_garbage() {
+        // Test several variants of garbage.
+        for garbage in [
+            b"\x02\xfc\xaa\x38\x4b\x5c".as_slice(),
+            b"\x02\xfc\xaa".as_slice(),
+            b"\x01\x02\x03\x04\x05".as_slice(),
+        ] {
+            let private_key = KEYPAIR.secret.clone();
+
+            let mut binary = DcKey::to_bytes(&private_key);
+            binary.extend(garbage);
+
+            let private_key2 =
+                SignedSecretKey::from_slice(&binary).expect("Failed to ignore garbage");
+
+            assert_eq!(private_key.dc_fingerprint(), private_key2.dc_fingerprint());
+        }
+    }
+
     #[test]
     fn test_base64_roundtrip() {
         let key = KEYPAIR.public.clone();
         let base64 = key.to_base64();
         let key2 = SignedPublicKey::from_base64(&base64).unwrap();
         assert_eq!(key, key2);
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn test_load_self_existing() {
-        let alice = alice_keypair();
-        let t = TestContext::new_alice().await;
-        let pubkey = load_self_public_key(&t).await.unwrap();
-        assert_eq!(alice.public, pubkey);
-        let seckey = load_self_secret_key(&t).await.unwrap();
-        assert_eq!(alice.secret, seckey);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -638,6 +733,7 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
         assert_eq!(pubkey.primary_key, KEYPAIR.public.primary_key);
     }
 
+    /// Tests that setting a default key second time is not allowed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_save_self_key_twice() {
         // Saving the same key twice should result in only one row in
@@ -652,13 +748,13 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
                 .unwrap()
         };
         assert_eq!(nrows().await, 0);
-        store_self_keypair(&ctx, &KEYPAIR, KeyPairUse::Default)
-            .await
-            .unwrap();
+        store_self_keypair(&ctx, &KEYPAIR).await.unwrap();
         assert_eq!(nrows().await, 1);
-        store_self_keypair(&ctx, &KEYPAIR, KeyPairUse::Default)
-            .await
-            .unwrap();
+
+        // Saving a second key fails.
+        let res = store_self_keypair(&ctx, &KEYPAIR).await;
+        assert!(res.is_err());
+
         assert_eq!(nrows().await, 1);
     }
 

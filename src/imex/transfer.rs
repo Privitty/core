@@ -31,10 +31,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
-use anyhow::{bail, format_err, Context as _, Result};
+use anyhow::{Context as _, Result, bail, format_err};
 use futures_lite::FutureExt;
-use iroh_net::relay::RelayMode;
-use iroh_net::Endpoint;
+use iroh::{Endpoint, RelayMode};
 use tokio::fs;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -42,13 +41,14 @@ use tokio_util::sync::CancellationToken;
 use crate::chat::add_device_msg;
 use crate::context::Context;
 use crate::imex::BlobDirContents;
+use crate::log::{info, warn};
 use crate::message::Message;
 use crate::qr::Qr;
 use crate::stock_str::backup_transfer_msg_body;
-use crate::tools::{create_id, time, TempPathGuard};
-use crate::EventType;
+use crate::tools::{TempPathGuard, create_id, time};
+use crate::{EventType, e2ee};
 
-use super::{export_backup_stream, export_database, import_backup_stream, DBFILE_BACKUP_NAME};
+use super::{DBFILE_BACKUP_NAME, export_backup_stream, export_database, import_backup_stream};
 
 /// ALPN protocol identifier for the backup transfer protocol.
 const BACKUP_ALPN: &[u8] = b"/deltachat/backup";
@@ -65,11 +65,11 @@ const BACKUP_ALPN: &[u8] = b"/deltachat/backup";
 /// task use the [`Context::stop_ongoing`] mechanism.
 #[derive(Debug)]
 pub struct BackupProvider {
-    /// iroh-net endpoint.
+    /// iroh endpoint.
     _endpoint: Endpoint,
 
-    /// iroh-net address.
-    node_addr: iroh_net::NodeAddr,
+    /// iroh address.
+    node_addr: iroh::NodeAddr,
 
     /// Authentication token that should be submitted
     /// to retrieve the backup.
@@ -96,6 +96,7 @@ impl BackupProvider {
     pub async fn prepare(context: &Context) -> Result<Self> {
         let relay_mode = RelayMode::Disabled;
         let endpoint = Endpoint::builder()
+            .tls_x509() // For compatibility with iroh <0.34.0
             .alpns(vec![BACKUP_ALPN.to_vec()])
             .relay_mode(relay_mode)
             .bind()
@@ -109,6 +110,11 @@ impl BackupProvider {
             .get_blobdir()
             .parent()
             .context("Context dir not found")?;
+
+        // before we export, make sure the private key exists
+        e2ee::ensure_secret_key_exists(context)
+            .await
+            .context("Cannot create private key or private key not available")?;
 
         let dbfile = context_dir.join(DBFILE_BACKUP_NAME);
         if fs::metadata(&dbfile).await.is_ok() {
@@ -162,7 +168,7 @@ impl BackupProvider {
 
     async fn handle_connection(
         context: Context,
-        conn: iroh_net::endpoint::Connecting,
+        conn: iroh::endpoint::Connecting,
         auth_token: String,
         dbfile: Arc<TempPathGuard>,
     ) -> Result<()> {
@@ -178,6 +184,7 @@ impl BackupProvider {
         }
 
         info!(context, "Received valid backup authentication token.");
+        // Emit a nonzero progress so that UIs can display smth like "Transferring...".
         context.emit_event(EventType::ImexProgress(1));
 
         let blobdir = BlobDirContents::new(&context).await?;
@@ -291,12 +298,16 @@ impl Future for BackupProvider {
 
 pub async fn get_backup2(
     context: &Context,
-    node_addr: iroh_net::NodeAddr,
+    node_addr: iroh::NodeAddr,
     auth_token: String,
 ) -> Result<()> {
     let relay_mode = RelayMode::Disabled;
 
-    let endpoint = Endpoint::builder().relay_mode(relay_mode).bind().await?;
+    let endpoint = Endpoint::builder()
+        .tls_x509() // For compatibility with iroh <0.34.0
+        .relay_mode(relay_mode)
+        .bind()
+        .await?;
 
     let conn = endpoint.connect(node_addr, BACKUP_ALPN).await?;
     let (mut send_stream, mut recv_stream) = conn.open_bi().await?;
@@ -309,6 +320,10 @@ pub async fn get_backup2(
     let mut file_size_buf = [0u8; 8];
     recv_stream.read_exact(&mut file_size_buf).await?;
     let file_size = u64::from_be_bytes(file_size_buf);
+    info!(context, "Received backup file size.");
+    // Emit a nonzero progress so that UIs can display smth like "Transferring...".
+    context.emit_event(EventType::ImexProgress(1));
+
     import_backup_stream(context, recv_stream, file_size, passphrase)
         .await
         .context("Failed to import backup from QUIC stream")?;
@@ -337,7 +352,7 @@ pub async fn get_backup2(
 /// This is a long running operation which will return only when completed.
 ///
 /// Using [`Qr`] as argument is a bit odd as it only accepts specific variant of it.  It
-/// does avoid having [`iroh_net::NodeAddr`] in the primary API however, without
+/// does avoid having [`iroh::NodeAddr`] in the primary API however, without
 /// having to revert to untyped bytes.
 pub async fn get_backup(context: &Context, qr: Qr) -> Result<()> {
     match qr {
@@ -367,7 +382,7 @@ pub async fn get_backup(context: &Context, qr: Qr) -> Result<()> {
 mod tests {
     use std::time::Duration;
 
-    use crate::chat::{get_chat_msgs, send_msg, ChatItem};
+    use crate::chat::{ChatItem, get_chat_msgs, send_msg};
     use crate::message::Viewtype;
     use crate::test_utils::TestContextManager;
 
@@ -389,7 +404,8 @@ mod tests {
         let file = ctx0.get_blobdir().join("hello.txt");
         fs::write(&file, "i am attachment").await.unwrap();
         let mut msg = Message::new(Viewtype::File);
-        msg.set_file(file.to_str().unwrap(), Some("text/plain"));
+        msg.set_file_and_deduplicate(&ctx0, &file, Some("hello.txt"), Some("text/plain"))
+            .unwrap();
         send_msg(&ctx0, self_chat.id, &mut msg).await.unwrap();
 
         // Prepare to transfer backup.
@@ -423,7 +439,12 @@ mod tests {
         let msg = Message::load_from_db(&ctx1, *msgid).await.unwrap();
 
         let path = msg.get_file(&ctx1).unwrap();
-        assert_eq!(path.with_file_name("hello.txt"), path);
+        assert_eq!(
+            // That's the hash of the file:
+            path.with_file_name("ac1d2d284757656a8d41dc40aae4136.txt"),
+            path
+        );
+        assert_eq!("hello.txt", msg.get_filename().unwrap());
         let text = fs::read_to_string(&path).await.unwrap();
         assert_eq!(text, "i am attachment");
 
@@ -434,12 +455,14 @@ mod tests {
         assert!(msg.save_file(&ctx1, &path).await.is_err());
 
         // Check that both received the ImexProgress events.
-        ctx0.evtracker
-            .get_matching(|ev| matches!(ev, EventType::ImexProgress(1000)))
-            .await;
-        ctx1.evtracker
-            .get_matching(|ev| matches!(ev, EventType::ImexProgress(1000)))
-            .await;
+        for ctx in [&ctx0, &ctx1] {
+            ctx.evtracker
+                .get_matching(|ev| matches!(ev, EventType::ImexProgress(1)))
+                .await;
+            ctx.evtracker
+                .get_matching(|ev| matches!(ev, EventType::ImexProgress(1000)))
+                .await;
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
