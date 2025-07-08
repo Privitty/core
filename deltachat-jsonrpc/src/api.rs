@@ -2115,6 +2115,20 @@ impl CommandApi {
         }
     }
 
+    async fn send_msg_with_subject(&self, account_id: u32, chat_id: u32, data: MessageData, subj: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        let mut message = data
+            .create_message(&ctx)
+            .await
+            .context("Failed to create message with subject")?;
+        message.set_subject(subj);
+        let msg_id = chat::send_msg(&ctx, ChatId::new(chat_id), &mut message)
+            .await
+            .context("Failed to send created message with subject")?
+            .to_u32();
+        Ok(msg_id)
+    }
+
     async fn send_msg(&self, account_id: u32, chat_id: u32, data: MessageData) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
         let mut message = data

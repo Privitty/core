@@ -108,6 +108,8 @@ pub struct MessageObject {
     reactions: Option<JSONRPCReactions>,
 
     vcard_contact: Option<VcardContact>,
+
+    is_privitty_message: bool,
 }
 
 #[derive(Serialize, TypeDef, schemars::JsonSchema)]
@@ -201,7 +203,7 @@ impl MessageObject {
             .map(Into::into)
             .collect();
 
-        let message_object = MessageObject {
+        let message_object: MessageObject = MessageObject {
             id: msg_id.to_u32(),
             chat_id: message.get_chat_id().to_u32(),
             from_id: message.get_from_id().to_u32(),
@@ -280,6 +282,8 @@ impl MessageObject {
             reactions,
 
             vcard_contact: vcard_contacts.first().cloned(),
+
+            is_privitty_message: message.get_subject().contains("'privitty':'true'") && !message.get_subject().contains("Re:") && !message.get_subject().contains("'type':'privfile'"),
         };
         Ok(Some(message_object))
     }

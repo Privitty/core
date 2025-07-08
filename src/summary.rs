@@ -163,6 +163,34 @@ impl Message {
         }
     }
 
+    fn get_privitty_replacement_text(subject: &str) -> String {
+        if subject.contains("new_peer_add") {
+            "Establishing guaranteed full control over your shared data, please wait ...".to_string()
+        } else if subject.contains("new_group_add") || subject.contains("new_group_concluded") {
+            "This group is Privitty secure—take control and revoke data anytime.".to_string()
+        } else if subject.contains("new_peer_complete") || subject.contains("new_peer_conclude") {
+            "You are Privitty secure—take control and revoke data anytime.".to_string()
+        } else if subject.contains("forward_add_request") {
+            "A file has been forwarded to you.".to_string()
+        } else if subject.contains("OTSP_SENT") {
+            "You granted 15 mins viewing access.".to_string()
+        } else if subject.contains("SPLITKEYS_REQUEST") || subject.contains("SPLITKEYS_REQUESTING") {
+            "Requesting access from the owner ...".to_string()
+        } else if subject.contains("SPLITKEYS_RESPONSE") {
+            "Granted access for next 15 mins.".to_string()
+        } else if subject.contains("SPLITKEYS_REVOKED") {
+            "You revoked access".to_string()
+        } else if subject.contains("SPLITKEYS_DELETED") {
+            "Requesting for a deleted message".to_string()
+        } else if subject.contains("SPLITKEYS_UNDO_REVOKED") {
+            "You Undo revoke".to_string()
+        } else if subject.contains("relay_message") || subject.contains("relay_request") || subject.contains("relay_response") {
+            "relay_message".to_string()
+        } else {
+            String::new()
+        }
+    }
+
     /// Returns a summary text without "Forwarded:" prefix.
     async fn get_summary_text_without_prefix(&self, context: &Context) -> String {
         let (emoji, type_name, type_file, append_text);
@@ -246,7 +274,11 @@ impl Message {
             }
         };
 
-        let text = self.text.clone();
+        let text = if self.subject.contains("'privitty':'true'") && !self.subject.contains("Re:") && !self.subject.contains("'type':'privfile'"){
+            Self::get_privitty_replacement_text(&self.subject)
+        }else{
+            self.text.clone()
+        };
 
         let summary = if let Some(type_file) = type_file {
             if append_text && !text.is_empty() {
