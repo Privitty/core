@@ -48,7 +48,7 @@ use crate::stock_str::backup_transfer_msg_body;
 use crate::tools::{create_id, time, TempPathGuard};
 use crate::{e2ee, EventType};
 
-use super::{export_backup_stream, export_database, import_backup_stream, DBFILE_BACKUP_NAME};
+use super::{DBFILE_BACKUP_NAME, PRIVITTY_BACKUP_NAME, calculate_dir_size, export_backup_stream, export_database, import_backup_stream};
 
 /// ALPN protocol identifier for the backup transfer protocol.
 const BACKUP_ALPN: &[u8] = b"/deltachat/backup";
@@ -194,6 +194,14 @@ impl BackupProvider {
         for blob in blobdir.iter() {
             file_size += blob.to_abs_path().metadata()?.len()
         }
+        
+        // Add size of .privitty folder if it exists
+        let context_dir = context
+            .get_blobdir()
+            .parent()
+            .context("Context dir not found")?;
+        let privitty_dir = context_dir.join(PRIVITTY_BACKUP_NAME);
+        file_size += calculate_dir_size(&privitty_dir).await?;
 
         send_stream.write_all(&file_size.to_be_bytes()).await?;
 
