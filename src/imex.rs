@@ -38,6 +38,7 @@ pub use transfer::{BackupProvider, get_backup};
 // Name of the database file in the backup.
 const DBFILE_BACKUP_NAME: &str = "dc_database_backup.sqlite";
 pub(crate) const BLOBS_BACKUP_NAME: &str = "blobs_backup";
+pub(crate) const PRIVITTY_BACKUP_NAME: &str = ".privitty";
 
 /// Import/export command.
 #[derive(Debug, Display, Copy, Clone, PartialEq, Eq, FromPrimitive, ToPrimitive)]
@@ -322,6 +323,15 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
     let backup_file = ProgressReader::new(backup_file, context.clone(), file_size);
     let mut archive = Archive::new(backup_file);
 
+    let context_dir = context
+        .get_blobdir()
+        .parent()
+        .context("Context dir not found");
+    let context_dir = match context_dir {
+        Ok(dir) => dir.to_path_buf(),
+        Err(e) => return (Err(e).context("Failed to get context dir"),),
+    };
+
     let mut entries = match archive.entries() {
         Ok(entries) => entries,
         Err(e) => return (Err(e).context("Failed to get archive entries"),),
@@ -338,6 +348,38 @@ async fn import_backup_stream_inner<R: tokio::io::AsyncRead + Unpin>(
             Ok(path) => path.to_path_buf(),
             Err(e) => break Err(e).context("Failed to get entry path"),
         };
+        
+        // Handle .privitty folder separately - extract to context_dir instead of blobdir
+        // Check if the path starts with .privitty component (skipping leading CurDir components)
+        // This handles paths like ".privitty/file.txt", "./.privitty/file.txt", etc.
+        let is_privitty_entry = path
+            .components()
+            .skip_while(|c| matches!(c, std::path::Component::CurDir))
+            .next()
+            .and_then(|c| {
+                if let std::path::Component::Normal(name) = c {
+                    name.to_str()
+                } else {
+                    None
+                }
+            })
+            .map(|name| name == PRIVITTY_BACKUP_NAME)
+            .unwrap_or(false);
+        
+        if is_privitty_entry {
+            // Ensure target directory exists
+            if let Err(e) = fs::create_dir_all(&context_dir).await {
+                warn!(context, "Failed to create context dir {}: {:#}", context_dir.display(), e);
+            }
+            if let Err(e) = f.unpack_in(&context_dir).await {
+                warn!(context, "Failed to unpack .privitty entry {} to {}: {:#}", path.display(), context_dir.display(), e);
+                // Continue processing other entries even if .privitty extraction fails
+            } else {
+                info!(context, "Successfully unpacked .privitty entry {} to {}", path.display(), context_dir.display());
+            }
+            continue;
+        }
+        
         if let Err(e) = f.unpack_in(context.get_blobdir()).await {
             break Err(e).context("Failed to unpack file");
         }
@@ -465,6 +507,14 @@ async fn export_backup(context: &Context, dir: &Path, passphrase: String) -> Res
     for blob in blobdir.iter() {
         file_size += blob.to_abs_path().metadata()?.len()
     }
+    
+    // Add size of .privitty folder if it exists
+    let context_dir = context
+        .get_blobdir()
+        .parent()
+        .context("Context dir not found")?;
+    let privitty_dir = context_dir.join(PRIVITTY_BACKUP_NAME);
+    file_size += calculate_dir_size(&privitty_dir).await?;
 
     export_backup_stream(context, &temp_db_path, blobdir, file, file_size)
         .await
@@ -545,6 +595,73 @@ where
     }
 }
 
+/// Calculates the total size of all files in a directory recursively.
+pub(crate) async fn calculate_dir_size(dir: &Path) -> Result<u64> {
+    let mut total_size = 0u64;
+    if !dir.exists() {
+        return Ok(0);
+    }
+    // Use iterative approach with a stack to avoid recursion boxing issues
+    let mut dirs_to_process = vec![dir.to_path_buf()];
+    
+    while let Some(current_dir) = dirs_to_process.pop() {
+        let mut entries = tokio::fs::read_dir(&current_dir).await?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let metadata = entry.metadata().await?;
+            if metadata.is_file() {
+                total_size += metadata.len();
+            } else if metadata.is_dir() {
+                dirs_to_process.push(path);
+            }
+        }
+    }
+    Ok(total_size)
+}
+
+/// Adds a directory to the tar archive recursively.
+async fn append_dir_to_tar<W>(
+    builder: &mut tokio_tar::Builder<W>,
+    source_dir: &Path,
+    archive_prefix: &Path,
+) -> Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin + Send,
+{
+    if !source_dir.exists() {
+        return Ok(());
+    }
+    // Use iterative approach with a stack to avoid recursion issues
+    let mut dirs_to_process: Vec<(PathBuf, PathBuf)> = vec![(source_dir.to_path_buf(), archive_prefix.to_path_buf())];
+    
+    while let Some((current_dir, current_archive_prefix)) = dirs_to_process.pop() {
+        let mut entries = tokio::fs::read_dir(&current_dir).await?;
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let path = entry.path();
+            let metadata = entry.metadata().await?;
+            
+            if metadata.is_file() {
+                let file_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| format_err!("invalid file name"))?;
+                let archive_path = current_archive_prefix.join(file_name);
+                let mut file = File::open(&path).await?;
+                builder.append_file(archive_path, &mut file).await?;
+            } else if metadata.is_dir() {
+                let dir_name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .ok_or_else(|| format_err!("invalid directory name"))?;
+                let archive_path = current_archive_prefix.join(dir_name);
+                // Add subdirectory to stack for processing
+                dirs_to_process.push((path, archive_path));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Exports the database and blobs into a stream.
 pub(crate) async fn export_backup_stream<'a, W>(
     context: &'a Context,
@@ -567,6 +684,26 @@ where
         let mut file = File::open(blob.to_abs_path()).await?;
         let path_in_archive = PathBuf::from(BLOBS_BACKUP_NAME).join(blob.as_name());
         builder.append_file(path_in_archive, &mut file).await?;
+    }
+
+    // Add .privitty folder if it exists
+    let context_dir = context
+        .get_blobdir()
+        .parent()
+        .context("Context dir not found")?;
+    let privitty_dir = context_dir.join(PRIVITTY_BACKUP_NAME);
+    if privitty_dir.exists() {
+        info!(context, "Adding .privitty folder to backup from {}", privitty_dir.display());
+        append_dir_to_tar(
+            &mut builder,
+            &privitty_dir,
+            &PathBuf::from(PRIVITTY_BACKUP_NAME),
+        )
+        .await
+        .context("Failed to add .privitty folder to backup")?;
+        info!(context, "Successfully added .privitty folder to backup");
+    } else {
+        info!(context, ".privitty folder does not exist at {}, skipping", privitty_dir.display());
     }
 
     builder.finish().await?;
