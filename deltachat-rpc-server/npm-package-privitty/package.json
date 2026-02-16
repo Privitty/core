@@ -1,0 +1,20 @@
+{
+  "name": "@privitty/deltachat-rpc-server",
+  "version": "1.160.0",
+  "license": "MPL-2.0",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "type": "module",
+  "optionalDependencies": {},
+  "peerDependencies": {
+    "@deltachat/jsonrpc-client": "*"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Privitty/core.git",
+    "directory": "deltachat-rpc-server"
+  },
+  "scripts": {
+    "prepack": "node scripts/update_optional_dependencies_and_version.js"
+  }
+}
