@@ -33,7 +33,7 @@ use crate::contact::{Contact, ContactId, Modifier, Origin};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::headerdef::{HeaderDef, HeaderDefMap};
-use crate::log::{LogExt, error, info, warn};
+use crate::log::{LogExt, warn};
 use crate::login_param::{
     ConfiguredLoginParam, ConfiguredServerLoginParam, prioritize_server_login_params,
 };
