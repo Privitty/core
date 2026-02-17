@@ -8,13 +8,14 @@ use async_channel::{self as channel, Receiver, Sender};
 use futures::future::try_join_all;
 use futures_lite::FutureExt;
 use rand::Rng;
-use tokio::sync::{RwLock, RwLockWriteGuard, oneshot};
+use tokio::sync::{RwLock, oneshot};
 use tokio::task;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use self::connectivity::ConnectivityStore;
+pub(crate) use self::connectivity::ConnectivityStore;
 use crate::config::{self, Config};
+use crate::constants;
 use crate::contact::{ContactId, RecentlySeenLoop};
 use crate::context::Context;
 use crate::download::{DownloadState, download_msg};
@@ -52,32 +53,32 @@ impl SchedulerState {
     }
 
     /// Starts the scheduler if it is not yet started.
-    pub(crate) async fn start(&self, context: Context) {
+    pub(crate) async fn start(&self, context: &Context) {
         let mut inner = self.inner.write().await;
         match *inner {
             InnerSchedulerState::Started(_) => (),
-            InnerSchedulerState::Stopped => Self::do_start(inner, context).await,
+            InnerSchedulerState::Stopped => Self::do_start(&mut inner, context).await,
             InnerSchedulerState::Paused {
                 ref mut started, ..
             } => *started = true,
         }
+        context.update_connectivities(&inner);
     }
 
     /// Starts the scheduler if it is not yet started.
-    async fn do_start(mut inner: RwLockWriteGuard<'_, InnerSchedulerState>, context: Context) {
+    async fn do_start(inner: &mut InnerSchedulerState, context: &Context) {
         info!(context, "starting IO");
 
         // Notify message processing loop
         // to allow processing old messages after restart.
         context.new_msgs_notify.notify_one();
 
-        let ctx = context.clone();
-        match Scheduler::start(&context).await {
+        match Scheduler::start(context).await {
             Ok(scheduler) => {
                 *inner = InnerSchedulerState::Started(scheduler);
                 context.emit_event(EventType::ConnectivityChanged);
             }
-            Err(err) => error!(&ctx, "Failed to start IO: {:#}", err),
+            Err(err) => error!(context, "Failed to start IO: {:#}", err),
         }
     }
 
@@ -86,18 +87,19 @@ impl SchedulerState {
         let mut inner = self.inner.write().await;
         match *inner {
             InnerSchedulerState::Started(_) => {
-                Self::do_stop(inner, context, InnerSchedulerState::Stopped).await
+                Self::do_stop(&mut inner, context, InnerSchedulerState::Stopped).await
             }
             InnerSchedulerState::Stopped => (),
             InnerSchedulerState::Paused {
                 ref mut started, ..
             } => *started = false,
         }
+        context.update_connectivities(&inner);
     }
 
     /// Stops the scheduler if it is currently running.
     async fn do_stop(
-        mut inner: RwLockWriteGuard<'_, InnerSchedulerState>,
+        inner: &mut InnerSchedulerState,
         context: &Context,
         new_state: InnerSchedulerState,
     ) {
@@ -121,7 +123,7 @@ impl SchedulerState {
             debug_logging.loop_handle.abort();
             debug_logging.loop_handle.await.ok();
         }
-        let prev_state = std::mem::replace(&mut *inner, new_state);
+        let prev_state = std::mem::replace(inner, new_state);
         context.emit_event(EventType::ConnectivityChanged);
         match prev_state {
             InnerSchedulerState::Started(scheduler) => scheduler.stop(context).await,
@@ -137,7 +139,7 @@ impl SchedulerState {
     /// If in the meantime [`SchedulerState::start`] or [`SchedulerState::stop`] is called
     /// resume will do the right thing and restore the scheduler to the state requested by
     /// the last call.
-    pub(crate) async fn pause(&'_ self, context: Context) -> Result<IoPausedGuard> {
+    pub(crate) async fn pause(&'_ self, context: &Context) -> Result<IoPausedGuard> {
         {
             let mut inner = self.inner.write().await;
             match *inner {
@@ -146,7 +148,7 @@ impl SchedulerState {
                         started: true,
                         pause_guards_count: NonZeroUsize::new(1).unwrap(),
                     };
-                    Self::do_stop(inner, &context, new_state).await;
+                    Self::do_stop(&mut inner, context, new_state).await;
                 }
                 InnerSchedulerState::Stopped => {
                     *inner = InnerSchedulerState::Paused {
@@ -163,9 +165,11 @@ impl SchedulerState {
                         .ok_or_else(|| Error::msg("Too many pause guards active"))?
                 }
             }
+            context.update_connectivities(&inner);
         }
 
         let (tx, rx) = oneshot::channel();
+        let context = context.clone();
         tokio::spawn(async move {
             rx.await.ok();
             let mut inner = context.scheduler.inner.write().await;
@@ -182,7 +186,7 @@ impl SchedulerState {
                 } => {
                     if *pause_guards_count == NonZeroUsize::new(1).unwrap() {
                         match *started {
-                            true => SchedulerState::do_start(inner, context.clone()).await,
+                            true => SchedulerState::do_start(&mut inner, &context).await,
                             false => *inner = InnerSchedulerState::Stopped,
                         }
                     } else {
@@ -192,6 +196,7 @@ impl SchedulerState {
                     }
                 }
             }
+            context.update_connectivities(&inner);
         });
         Ok(IoPausedGuard { sender: Some(tx) })
     }
@@ -201,7 +206,7 @@ impl SchedulerState {
         info!(context, "restarting IO");
         if self.is_running().await {
             self.stop(context).await;
-            self.start(context.clone()).await;
+            self.start(context).await;
         }
     }
 
@@ -222,7 +227,7 @@ impl SchedulerState {
             _ => return,
         };
         drop(inner);
-        connectivity::idle_interrupted(inbox, oboxes).await;
+        connectivity::idle_interrupted(inbox, oboxes);
     }
 
     /// Indicate that the network likely is lost.
@@ -239,7 +244,7 @@ impl SchedulerState {
             _ => return,
         };
         drop(inner);
-        connectivity::maybe_network_lost(context, stores).await;
+        connectivity::maybe_network_lost(context, stores);
     }
 
     pub(crate) async fn interrupt_inbox(&self) {
@@ -287,7 +292,7 @@ impl SchedulerState {
 }
 
 #[derive(Debug, Default)]
-enum InnerSchedulerState {
+pub(crate) enum InnerSchedulerState {
     Started(Scheduler),
     #[default]
     Stopped,
@@ -497,7 +502,8 @@ async fn inbox_fetch_idle(ctx: &Context, imap: &mut Imap, mut session: Session) 
 
     match ctx.get_config_i64(Config::LastHousekeeping).await {
         Ok(last_housekeeping_time) => {
-            let next_housekeeping_time = last_housekeeping_time.saturating_add(60 * 60 * 24);
+            let next_housekeeping_time =
+                last_housekeeping_time.saturating_add(constants::HOUSEKEEPING_PERIOD);
             if next_housekeeping_time <= time() {
                 sql::housekeeping(ctx).await.log_err(ctx).ok();
             }
@@ -563,7 +569,7 @@ async fn fetch_idle(
         // The folder is not configured.
         // For example, this happens if the server does not have Sent folder
         // but watching Sent folder is enabled.
-        connection.connectivity.set_not_configured(ctx).await;
+        connection.connectivity.set_not_configured(ctx);
         connection.idle_interrupt_receiver.recv().await.ok();
         bail!("Cannot fetch folder {folder_meaning} because it is not configured");
     };
@@ -653,7 +659,7 @@ async fn fetch_idle(
         .log_err(ctx)
         .ok();
 
-    connection.connectivity.set_idle(ctx).await;
+    connection.connectivity.set_idle(ctx);
 
     ctx.emit_event(EventType::ImapInboxIdle);
 
@@ -804,8 +810,8 @@ async fn smtp_loop(
             // Fake Idle
             info!(ctx, "SMTP fake idle started.");
             match &connection.last_send_error {
-                None => connection.connectivity.set_idle(&ctx).await,
-                Some(err) => connection.connectivity.set_err(&ctx, err).await,
+                None => connection.connectivity.set_idle(&ctx),
+                Some(err) => connection.connectivity.set_err(&ctx, err),
             }
 
             // If send_smtp_messages() failed, we set a timeout for the fake-idle so that
@@ -926,7 +932,7 @@ impl Scheduler {
 
         // wait for all loops to be started
         if let Err(err) = try_join_all(start_recvs).await {
-            bail!("failed to start scheduler: {}", err);
+            bail!("failed to start scheduler: {err}");
         }
 
         info!(ctx, "scheduler is running");

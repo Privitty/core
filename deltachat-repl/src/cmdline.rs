@@ -87,7 +87,7 @@ async fn poke_eml_file(context: &Context, filename: &Path) -> Result<()> {
     let data = read_file(context, filename).await?;
 
     if let Err(err) = receive_imf(context, &data, false).await {
-        println!("receive_imf errored: {err:?}");
+        eprintln!("receive_imf errored: {err:?}");
     }
     Ok(())
 }
@@ -210,13 +210,7 @@ async fn log_msg(context: &Context, prefix: impl AsRef<str>, msg: &Message) {
         } else {
             ""
         },
-        if msg.get_viewtype() == Viewtype::VideochatInvitation {
-            format!(
-                "[VIDEOCHAT-INVITATION: {}, type={}]",
-                msg.get_videochat_url().unwrap_or_default(),
-                msg.get_videochat_type().unwrap_or_default()
-            )
-        } else if msg.get_viewtype() == Viewtype::Webxdc {
+        if msg.get_viewtype() == Viewtype::Webxdc {
             match msg.get_webxdc_info(context).await {
                 Ok(info) => format!(
                     "[WEBXDC: {}, icon={}, document={}, summary={}, source_code_url={}]",
@@ -324,7 +318,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  send-backup\n\
                  receive-backup <qr>\n\
                  export-keys\n\
-                 import-keys\n\
+                 import-keys <key-file>\n\
                  poke [<eml-file>|<folder>|<addr> <key-file>]\n\
                  reset <flags>\n\
                  stop\n\
@@ -333,8 +327,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             _ => println!(
                 "==========================Database commands==\n\
                  info\n\
-                 open <file to open or create>\n\
-                 close\n\
                  set <configuration-key> [<value>]\n\
                  get <configuration-key>\n\
                  oauth2\n\
@@ -349,28 +341,31 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  ==============================Chat commands==\n\
                  listchats [<query>]\n\
                  listarchived\n\
+                 start-realtime <msg-id>\n\
+                 send-realtime <msg-id> <data>\n\
                  chat [<chat-id>|0]\n\
                  createchat <contact-id>\n\
                  creategroup <name>\n\
-                 createbroadcast\n\
+                 createbroadcast <name>\n\
                  createprotected <name>\n\
                  addmember <contact-id>\n\
                  removemember <contact-id>\n\
                  groupname <name>\n\
-                 groupimage [<file>]\n\
+                 groupimage <image>\n\
                  chatinfo\n\
                  sendlocations <seconds>\n\
                  setlocation <lat> <lng>\n\
                  dellocations\n\
                  getlocations [<contact-id>]\n\
                  send <text>\n\
+                 send-sync <text>\n\
+                 sendempty\n\
                  sendimage <file> [<text>]\n\
                  sendsticker <file> [<text>]\n\
                  sendfile <file> [<text>]\n\
                  sendhtml <file for html-part> [<text for plain-part>]\n\
                  sendsyncmsg\n\
                  sendupdate <msg-id> <json status update>\n\
-                 videochat\n\
                  draft [<text>]\n\
                  devicemsg <text>\n\
                  listmedia\n\
@@ -382,7 +377,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  unmute <chat-id>\n\
                  delchat <chat-id>\n\
                  accept <chat-id>\n\
-                 decline <chat-id>\n\
+                 blockchat <chat-id>\n\
                  ===========================Message commands==\n\
                  listmsgs <query>\n\
                  msginfo <msg-id>\n\
@@ -396,14 +391,14 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                  react <msg-id> [<reaction>]\n\
                  ===========================Contact commands==\n\
                  listcontacts [<query>]\n\
-                 listverified [<query>]\n\
                  addcontact [<name>] <addr>\n\
                  contactinfo <contact-id>\n\
                  delcontact <contact-id>\n\
-                 cleanupcontacts\n\
                  block <contact-id>\n\
                  unblock <contact-id>\n\
                  listblocked\n\
+                 import-vcard <file>\n\
+                 make-vcard <file> <contact-id> [contact-id ...]\n\
                  ======================================Misc.==\n\
                  getqr [<chat-id>]\n\
                  getqrsvg [<chat-id>]\n\
@@ -424,7 +419,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             Ok(setup_code) => {
                 println!("Setup code for the transferred setup message: {setup_code}",)
             }
-            Err(err) => bail!("Failed to generate setup code: {}", err),
+            Err(err) => bail!("Failed to generate setup code: {err}"),
         },
         "get-setupcodebegin" => {
             ensure!(!arg1.is_empty(), "Argument <msg-id> missing.");
@@ -438,7 +433,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                     setupcodebegin.unwrap_or_default(),
                 );
             } else {
-                bail!("{} is no setup message.", msg_id,);
+                bail!("{msg_id} is no setup message.",);
             }
         }
         "continue-key-transfer" => {
@@ -490,6 +485,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             println!("Exported to {}.", dir.to_string_lossy());
         }
         "import-keys" => {
+            ensure!(!arg1.is_empty(), "Argument <key-file> missing.");
             imex(&context, ImexMode::ImportSelfKeys, arg1.as_ref(), None).await?;
         }
         "poke" => {
@@ -532,7 +528,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                     println!("Report written to: {file:#?}");
                 }
                 Err(err) => {
-                    bail!("Failed to get connectivity html: {}", err);
+                    bail!("Failed to get connectivity html: {err}");
                 }
             }
         }
@@ -621,7 +617,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 println!("Location streaming enabled.");
             }
             println!("{cnt} chats");
-            println!("{time_needed:?} to create this list");
+            eprintln!("{time_needed:?} to create this list");
         }
         "start-realtime" => {
             if arg1.is_empty() {
@@ -731,7 +727,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             chat::marknoticed_chat(&context, sel_chat.get_id()).await?;
             let time_noticed_needed = time_noticed_start.elapsed().unwrap_or_default();
 
-            println!(
+            eprintln!(
                 "{time_needed:?} to create this list, {time_noticed_needed:?} to mark all messages as noticed."
             );
         }
@@ -750,7 +746,8 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             println!("Group#{chat_id} created successfully.");
         }
         "createbroadcast" => {
-            let chat_id = chat::create_broadcast_list(&context).await?;
+            ensure!(!arg1.is_empty(), "Argument <name> missing.");
+            let chat_id = chat::create_broadcast(&context, arg1.to_string()).await?;
 
             println!("Broadcast#{chat_id} created successfully.");
         }
@@ -912,6 +909,23 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
 
             chat::send_text_msg(&context, sel_chat.as_ref().unwrap().get_id(), msg).await?;
         }
+        "send-sync" => {
+            ensure!(sel_chat.is_some(), "No chat selected.");
+            ensure!(!arg1.is_empty(), "No message text given.");
+
+            // Send message over a dedicated SMTP connection
+            // and measure time.
+            //
+            // This can be used to benchmark SMTP connection establishment.
+            let time_start = std::time::Instant::now();
+
+            let msg = format!("{arg1} {arg2}");
+            let mut msg = Message::new_text(msg);
+            chat::send_msg_sync(&context, sel_chat.as_ref().unwrap().get_id(), &mut msg).await?;
+
+            let time_needed = time_start.elapsed();
+            println!("Sent message in {time_needed:?}.");
+        }
         "sendempty" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
             chat::send_text_msg(&context, sel_chat.as_ref().unwrap().get_id(), "".into()).await?;
@@ -959,10 +973,6 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             let msg_id = MsgId::new(arg1.parse()?);
             context.send_webxdc_status_update(msg_id, arg2).await?;
         }
-        "videochat" => {
-            ensure!(sel_chat.is_some(), "No chat selected.");
-            chat::send_videochat_invitation(&context, sel_chat.as_ref().unwrap().get_id()).await?;
-        }
         "listmsgs" => {
             ensure!(!arg1.is_empty(), "Argument <query> missing.");
 
@@ -984,7 +994,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
                 },
                 query,
             );
-            println!("{time_needed:?} to create this list");
+            eprintln!("{time_needed:?} to create this list");
         }
         "draft" => {
             ensure!(sel_chat.is_some(), "No chat selected.");
@@ -1150,7 +1160,10 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
         "listcontacts" | "contacts" => {
             let contacts = Contact::get_all(&context, DC_GCL_ADD_SELF, Some(arg1)).await?;
             log_contactlist(&context, &contacts).await?;
-            println!("{} contacts.", contacts.len());
+            println!("{} key contacts.", contacts.len());
+            let addrcontacts = Contact::get_all(&context, DC_GCL_ADDRESS, Some(arg1)).await?;
+            log_contactlist(&context, &addrcontacts).await?;
+            println!("{} address contacts.", addrcontacts.len());
         }
         "addcontact" => {
             ensure!(!arg1.is_empty(), "Arguments [<name>] <addr> expected.");
@@ -1214,6 +1227,24 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             log_contactlist(&context, &contacts).await?;
             println!("{} blocked contacts.", contacts.len());
         }
+        "import-vcard" => {
+            ensure!(!arg1.is_empty(), "Argument <file> missing.");
+            let vcard_content = fs::read_to_string(&arg1.to_string()).await?;
+            let contacts = import_vcard(&context, &vcard_content).await?;
+            println!("vCard contacts imported:");
+            log_contactlist(&context, &contacts).await?;
+        }
+        "make-vcard" => {
+            ensure!(!arg1.is_empty(), "Argument <file> missing.");
+            ensure!(!arg2.is_empty(), "Argument <contact-id> missing.");
+            let mut contact_ids = vec![];
+            for x in arg2.split_whitespace() {
+                contact_ids.push(ContactId::new(x.parse()?))
+            }
+            let vcard_content = make_vcard(&context, &contact_ids).await?;
+            fs::write(&arg1.to_string(), vcard_content).await?;
+            println!("vCard written to: {arg1}");
+        }
         "checkqr" => {
             ensure!(!arg1.is_empty(), "Argument <qr-content> missing.");
             let qr = check_qr(&context, arg1).await?;
@@ -1223,7 +1254,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             ensure!(!arg1.is_empty(), "Argument <qr-content> missing.");
             match set_config_from_qr(&context, arg1).await {
                 Ok(()) => println!("Config set from QR code, you can now call 'configure'"),
-                Err(err) => println!("Cannot set config from QR code: {err:?}"),
+                Err(err) => eprintln!("Cannot set config from QR code: {err:?}"),
             }
         }
         "createqrsvg" => {
@@ -1274,7 +1305,7 @@ pub async fn cmdline(context: Context, line: &str, chat_id: &mut ChatId) -> Resu
             );
         }
         "" => (),
-        _ => bail!("Unknown command: \"{}\" type ? for help.", arg0),
+        _ => bail!("Unknown command: \"{arg0}\" type ? for help."),
     }
 
     Ok(())

@@ -277,6 +277,7 @@ pub(crate) async fn stock_ephemeral_timer_changed(
                 .await
             }
             604_800 => stock_str::msg_ephemeral_timer_week(context, from_id).await,
+            31_536_000..=31_708_800 => stock_str::msg_ephemeral_timer_year(context, from_id).await,
             _ => {
                 stock_str::msg_ephemeral_timer_weeks(
                     context,
@@ -375,6 +376,10 @@ pub(crate) async fn start_chat_ephemeral_timers(context: &Context, chat_id: Chat
 /// `delete_device_after` setting or `ephemeral_timestamp` column.
 ///
 /// For each message a row ID, chat id, viewtype and location ID is returned.
+///
+/// Unknown viewtypes are returned as `Viewtype::Unknown`
+/// and not as errors bubbled up, easily resulting in infinite loop or leaving messages undeleted.
+/// (Happens when viewtypes are removed or added on another device which was backup/add-second-device source)
 async fn select_expired_messages(
     context: &Context,
     now: i64,
@@ -394,7 +399,11 @@ WHERE
             |row| {
                 let id: MsgId = row.get("id")?;
                 let chat_id: ChatId = row.get("chat_id")?;
-                let viewtype: Viewtype = row.get("type")?;
+                let viewtype: Viewtype = row
+                    .get("type")
+                    .context("Using default viewtype for ephemeral handling.")
+                    .log_err(context)
+                    .unwrap_or_default();
                 let location_id: u32 = row.get("location_id")?;
                 Ok((id, chat_id, viewtype, location_id))
             },
@@ -436,7 +445,11 @@ WHERE
                 |row| {
                     let id: MsgId = row.get("id")?;
                     let chat_id: ChatId = row.get("chat_id")?;
-                    let viewtype: Viewtype = row.get("type")?;
+                    let viewtype: Viewtype = row
+                        .get("type")
+                        .context("Using default viewtype for delete-old handling.")
+                        .log_err(context)
+                        .unwrap_or_default();
                     let location_id: u32 = row.get("location_id")?;
                     Ok((id, chat_id, viewtype, location_id))
                 },
@@ -466,23 +479,18 @@ pub(crate) async fn delete_expired_messages(context: &Context, now: i64) -> Resu
             .transaction(|transaction| {
                 let mut msgs_changed = Vec::with_capacity(rows.len());
                 let mut webxdc_deleted = Vec::new();
-
-                // If you change which information is removed here, also change MsgId::trash() and
-                // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
+                // If you change which information is preserved here, also change `MsgId::trash()`
+                // and other places it references.
+                let mut del_msg_stmt = transaction.prepare(
+                    "INSERT OR REPLACE INTO msgs (id, rfc724_mid, timestamp, chat_id)
+                     SELECT ?1, rfc724_mid, timestamp, ? FROM msgs WHERE id=?1",
+                )?;
+                let mut del_location_stmt =
+                    transaction.prepare("DELETE FROM locations WHERE independent=1 AND id=?")?;
                 for (msg_id, chat_id, viewtype, location_id) in rows {
-                    transaction.execute(
-                        "UPDATE msgs
-                     SET chat_id=?, txt='', txt_normalized=NULL, subject='', txt_raw='',
-                         mime_headers='', from_id=0, to_id=0, param=''
-                     WHERE id=?",
-                        (DC_CHAT_ID_TRASH, msg_id),
-                    )?;
-
+                    del_msg_stmt.execute((msg_id, DC_CHAT_ID_TRASH))?;
                     if location_id > 0 {
-                        transaction.execute(
-                            "DELETE FROM locations WHERE independent=1 AND id=?",
-                            (location_id,),
-                        )?;
+                        del_location_stmt.execute((location_id,))?;
                     }
 
                     msgs_changed.push((chat_id, msg_id));

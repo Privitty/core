@@ -2,7 +2,7 @@ use super::*;
 use crate::chat::{ProtectionStatus, create_group_chat};
 use crate::config::Config;
 use crate::securejoin::get_securejoin_qr;
-use crate::test_utils::{TestContext, TestContextManager};
+use crate::test_utils::{TestContext, TestContextManager, sync};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_http() -> Result<()> {
@@ -210,19 +210,30 @@ async fn test_decode_smtp() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_ideltachat_link() -> Result<()> {
-    let ctx = TestContext::new_alice().await;
+    let mut tcm = TestContextManager::new();
+    let ctx_configured = &tcm.alice().await;
 
-    let qr = check_qr(
-        &ctx.ctx,
-        "https://i.delta.chat/#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
-    ).await?;
-    assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+    // Explicitly test that scanning QR codes works
+    // with unconfigured accounts.
+    // This is needed for the flow where
+    // user scans a QR code or follows invite link
+    // and then creates a profile and e.g. joins a group
+    // at the same time.
+    let ctx_unconfigured = &tcm.unconfigured().await;
 
-    let qr = check_qr(
-        &ctx.ctx,
-        "https://i.privittytech.com#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
-    ).await?;
-    assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+    for ctx in &[ctx_configured, ctx_unconfigured] {
+        let qr = check_qr(
+            ctx,
+            "https://i.privittytech.com/#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        ).await?;
+        assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+
+        let qr = check_qr(
+            ctx,
+            "https://i.privittytech.com#79252762C34C5096AF57958F4FC3D21A81B0F0A7&a=cli%40deltachat.de&g=test%20%3F+test%20%21&x=h-0oKQf2CDK&i=9JEXlxAqGM0&s=0V7LzL9cxRL"
+        ).await?;
+        assert!(matches!(qr, Qr::AskVerifyGroup { .. }));
+    }
 
     Ok(())
 }
@@ -499,6 +510,77 @@ async fn test_withdraw_verifygroup() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_withdraw_multidevice() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let alice2 = &tcm.alice().await;
+
+    alice.set_config_bool(Config::SyncMsgs, true).await?;
+    alice2.set_config_bool(Config::SyncMsgs, true).await?;
+
+    // Alice creates two QR codes on the first device:
+    // group QR code and contact QR code.
+    let chat_id = create_group_chat(alice, ProtectionStatus::Unprotected, "Group").await?;
+    let chat2_id = create_group_chat(alice, ProtectionStatus::Unprotected, "Group 2").await?;
+    let contact_qr = get_securejoin_qr(alice, None).await?;
+    let group_qr = get_securejoin_qr(alice, Some(chat_id)).await?;
+    let group2_qr = get_securejoin_qr(alice, Some(chat2_id)).await?;
+
+    assert!(matches!(
+        check_qr(alice, &contact_qr).await?,
+        Qr::WithdrawVerifyContact { .. }
+    ));
+    assert!(matches!(
+        check_qr(alice, &group_qr).await?,
+        Qr::WithdrawVerifyGroup { .. }
+    ));
+
+    // Sync group QR codes.
+    sync(alice, alice2).await;
+    assert!(matches!(
+        check_qr(alice2, &group_qr).await?,
+        Qr::WithdrawVerifyGroup { .. }
+    ));
+    assert!(matches!(
+        check_qr(alice2, &group2_qr).await?,
+        Qr::WithdrawVerifyGroup { .. }
+    ));
+
+    // Alice creates a contact QR code on second device
+    // and withdraws it.
+    let contact_qr2 = get_securejoin_qr(alice2, None).await?;
+    set_config_from_qr(alice2, &contact_qr2).await?;
+    assert!(matches!(
+        check_qr(alice2, &contact_qr2).await?,
+        Qr::ReviveVerifyContact { .. }
+    ));
+
+    // Alice also withdraws second group QR code on second device.
+    set_config_from_qr(alice2, &group2_qr).await?;
+
+    // Sync messages are sent from Alice's second device to first device.
+    sync(alice2, alice).await;
+
+    // Now first device has reset all contact QR codes
+    // and second group QR code,
+    // but first group QR code is still valid.
+    assert!(matches!(
+        check_qr(alice, &contact_qr2).await?,
+        Qr::ReviveVerifyContact { .. }
+    ));
+    assert!(matches!(
+        check_qr(alice, &group_qr).await?,
+        Qr::WithdrawVerifyGroup { .. }
+    ));
+    assert!(matches!(
+        check_qr(alice, &group2_qr).await?,
+        Qr::ReviveVerifyGroup { .. }
+    ));
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_and_apply_dclogin() -> Result<()> {
     let ctx = TestContext::new().await;
 
@@ -631,32 +713,6 @@ async fn test_decode_account() -> Result<()> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_decode_webrtc_instance() -> Result<()> {
-    let ctx = TestContext::new().await;
-
-    let qr = check_qr(&ctx.ctx, "DCWEBRTC:basicwebrtc:https://basicurl.com/$ROOM").await?;
-    assert_eq!(
-        qr,
-        Qr::WebrtcInstance {
-            domain: "basicurl.com".to_string(),
-            instance_pattern: "basicwebrtc:https://basicurl.com/$ROOM".to_string()
-        }
-    );
-
-    // Test it again with mixcased "dcWebRTC:" uri scheme
-    let qr = check_qr(&ctx.ctx, "dcWebRTC:https://example.org/").await?;
-    assert_eq!(
-        qr,
-        Qr::WebrtcInstance {
-            domain: "example.org".to_string(),
-            instance_pattern: "https://example.org/".to_string()
-        }
-    );
-
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_decode_tg_socks_proxy() -> Result<()> {
     let t = TestContext::new().await;
 
@@ -736,34 +792,6 @@ async fn test_decode_account_bad_scheme() {
     )
     .await;
     assert!(res.is_err());
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_set_webrtc_instance_config_from_qr() -> Result<()> {
-    let ctx = TestContext::new().await;
-
-    assert!(ctx.ctx.get_config(Config::WebrtcInstance).await?.is_none());
-
-    let res = set_config_from_qr(&ctx.ctx, "badqr:https://example.org/").await;
-    assert!(res.is_err());
-    assert!(ctx.ctx.get_config(Config::WebrtcInstance).await?.is_none());
-
-    let res = set_config_from_qr(&ctx.ctx, "dcwebrtc:https://example.org/").await;
-    assert!(res.is_ok());
-    assert_eq!(
-        ctx.ctx.get_config(Config::WebrtcInstance).await?.unwrap(),
-        "https://example.org/"
-    );
-
-    let res =
-        set_config_from_qr(&ctx.ctx, "DCWEBRTC:basicwebrtc:https://foo.bar/?$ROOM&test").await;
-    assert!(res.is_ok());
-    assert_eq!(
-        ctx.ctx.get_config(Config::WebrtcInstance).await?.unwrap(),
-        "basicwebrtc:https://foo.bar/?$ROOM&test"
-    );
-
-    Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

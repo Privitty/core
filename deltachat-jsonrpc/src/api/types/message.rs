@@ -84,9 +84,6 @@ pub struct MessageObject {
     dimensions_height: i32,
     dimensions_width: i32,
 
-    videochat_type: Option<u32>,
-    videochat_url: Option<String>,
-
     override_sender_name: Option<String>,
     sender: ContactObject,
 
@@ -239,15 +236,6 @@ impl MessageObject {
             dimensions_height: message.get_height(),
             dimensions_width: message.get_width(),
 
-            videochat_type: match message.get_videochat_type() {
-                Some(vct) => Some(
-                    vct.to_u32()
-                        .context("videochat type conversion to number failed")?,
-                ),
-                None => None,
-            },
-            videochat_url: message.get_videochat_url(),
-
             override_sender_name,
             sender,
 
@@ -321,8 +309,8 @@ pub enum MessageViewtype {
     /// Message containing any file, eg. a PDF.
     File,
 
-    /// Message is an invitation to a videochat.
-    VideochatInvitation,
+    /// Message is a call.
+    Call,
 
     /// Message is an webxdc instance.
     Webxdc,
@@ -345,7 +333,7 @@ impl From<Viewtype> for MessageViewtype {
             Viewtype::Voice => MessageViewtype::Voice,
             Viewtype::Video => MessageViewtype::Video,
             Viewtype::File => MessageViewtype::File,
-            Viewtype::VideochatInvitation => MessageViewtype::VideochatInvitation,
+            Viewtype::Call => MessageViewtype::Call,
             Viewtype::Webxdc => MessageViewtype::Webxdc,
             Viewtype::Vcard => MessageViewtype::Vcard,
         }
@@ -364,7 +352,7 @@ impl From<MessageViewtype> for Viewtype {
             MessageViewtype::Voice => Viewtype::Voice,
             MessageViewtype::Video => Viewtype::Video,
             MessageViewtype::File => Viewtype::File,
-            MessageViewtype::VideochatInvitation => Viewtype::VideochatInvitation,
+            MessageViewtype::Call => Viewtype::Call,
             MessageViewtype::Webxdc => Viewtype::Webxdc,
             MessageViewtype::Vcard => Viewtype::Vcard,
         }
@@ -416,6 +404,9 @@ pub enum SystemMessageType {
     /// Chat ephemeral message timer is changed.
     EphemeralTimerChanged,
 
+    // Chat is e2ee
+    ChatE2ee,
+
     // Chat protection state changed
     ChatProtectionEnabled,
     ChatProtectionDisabled,
@@ -434,6 +425,9 @@ pub enum SystemMessageType {
 
     /// This message contains a users iroh node address.
     IrohNodeAddr,
+
+    CallAccepted,
+    CallEnded,
 }
 
 impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
@@ -450,6 +444,7 @@ impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
             SystemMessage::LocationStreamingEnabled => SystemMessageType::LocationStreamingEnabled,
             SystemMessage::LocationOnly => SystemMessageType::LocationOnly,
             SystemMessage::EphemeralTimerChanged => SystemMessageType::EphemeralTimerChanged,
+            SystemMessage::ChatE2ee => SystemMessageType::ChatE2ee,
             SystemMessage::ChatProtectionEnabled => SystemMessageType::ChatProtectionEnabled,
             SystemMessage::ChatProtectionDisabled => SystemMessageType::ChatProtectionDisabled,
             SystemMessage::MultiDeviceSync => SystemMessageType::MultiDeviceSync,
@@ -459,6 +454,8 @@ impl From<deltachat::mimeparser::SystemMessage> for SystemMessageType {
             SystemMessage::IrohNodeAddr => SystemMessageType::IrohNodeAddr,
             SystemMessage::SecurejoinWait => SystemMessageType::SecurejoinWait,
             SystemMessage::SecurejoinWaitTimeout => SystemMessageType::SecurejoinWaitTimeout,
+            SystemMessage::CallAccepted => SystemMessageType::CallAccepted,
+            SystemMessage::CallEnded => SystemMessageType::CallEnded,
         }
     }
 }

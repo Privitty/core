@@ -11,7 +11,8 @@ from unittest.mock import MagicMock
 import pytest
 
 from deltachat_rpc_client import Contact, EventType, Message, events
-from deltachat_rpc_client.const import DownloadState, MessageState
+from deltachat_rpc_client.const import ChatType, DownloadState, MessageState
+from deltachat_rpc_client.pytestplugin import E2EE_INFO_MSGS
 from deltachat_rpc_client.rpc import JsonRpcError
 
 
@@ -170,7 +171,10 @@ def test_account(acfactory) -> None:
     assert alice.get_size()
     assert alice.is_configured()
     assert not alice.get_avatar()
-    assert alice.get_contact_by_addr(bob_addr) is None  # There is no address-contact, only key-contact
+    # get_contact_by_addr() can lookup a key contact by address:
+    bob_contact = alice.get_contact_by_addr(bob_addr).get_snapshot()
+    assert bob_contact.display_name == "Bob"
+    assert bob_contact.is_key_contact
     assert alice.get_contacts()
     assert alice.get_contacts(snapshot=True)
     assert alice.self_contact
@@ -248,6 +252,7 @@ def test_chat(acfactory) -> None:
     bob_chat_alice.get_encryption_info()
 
     group = alice.create_group("test group")
+    to_resend = group.send_text("will be resent")
     group.add_contact(alice_contact_bob)
     group.get_qr_code()
 
@@ -259,6 +264,7 @@ def test_chat(acfactory) -> None:
 
     msg = group.send_message(text="hi")
     assert (msg.get_snapshot()).text == "hi"
+    group.resend_messages([to_resend])
     group.forward_messages([msg])
 
     group.set_draft(text="test draft")
@@ -323,6 +329,52 @@ def test_message(acfactory) -> None:
     assert reactions
     snapshot = message.get_snapshot()
     assert reactions == snapshot.reactions
+
+
+def test_receive_imf_failure(acfactory) -> None:
+    alice, bob = acfactory.get_online_accounts(2)
+    alice_contact_bob = alice.create_contact(bob, "Bob")
+    alice_chat_bob = alice_contact_bob.create_chat()
+
+    bob.set_config("fail_on_receiving_full_msg", "1")
+    alice_chat_bob.send_text("Hello!")
+    event = bob.wait_for_incoming_msg_event()
+    chat_id = event.chat_id
+    msg_id = event.msg_id
+    message = bob.get_message_by_id(msg_id)
+    snapshot = message.get_snapshot()
+    assert snapshot.chat_id == chat_id
+    assert snapshot.download_state == DownloadState.AVAILABLE
+    assert snapshot.error is not None
+    assert snapshot.show_padlock
+
+    # The failed message doesn't break the IMAP loop.
+    bob.set_config("fail_on_receiving_full_msg", "0")
+    alice_chat_bob.send_text("Hello again!")
+    event = bob.wait_for_incoming_msg_event()
+    assert event.chat_id == chat_id
+    msg_id = event.msg_id
+    message1 = bob.get_message_by_id(msg_id)
+    snapshot = message1.get_snapshot()
+    assert snapshot.chat_id == chat_id
+    assert snapshot.download_state == DownloadState.DONE
+    assert snapshot.error is None
+
+    # The failed message can be re-downloaded later.
+    bob._rpc.download_full_message(bob.id, message.id)
+    event = bob.wait_for_event(EventType.MSGS_CHANGED)
+    message = bob.get_message_by_id(event.msg_id)
+    snapshot = message.get_snapshot()
+    assert snapshot.download_state == DownloadState.IN_PROGRESS
+    event = bob.wait_for_event(EventType.MSGS_CHANGED)
+    assert event.chat_id == chat_id
+    msg_id = event.msg_id
+    message = bob.get_message_by_id(msg_id)
+    snapshot = message.get_snapshot()
+    assert snapshot.chat_id == chat_id
+    assert snapshot.download_state == DownloadState.DONE
+    assert snapshot.error is None
+    assert snapshot.text == "Hello!"
 
 
 def test_selfavatar_sync(acfactory, data, log) -> None:
@@ -457,8 +509,12 @@ def test_wait_next_messages(acfactory) -> None:
         alice_chat_bot.send_text("Hello!")
 
         next_messages = next_messages_task.result()
-        assert len(next_messages) == 1
-        snapshot = next_messages[0].get_snapshot()
+
+        if len(next_messages) == E2EE_INFO_MSGS:
+            next_messages += bot.wait_next_messages()
+
+        assert len(next_messages) == 1 + E2EE_INFO_MSGS
+        snapshot = next_messages[0 + E2EE_INFO_MSGS].get_snapshot()
         assert snapshot.text == "Hello!"
 
 
@@ -726,6 +782,26 @@ def test_markseen_contact_request(acfactory):
     assert message2.get_snapshot().state == MessageState.IN_SEEN
 
 
+def test_read_receipt(acfactory):
+    """
+    Test sending a read receipt and ensure it is attributed to the correct contact.
+    """
+    alice, bob = acfactory.get_online_accounts(2)
+
+    alice_chat_bob = alice.create_chat(bob)
+    alice_contact_bob = alice.create_contact(bob)
+    bob.create_chat(alice)  # Accept the chat
+
+    alice_chat_bob.send_text("Hello Bob!")
+    msg = bob.wait_for_incoming_msg()
+    msg.mark_seen()
+
+    read_msg = alice.get_message_by_id(alice.wait_for_event(EventType.MSG_READ).msg_id)
+    read_receipts = read_msg.get_read_receipts()
+    assert len(read_receipts) == 1
+    assert read_receipts[0].contact_id == alice_contact_bob.id
+
+
 def test_get_http_response(acfactory):
     alice = acfactory.new_configured_account()
     http_response = alice._rpc.get_http_response(alice.id, "https://example.org")
@@ -846,3 +922,36 @@ def test_delete_deltachat_folder(acfactory, direct_imap):
     assert msg.text == "hello"
 
     assert "DeltaChat" in ac1_direct_imap.list_folders()
+
+
+def test_broadcast(acfactory):
+    alice, bob = acfactory.get_online_accounts(2)
+
+    alice_chat = alice.create_broadcast("My great channel")
+    snapshot = alice_chat.get_basic_snapshot()
+    assert snapshot.name == "My great channel"
+    assert snapshot.is_unpromoted
+    assert snapshot.is_encrypted
+    assert snapshot.chat_type == ChatType.OUT_BROADCAST
+
+    alice_contact_bob = alice.create_contact(bob, "Bob")
+    alice_chat.add_contact(alice_contact_bob)
+
+    alice_msg = alice_chat.send_message(text="hello").get_snapshot()
+    assert alice_msg.text == "hello"
+    assert alice_msg.show_padlock
+
+    bob_msg = bob.wait_for_incoming_msg().get_snapshot()
+    assert bob_msg.text == "hello"
+    assert bob_msg.show_padlock
+    assert bob_msg.error is None
+
+    bob_chat = bob.get_chat_by_id(bob_msg.chat_id)
+    bob_chat_snapshot = bob_chat.get_basic_snapshot()
+    assert bob_chat_snapshot.name == "My great channel"
+    assert not bob_chat_snapshot.is_unpromoted
+    assert bob_chat_snapshot.is_encrypted
+    assert bob_chat_snapshot.chat_type == ChatType.IN_BROADCAST
+    assert bob_chat_snapshot.is_contact_request
+
+    assert not bob_chat.can_send()

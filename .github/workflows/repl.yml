@@ -14,11 +14,11 @@ jobs:
     name: Build REPL example
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
       - name: Build
         run: nix build .#deltachat-repl-win64
       - name: Upload binary

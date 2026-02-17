@@ -1,7 +1,8 @@
 //! Utilities to help writing tests.
 //!
 //! This private module is only compiled for test runs.
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::env::current_dir;
 use std::fmt::Write;
 use std::ops::{Deref, DerefMut};
 use std::panic;
@@ -34,7 +35,7 @@ use crate::context::Context;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::key::{self, DcKey, DcSecretKey, self_fingerprint};
 use crate::log::warn;
-use crate::message::{Message, MessageState, MsgId, Viewtype, update_msg_state};
+use crate::message::{Message, MessageState, MsgId, update_msg_state};
 use crate::mimeparser::{MimeMessage, SystemMessage};
 use crate::pgp::KeyPair;
 use crate::receive_imf::receive_imf;
@@ -42,8 +43,21 @@ use crate::securejoin::{get_securejoin_qr, join_securejoin};
 use crate::stock_str::StockStrings;
 use crate::tools::time;
 
+/// The number of info messages added to new e2ee chats.
+/// Currently this is "End-to-end encryption available", string `E2eAvailable`.
+pub const E2EE_INFO_MSGS: usize = 1;
+
 #[allow(non_upper_case_globals)]
 pub const AVATAR_900x900_BYTES: &[u8] = include_bytes!("../test-data/image/avatar900x900.png");
+
+#[allow(non_upper_case_globals)]
+pub const AVATAR_64x64_BYTES: &[u8] = include_bytes!("../test-data/image/avatar64x64.png");
+
+/// The filename of [`AVATAR_64x64_BYTES`],
+/// after it has been saved
+/// by [`crate::blob::BlobObject::create_and_deduplicate`].
+#[allow(non_upper_case_globals)]
+pub const AVATAR_64x64_DEDUPLICATED: &str = "e9b6c7a78aa2e4f415644f55a553e73.png";
 
 /// Map of context IDs to names for [`TestContext`]s.
 static CONTEXT_NAMES: LazyLock<std::sync::RwLock<BTreeMap<u32, String>>> =
@@ -56,19 +70,22 @@ static CONTEXT_NAMES: LazyLock<std::sync::RwLock<BTreeMap<u32, String>>> =
 /// [`TestContext`]s without managing your own [`LogSink`].
 pub struct TestContextManager {
     log_sink: LogSink,
+    used_names: BTreeSet<String>,
 }
 
 impl TestContextManager {
     pub fn new() -> Self {
-        let log_sink = LogSink::new();
-        Self { log_sink }
+        Self {
+            log_sink: LogSink::new(),
+            used_names: BTreeSet::new(),
+        }
     }
 
     pub async fn alice(&mut self) -> TestContext {
         TestContext::builder()
             .configure_alice()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -76,7 +93,7 @@ impl TestContextManager {
         TestContext::builder()
             .configure_bob()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -84,7 +101,7 @@ impl TestContextManager {
         TestContext::builder()
             .configure_charlie()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -92,7 +109,7 @@ impl TestContextManager {
         TestContext::builder()
             .configure_dom()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -100,7 +117,7 @@ impl TestContextManager {
         TestContext::builder()
             .configure_elena()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -108,7 +125,7 @@ impl TestContextManager {
         TestContext::builder()
             .configure_fiona()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -116,7 +133,7 @@ impl TestContextManager {
     pub async fn unconfigured(&mut self) -> TestContext {
         TestContext::builder()
             .with_log_sink(self.log_sink.clone())
-            .build()
+            .build(Some(&mut self.used_names))
             .await
     }
 
@@ -169,8 +186,8 @@ impl TestContextManager {
             msg,
             to.name()
         ));
-        let chat = from.create_chat(to).await;
-        let sent = from.send_text(chat.id, msg).await;
+        let chat_id = from.create_chat_id(to).await;
+        let sent = from.send_text(chat_id, msg).await;
         to.recv_msg(&sent).await
     }
 
@@ -312,7 +329,7 @@ impl TestContextBuilder {
     }
 
     /// Builds the [`TestContext`].
-    pub async fn build(self) -> TestContext {
+    pub async fn build(self, used_names: Option<&mut BTreeSet<String>>) -> TestContext {
         if let Some(key_pair) = self.key_pair {
             let userid = {
                 let public_key = &key_pair.public;
@@ -326,7 +343,19 @@ impl TestContextBuilder {
                 .addr;
             let name = EmailAddress::new(&addr).unwrap().local;
 
-            let test_context = TestContext::new_internal(Some(name), self.log_sink).await;
+            let mut unused_name = name.clone();
+            if let Some(used_names) = used_names {
+                assert!(used_names.len() < 100);
+                // If there are multiple Alices, call them 'alice', 'alice2', 'alice3', ...
+                let mut i = 1;
+                while used_names.contains(&unused_name) {
+                    i += 1;
+                    unused_name = format!("{name}{i}");
+                }
+                used_names.insert(unused_name.clone());
+            }
+
+            let test_context = TestContext::new_internal(Some(unused_name), self.log_sink).await;
             test_context.configure_addr(&addr).await;
             key::store_self_keypair(&test_context, &key_pair)
                 .await
@@ -380,21 +409,21 @@ impl TestContext {
     ///
     /// This is a shortcut which configures alice@example.org with a fixed key.
     pub async fn new_alice() -> Self {
-        Self::builder().configure_alice().build().await
+        Self::builder().configure_alice().build(None).await
     }
 
     /// Creates a new configured [`TestContext`].
     ///
     /// This is a shortcut which configures bob@example.net with a fixed key.
     pub async fn new_bob() -> Self {
-        Self::builder().configure_bob().build().await
+        Self::builder().configure_bob().build(None).await
     }
 
     /// Creates a new configured [`TestContext`].
     ///
     /// This is a shortcut which configures fiona@example.net with a fixed key.
     pub async fn new_fiona() -> Self {
-        Self::builder().configure_fiona().build().await
+        Self::builder().configure_fiona().build(None).await
     }
 
     /// Print current chat state.
@@ -546,6 +575,13 @@ impl TestContext {
             update_msg_state(&self.ctx, msg_id, MessageState::OutDelivered)
                 .await
                 .expect("failed to update message state");
+            self.sql
+                .execute(
+                    "UPDATE msgs SET timestamp_sent=? WHERE id=?",
+                    (time(), msg_id),
+                )
+                .await
+                .expect("Failed to update timestamp_sent");
         }
 
         let payload_headers = payload.split("\r\n\r\n").next().unwrap().lines();
@@ -744,7 +780,7 @@ impl TestContext {
     pub async fn add_or_lookup_address_contact(&self, other: &TestContext) -> Contact {
         let contact_id = self.add_or_lookup_address_contact_id(other).await;
         let contact = Contact::get_by_id(&self.ctx, contact_id).await.unwrap();
-        debug_assert_eq!(contact.is_key_contact(), false);
+        assert_eq!(contact.is_key_contact(), false);
         contact
     }
 
@@ -823,14 +859,23 @@ impl TestContext {
         Chat::load_from_db(&self.ctx, chat_id).await.unwrap()
     }
 
+    /// Creates or returns an existing 1:1 [`ChatId`] with another account.
+    ///
+    /// This first creates a contact by exporting a vCard from the `other`
+    /// and importing it into `self`,
+    /// then creates a 1:1 chat with this contact.
+    pub async fn create_chat_id(&self, other: &TestContext) -> ChatId {
+        let contact_id = self.add_or_lookup_contact_id(other).await;
+        ChatId::create_for_contact(self, contact_id).await.unwrap()
+    }
+
     /// Creates or returns an existing 1:1 [`Chat`] with another account.
     ///
     /// This first creates a contact by exporting a vCard from the `other`
     /// and importing it into `self`,
     /// then creates a 1:1 chat with this contact.
     pub async fn create_chat(&self, other: &TestContext) -> Chat {
-        let contact_id = self.add_or_lookup_contact_id(other).await;
-        let chat_id = ChatId::create_for_contact(self, contact_id).await.unwrap();
+        let chat_id = self.create_chat_id(other).await;
         Chat::load_from_db(self, chat_id).await.unwrap()
     }
 
@@ -1054,6 +1099,25 @@ impl Drop for TestContext {
                 // Print the chats if runtime still exists.
                 handle.block_on(async move {
                     self.print_chats().await;
+
+                    // If you set this to true, and a test fails,
+                    // the sql databases will be saved into the current working directory
+                    // so that you can examine them.
+                    if std::env::var("DELTACHAT_SAVE_TMP_DB").is_ok() {
+                        let _: u32 = self
+                            .sql
+                            .query_get_value("PRAGMA wal_checkpoint;", ())
+                            .await
+                            .unwrap()
+                            .unwrap();
+
+                        let from = self.get_dbfile();
+                        let target = current_dir()
+                            .unwrap()
+                            .join(format!("test-account-{}.db", self.name()));
+                        tokio::fs::copy(from, &target).await.unwrap();
+                        eprintln!("Copied database from {from:?} to {target:?}\n");
+                    }
                 });
             }
         });
@@ -1137,6 +1201,11 @@ impl Drop for InnerLogSink {
         while let Ok(event) = self.events.try_recv() {
             print_logevent(&event);
         }
+        if std::env::var("DELTACHAT_SAVE_TMP_DB").is_err() {
+            eprintln!(
+                "note: If you want to examine the database files, set environment variable DELTACHAT_SAVE_TMP_DB=1"
+            )
+        }
     }
 }
 
@@ -1147,7 +1216,7 @@ impl Drop for InnerLogSink {
 #[derive(Debug, Clone)]
 pub struct SentMessage<'a> {
     pub payload: String,
-    recipients: String,
+    pub recipients: String,
     pub sender_msg_id: MsgId,
     sender_context: &'a Context,
 }
@@ -1183,9 +1252,8 @@ impl SentMessage<'_> {
 ///
 /// The keypair was created using the crate::key::tests::gen_key test.
 pub fn alice_keypair() -> KeyPair {
-    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/alice-secret.asc"))
-        .unwrap()
-        .0;
+    let secret =
+        key::SignedSecretKey::from_asc(include_str!("../test-data/key/alice-secret.asc")).unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1194,9 +1262,8 @@ pub fn alice_keypair() -> KeyPair {
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn bob_keypair() -> KeyPair {
-    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/bob-secret.asc"))
-        .unwrap()
-        .0;
+    let secret =
+        key::SignedSecretKey::from_asc(include_str!("../test-data/key/bob-secret.asc")).unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1207,8 +1274,7 @@ pub fn bob_keypair() -> KeyPair {
 pub fn charlie_keypair() -> KeyPair {
     let secret =
         key::SignedSecretKey::from_asc(include_str!("../test-data/key/charlie-secret.asc"))
-            .unwrap()
-            .0;
+            .unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1217,9 +1283,8 @@ pub fn charlie_keypair() -> KeyPair {
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn dom_keypair() -> KeyPair {
-    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/dom-secret.asc"))
-        .unwrap()
-        .0;
+    let secret =
+        key::SignedSecretKey::from_asc(include_str!("../test-data/key/dom-secret.asc")).unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1228,9 +1293,8 @@ pub fn dom_keypair() -> KeyPair {
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn elena_keypair() -> KeyPair {
-    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/elena-secret.asc"))
-        .unwrap()
-        .0;
+    let secret =
+        key::SignedSecretKey::from_asc(include_str!("../test-data/key/elena-secret.asc")).unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1239,9 +1303,8 @@ pub fn elena_keypair() -> KeyPair {
 ///
 /// Like [alice_keypair] but a different key and identity.
 pub fn fiona_keypair() -> KeyPair {
-    let secret = key::SignedSecretKey::from_asc(include_str!("../test-data/key/fiona-secret.asc"))
-        .unwrap()
-        .0;
+    let secret =
+        key::SignedSecretKey::from_asc(include_str!("../test-data/key/fiona-secret.asc")).unwrap();
     let public = secret.split_public_key().unwrap();
     KeyPair { public, secret }
 }
@@ -1367,7 +1430,7 @@ fn print_logevent(logevent: &LogEvent) {
 /// Saves the other account's public key as verified
 pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
     let contact_id = this.add_or_lookup_contact_id(other).await;
-    mark_contact_id_as_verified(this, contact_id, ContactId::SELF)
+    mark_contact_id_as_verified(this, contact_id, Some(ContactId::SELF))
         .await
         .unwrap();
 }
@@ -1377,8 +1440,7 @@ pub(crate) async fn mark_as_verified(this: &TestContext, other: &TestContext) {
 pub(crate) async fn sync(alice0: &TestContext, alice1: &TestContext) {
     alice0.send_sync_msg().await.unwrap();
     let sync_msg = alice0.pop_sent_sync_msg().await;
-    let no_msg = alice1.recv_msg_opt(&sync_msg).await;
-    assert!(no_msg.is_none());
+    alice1.recv_msg_trash(&sync_msg).await;
 }
 
 /// Pretty-print an event to stdout
@@ -1473,7 +1535,7 @@ async fn write_msg(context: &Context, prefix: &str, msg: &Message, buf: &mut Str
     let msgtext = msg.get_text();
     writeln!(
         buf,
-        "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}{}",
+        "{}{}{}{}: {} (Contact#{}): {} {}{}{}{}",
         prefix,
         msg.get_id(),
         if msg.get_showpadlock() { "🔒" } else { "" },
@@ -1500,15 +1562,6 @@ async fn write_msg(context: &Context, prefix: &str, msg: &Message, buf: &mut Str
             }
         } else {
             ""
-        },
-        if msg.get_viewtype() == Viewtype::VideochatInvitation {
-            format!(
-                "[VIDEOCHAT-INVITATION: {}, type={}]",
-                msg.get_videochat_url().unwrap_or_default(),
-                msg.get_videochat_type().unwrap_or_default()
-            )
-        } else {
-            "".to_string()
         },
         if msg.is_forwarded() {
             "[FORWARDED]"
@@ -1547,14 +1600,14 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_alice() {
-        let alice = TestContext::builder().configure_alice().build().await;
+        let alice = TestContext::builder().configure_alice().build(None).await;
         alice.ctx.emit_event(EventType::Info("hello".into()));
         // panic!("Alice fails");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_with_bob() {
-        let bob = TestContext::builder().configure_bob().build().await;
+        let bob = TestContext::builder().configure_bob().build(None).await;
         bob.ctx.emit_event(EventType::Info("there".into()));
         // panic!("Bob fails");
     }

@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use rusqlite::{Connection, OpenFlags, Row, config::DbConfig, types::ValueRef};
 use tokio::sync::RwLock;
 
@@ -23,7 +23,7 @@ use crate::net::http::http_cache_cleanup;
 use crate::net::prune_connection_history;
 use crate::param::{Param, Params};
 use crate::stock_str;
-use crate::tools::{SystemTime, delete_file, time};
+use crate::tools::{SystemTime, Time, delete_file, time, time_elapsed};
 
 /// Extension to [`rusqlite::ToSql`] trait
 /// which also includes [`Send`] and [`Sync`].
@@ -175,10 +175,12 @@ impl Sql {
         .await
     }
 
+    const N_DB_CONNECTIONS: usize = 3;
+
     /// Creates a new connection pool.
     fn new_pool(dbfile: &Path, passphrase: String) -> Result<Pool> {
-        let mut connections = Vec::new();
-        for _ in 0..3 {
+        let mut connections = Vec::with_capacity(Self::N_DB_CONNECTIONS);
+        for _ in 0..Self::N_DB_CONNECTIONS {
             let connection = new_connection(dbfile, &passphrase)?;
             connections.push(connection);
         }
@@ -581,6 +583,12 @@ impl Sql {
         Ok(value)
     }
 
+    /// Removes the `key`'s value from the cache.
+    pub(crate) async fn uncache_raw_config(&self, key: &str) {
+        let mut lock = self.config_cache.write().await;
+        lock.remove(key);
+    }
+
     /// Sets configuration for the given key to 32-bit signed integer value.
     pub async fn set_raw_config_int(&self, key: &str, value: i32) -> Result<()> {
         self.set_raw_config(key, Some(&format!("{value}"))).await
@@ -630,6 +638,77 @@ impl Sql {
     #[cfg(feature = "internals")]
     pub fn config_cache(&self) -> &RwLock<HashMap<String, Option<String>>> {
         &self.config_cache
+    }
+
+    /// Runs a checkpoint operation in TRUNCATE mode, so the WAL file is truncated to 0 bytes.
+    pub(crate) async fn wal_checkpoint(context: &Context) -> Result<()> {
+        let t_start = Time::now();
+        let lock = context.sql.pool.read().await;
+        let Some(pool) = lock.as_ref() else {
+            // No db connections, nothing to checkpoint.
+            return Ok(());
+        };
+
+        // Do as much work as possible without blocking anybody.
+        let query_only = true;
+        let conn = pool.get(query_only).await?;
+        tokio::task::block_in_place(|| {
+            // Execute some transaction causing the WAL file to be opened so that the
+            // `wal_checkpoint()` can proceed, otherwise it fails when called the first time,
+            // see https://sqlite.org/forum/forumpost/7512d76a05268fc8.
+            conn.query_row("PRAGMA table_list", [], |_| Ok(()))?;
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |_| Ok(()))
+        })?;
+
+        // Kick out writers.
+        const _: () = assert!(Sql::N_DB_CONNECTIONS > 1, "Deadlock possible");
+        let _write_lock = pool.write_lock().await;
+        let t_writers_blocked = Time::now();
+        // Ensure that all readers use the most recent database snapshot (are at the end of WAL) so
+        // that `wal_checkpoint(FULL)` isn't blocked. We could use `PASSIVE` as well, but it's
+        // documented poorly, https://www.sqlite.org/pragma.html#pragma_wal_checkpoint and
+        // https://www.sqlite.org/c3ref/wal_checkpoint_v2.html don't tell how it interacts with new
+        // readers.
+        let mut read_conns = Vec::with_capacity(Self::N_DB_CONNECTIONS - 1);
+        for _ in 0..(Self::N_DB_CONNECTIONS - 1) {
+            read_conns.push(pool.get(query_only).await?);
+        }
+        read_conns.clear();
+        // Checkpoint the remaining WAL pages without blocking readers.
+        let (pages_total, pages_checkpointed) = tokio::task::block_in_place(|| {
+            conn.query_row("PRAGMA wal_checkpoint(FULL)", [], |row| {
+                let pages_total: i64 = row.get(1)?;
+                let pages_checkpointed: i64 = row.get(2)?;
+                Ok((pages_total, pages_checkpointed))
+            })
+        })?;
+        if pages_checkpointed < pages_total {
+            warn!(
+                context,
+                "Cannot checkpoint whole WAL. Pages total: {pages_total}, checkpointed: {pages_checkpointed}. Make sure there are no external connections running transactions.",
+            );
+        }
+        // Kick out readers to avoid blocking/SQLITE_BUSY.
+        for _ in 0..(Self::N_DB_CONNECTIONS - 1) {
+            read_conns.push(pool.get(query_only).await?);
+        }
+        let t_readers_blocked = Time::now();
+        tokio::task::block_in_place(|| {
+            let blocked = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                let blocked: i64 = row.get(0)?;
+                Ok(blocked)
+            })?;
+            ensure!(blocked == 0);
+            Ok(())
+        })?;
+        info!(
+            context,
+            "wal_checkpoint: Total time: {:?}. Writers blocked for: {:?}. Readers blocked for: {:?}.",
+            time_elapsed(&t_start),
+            time_elapsed(&t_writers_blocked),
+            time_elapsed(&t_readers_blocked),
+        );
+        Ok(())
     }
 }
 
@@ -724,6 +803,11 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
         .context("Failed to cleanup HTTP cache")
         .log_err(context)
         .ok();
+    migrations::msgs_to_key_contacts(context)
+        .await
+        .context("migrations::msgs_to_key_contacts")
+        .log_err(context)
+        .ok();
 
     if let Err(err) = remove_unused_files(context).await {
         warn!(
@@ -748,6 +832,14 @@ pub async fn housekeeping(context: &Context) -> Result<()> {
 
     if let Err(err) = incremental_vacuum(context).await {
         warn!(context, "Failed to run incremental vacuum: {err:#}.");
+    }
+    // Work around possible checkpoint starvations (there were cases reported when a WAL file is
+    // bigger than 200M) and also make sure we truncate the WAL periodically. Auto-checkponting does
+    // not normally truncate the WAL (unless the `journal_size_limit` pragma is set), see
+    // https://www.sqlite.org/wal.html.
+    if let Err(err) = Sql::wal_checkpoint(context).await {
+        warn!(context, "wal_checkpoint() failed: {err:#}.");
+        debug_assert!(false);
     }
 
     context

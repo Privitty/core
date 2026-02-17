@@ -2,6 +2,7 @@ use deltachat_contact_tools::ContactAddress;
 use mail_builder::headers::Header;
 use mailparse::{MailHeaderMap, addrparse_header};
 use std::str;
+use std::time::Duration;
 
 use super::*;
 use crate::chat::{
@@ -12,9 +13,11 @@ use crate::chatlist::Chatlist;
 use crate::constants;
 use crate::contact::Origin;
 use crate::headerdef::HeaderDef;
+use crate::message;
 use crate::mimeparser::MimeMessage;
 use crate::receive_imf::receive_imf;
 use crate::test_utils::{TestContext, TestContextManager, get_chat_msg};
+use crate::tools::SystemTime;
 
 fn render_email_address(display_name: &str, addr: &str) -> String {
     let mut output = Vec::<u8>::new();
@@ -88,8 +91,11 @@ fn test_render_rfc724_mid() {
 
 fn render_header_text(text: &str) -> String {
     let mut output = Vec::<u8>::new();
+
+    // Some non-zero length of the header name.
+    let bytes_written = 20;
     mail_builder::headers::text::Text::new(text.to_string())
-        .write_header(&mut output, 0)
+        .write_header(&mut output, bytes_written)
         .unwrap();
 
     String::from_utf8(output).unwrap()
@@ -680,6 +686,7 @@ async fn test_selfavatar_unencrypted_signed() {
         .unwrap()
         .unwrap();
     let alice_contact = Contact::get_by_id(&bob.ctx, alice_id).await.unwrap();
+    assert_eq!(alice_contact.is_key_contact(), false);
     assert!(
         alice_contact
             .get_profile_image(&bob.ctx)
@@ -863,6 +870,43 @@ async fn test_dont_remove_self() -> Result<()> {
         1 // There is a timestamp for Bob, not for Alice
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_new_member_is_first_recipient() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+    let charlie = &tcm.charlie().await;
+
+    let bob_id = alice.add_or_lookup_contact_id(bob).await;
+    let charlie_id = alice.add_or_lookup_contact_id(charlie).await;
+
+    let group = alice
+        .create_group_with_members(ProtectionStatus::Unprotected, "Group", &[bob])
+        .await;
+    alice.send_text(group, "Hi! I created a group.").await;
+
+    SystemTime::shift(Duration::from_secs(60));
+    add_contact_to_chat(alice, group, charlie_id).await?;
+    let sent_msg = alice.pop_sent_msg().await;
+    assert!(
+        sent_msg
+            .recipients
+            .starts_with(&charlie.get_config(Config::Addr).await?.unwrap())
+    );
+
+    remove_contact_from_chat(alice, group, bob_id).await?;
+    alice.pop_sent_msg().await;
+    SystemTime::shift(Duration::from_secs(60));
+    add_contact_to_chat(alice, group, bob_id).await?;
+    let sent_msg = alice.pop_sent_msg().await;
+    assert!(
+        sent_msg
+            .recipients
+            .starts_with(&bob.get_config(Config::Addr).await?.unwrap())
+    );
     Ok(())
 }
 

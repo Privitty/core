@@ -60,23 +60,6 @@ pub enum MediaQuality {
     Worse = 1,
 }
 
-/// Video chat URL type.
-#[derive(
-    Debug, Default, Display, Clone, Copy, PartialEq, Eq, FromPrimitive, ToPrimitive, FromSql, ToSql,
-)]
-#[repr(i8)]
-pub enum VideochatType {
-    /// Unknown type.
-    #[default]
-    Unknown = 0,
-
-    /// [basicWebRTC](https://github.com/cracker0dks/basicwebrtc) instance.
-    BasicWebrtc = 1,
-
-    /// [Jitsi Meet](https://jitsi.org/jitsi-meet/) instance.
-    Jitsi = 2,
-}
-
 pub const DC_HANDSHAKE_CONTINUE_NORMAL_PROCESSING: i32 = 0x01;
 pub const DC_HANDSHAKE_STOP_NORMAL_PROCESSING: i32 = 0x02;
 pub const DC_HANDSHAKE_ADD_DELETE_JOB: i32 = 0x04;
@@ -89,15 +72,17 @@ pub const DC_GCL_ADD_ALLDONE_HINT: usize = 0x04;
 pub const DC_GCL_FOR_FORWARDING: usize = 0x08;
 
 pub const DC_GCL_ADD_SELF: u32 = 0x02;
+pub const DC_GCL_ADDRESS: u32 = 0x04;
 
 // unchanged user avatars are resent to the recipients every some days
 pub(crate) const DC_RESEND_USER_AVATAR_DAYS: i64 = 14;
 
 // warn about an outdated app after a given number of days.
-// as we use the "provider-db generation date" as reference (that might not be updated very often)
-// and as not all system get speedy updates,
+// reference is the release date.
+// as not all system get speedy updates,
 // do not use too small value that will annoy users checking for nonexistent updates.
-pub(crate) const DC_OUTDATED_WARNING_DAYS: i64 = 365;
+// "90 days" has proven to be too short at some point (user were informed but there was no update)
+pub(crate) const DC_OUTDATED_WARNING_DAYS: i64 = 183;
 
 /// messages that should be deleted get this chat_id; the messages are deleted from the working thread later then. This is also needed as rfc724_mid should be preset as long as the message is not deleted on the server (otherwise it is downloaded again)
 pub const DC_CHAT_ID_TRASH: ChatId = ChatId::new(3);
@@ -126,17 +111,46 @@ pub const DC_CHAT_ID_LAST_SPECIAL: ChatId = ChatId::new(9);
 )]
 #[repr(u32)]
 pub enum Chattype {
-    /// 1:1 chat.
+    /// A 1:1 chat, i.e. a normal chat with a single contact.
+    ///
+    /// Created by [`ChatId::create_for_contact`].
     Single = 100,
 
     /// Group chat.
+    ///
+    /// Created by [`crate::chat::create_group_chat`].
     Group = 120,
 
-    /// Mailing list.
+    /// An (unencrypted) mailing list,
+    /// created by an incoming mailing list email.
     Mailinglist = 140,
 
-    /// Broadcast list.
-    Broadcast = 160,
+    /// Outgoing broadcast channel, called "Channel" in the UI.
+    ///
+    /// The user can send into this chat,
+    /// and all recipients will receive messages
+    /// in an `InBroadcast`.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    ///
+    /// Created by [`crate::chat::create_broadcast`].
+    OutBroadcast = 160,
+
+    /// Incoming broadcast channel, called "Channel" in the UI.
+    ///
+    /// This chat is read-only,
+    /// and we do not know who the other recipients are.
+    ///
+    /// This is similar to a `MailingList`,
+    /// with the main difference being that
+    /// `InBroadcast`s are encrypted.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    InBroadcast = 165,
 }
 
 pub const DC_MSG_ID_DAYMARKER: u32 = 9;
@@ -193,6 +207,10 @@ pub(crate) const WORSE_AVATAR_BYTES: usize = 20_000; // this also fits to Outloo
 pub const BALANCED_IMAGE_SIZE: u32 = 1280;
 pub const WORSE_IMAGE_SIZE: u32 = 640;
 
+/// Limit for received images size. Bigger images become `Viewtype::File` to avoid excessive memory
+/// usage by UIs.
+pub const MAX_RCVD_IMAGE_PIXELS: u32 = 50_000_000;
+
 // Key for the folder configuration version (see below).
 pub(crate) const DC_FOLDERS_CONFIGURED_KEY: &str = "folders_configured";
 // this value can be increased if the folder configuration is changed and must be redone on next program start
@@ -227,6 +245,9 @@ pub(crate) const ASM_BODY: &str = "This is the Autocrypt Setup Message \
     If you see this message in a chatmail client (Delta Chat, Arcane Chat, Delta Touch ...), \
     use \"Settings / Add Second Device\" instead.";
 
+/// Period between `sql::housekeeping()` runs.
+pub(crate) const HOUSEKEEPING_PERIOD: i64 = 24 * 60 * 60;
+
 #[cfg(test)]
 mod tests {
     use num_traits::FromPrimitive;
@@ -239,7 +260,7 @@ mod tests {
         assert_eq!(Chattype::Single, Chattype::from_i32(100).unwrap());
         assert_eq!(Chattype::Group, Chattype::from_i32(120).unwrap());
         assert_eq!(Chattype::Mailinglist, Chattype::from_i32(140).unwrap());
-        assert_eq!(Chattype::Broadcast, Chattype::from_i32(160).unwrap());
+        assert_eq!(Chattype::OutBroadcast, Chattype::from_i32(160).unwrap());
     }
 
     #[test]
@@ -269,17 +290,5 @@ mod tests {
         assert_eq!(MediaQuality::Balanced, MediaQuality::default());
         assert_eq!(MediaQuality::Balanced, MediaQuality::from_i32(0).unwrap());
         assert_eq!(MediaQuality::Worse, MediaQuality::from_i32(1).unwrap());
-    }
-
-    #[test]
-    fn test_videochattype_values() {
-        // values may be written to disk and must not change
-        assert_eq!(VideochatType::Unknown, VideochatType::default());
-        assert_eq!(VideochatType::Unknown, VideochatType::from_i32(0).unwrap());
-        assert_eq!(
-            VideochatType::BasicWebrtc,
-            VideochatType::from_i32(1).unwrap()
-        );
-        assert_eq!(VideochatType::Jitsi, VideochatType::from_i32(2).unwrap());
     }
 }

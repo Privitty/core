@@ -27,13 +27,15 @@ use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_secret_key, self_fingerprint};
 use crate::log::{info, warn};
+use crate::logged_debug_assert;
 use crate::login_param::{ConfiguredLoginParam, EnteredLoginParam};
 use crate::message::{self, Message, MessageState, MsgId};
+use crate::net::tls::TlsSessionStore;
 use crate::param::{Param, Params};
 use crate::peer_channels::Iroh;
 use crate::push::PushSubscriber;
 use crate::quota::QuotaInfo;
-use crate::scheduler::{SchedulerState, convert_folder_meaning};
+use crate::scheduler::{ConnectivityStore, SchedulerState, convert_folder_meaning};
 use crate::sql::Sql;
 use crate::stock_str::StockStrings;
 use crate::timesmearing::SmearedTimestamp;
@@ -296,6 +298,9 @@ pub struct InnerContext {
     /// True if account has subscribed to push notifications via IMAP.
     pub(crate) push_subscribed: AtomicBool,
 
+    /// TLS session resumption cache.
+    pub(crate) tls_session_store: TlsSessionStore,
+
     /// Iroh for realtime peer channels.
     pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 
@@ -303,6 +308,10 @@ pub struct InnerContext {
     /// tokio::sync::OnceCell would be possible to use, but overkill for our usecase;
     /// the standard library's OnceLock is enough, and it's a lot smaller in memory.
     pub(crate) self_fingerprint: OnceLock<String>,
+
+    /// `Connectivity` values for mailboxes, unordered. Used to compute the aggregate connectivity,
+    /// see [`Context::get_connectivity()`].
+    pub(crate) connectivities: parking_lot::Mutex<Vec<ConnectivityStore>>,
 }
 
 /// The state of ongoing process.
@@ -332,6 +341,15 @@ impl Default for RunningState {
 /// about the context on top of the information here.
 pub fn get_info() -> BTreeMap<&'static str, String> {
     let mut res = BTreeMap::new();
+
+    #[cfg(debug_assertions)]
+    res.insert(
+        "debug_assertions",
+        "On - DO NOT RELEASE THIS BUILD".to_string(),
+    );
+    #[cfg(not(debug_assertions))]
+    res.insert("debug_assertions", "Off".to_string());
+
     res.insert("deltachat_core_version", format!("v{}", &*DC_VERSION_STR));
     res.insert("sqlite_version", rusqlite::version().to_string());
     res.insert("arch", (std::mem::size_of::<usize>() * 8).to_string());
@@ -461,8 +479,10 @@ impl Context {
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
             push_subscribed: AtomicBool::new(false),
+            tls_session_store: TlsSessionStore::new(),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
+            connectivities: parking_lot::Mutex::new(Vec::new()),
         };
 
         let ctx = Context {
@@ -492,7 +512,7 @@ impl Context {
         // Now, some configs may have changed, so, we need to invalidate the cache.
         self.sql.config_cache.write().await.clear();
 
-        self.scheduler.start(self.clone()).await;
+        self.scheduler.start(self).await;
     }
 
     /// Stops the IO scheduler.
@@ -569,7 +589,7 @@ impl Context {
         } else {
             // Pause the scheduler to ensure another connection does not start
             // while we are fetching on a dedicated connection.
-            let _pause_guard = self.scheduler.pause(self.clone()).await?;
+            let _pause_guard = self.scheduler.pause(self).await?;
 
             // Start a new dedicated connection.
             let mut connection = Imap::new_configured(self, channel::bounded(1).1).await?;
@@ -660,8 +680,16 @@ impl Context {
     /// or [`Self::emit_msgs_changed_without_msg_id`] should be used
     /// instead of this function.
     pub fn emit_msgs_changed(&self, chat_id: ChatId, msg_id: MsgId) {
-        debug_assert!(!chat_id.is_unset());
-        debug_assert!(!msg_id.is_unset());
+        logged_debug_assert!(
+            self,
+            !chat_id.is_unset(),
+            "emit_msgs_changed: chat_id is unset."
+        );
+        logged_debug_assert!(
+            self,
+            !msg_id.is_unset(),
+            "emit_msgs_changed: msg_id is unset."
+        );
 
         self.emit_event(EventType::MsgsChanged { chat_id, msg_id });
         chatlist_events::emit_chatlist_changed(self);
@@ -670,7 +698,11 @@ impl Context {
 
     /// Emits a MsgsChanged event with specified chat and without message id.
     pub fn emit_msgs_changed_without_msg_id(&self, chat_id: ChatId) {
-        debug_assert!(!chat_id.is_unset());
+        logged_debug_assert!(
+            self,
+            !chat_id.is_unset(),
+            "emit_msgs_changed_without_msg_id: chat_id is unset."
+        );
 
         self.emit_event(EventType::MsgsChanged {
             chat_id,
@@ -806,7 +838,6 @@ impl Context {
             .query_get_value("PRAGMA journal_mode;", ())
             .await?
             .unwrap_or_else(|| "unknown".to_string());
-        let e2ee_enabled = self.get_config_int(Config::E2eeEnabled).await?;
         let mdns_enabled = self.get_config_int(Config::MdnsEnabled).await?;
         let bcc_self = self.get_config_int(Config::BccSelf).await?;
         let sync_msgs = self.get_config_int(Config::SyncMsgs).await?;
@@ -940,19 +971,12 @@ impl Context {
         res.insert("configured_mvbox_folder", configured_mvbox_folder);
         res.insert("configured_trash_folder", configured_trash_folder);
         res.insert("mdns_enabled", mdns_enabled.to_string());
-        res.insert("e2ee_enabled", e2ee_enabled.to_string());
         res.insert("bcc_self", bcc_self.to_string());
         res.insert("sync_msgs", sync_msgs.to_string());
         res.insert("disable_idle", disable_idle.to_string());
         res.insert("private_key_count", prv_key_cnt.to_string());
         res.insert("public_key_count", pub_key_cnt.to_string());
         res.insert("fingerprint", fingerprint_str);
-        res.insert(
-            "webrtc_instance",
-            self.get_config(Config::WebrtcInstance)
-                .await?
-                .unwrap_or_else(|| "<unset>".to_string()),
-        );
         res.insert(
             "media_quality",
             self.get_config_int(Config::MediaQuality).await?.to_string(),
@@ -1030,16 +1054,30 @@ impl Context {
             self.get_config_int(Config::GossipPeriod).await?.to_string(),
         );
         res.insert(
-            "verified_one_on_one_chats",
-            self.get_config_bool(Config::VerifiedOneOnOneChats)
-                .await?
-                .to_string(),
-        );
-        res.insert(
             "webxdc_realtime_enabled",
             self.get_config_bool(Config::WebxdcRealtimeEnabled)
                 .await?
                 .to_string(),
+        );
+        res.insert(
+            "donation_request_next_check",
+            self.get_config_i64(Config::DonationRequestNextCheck)
+                .await?
+                .to_string(),
+        );
+        res.insert(
+            "first_key_contacts_msg_id",
+            self.sql
+                .get_raw_config("first_key_contacts_msg_id")
+                .await?
+                .unwrap_or_default(),
+        );
+        res.insert(
+            "fail_on_receiving_full_msg",
+            self.sql
+                .get_raw_config("fail_on_receiving_full_msg")
+                .await?
+                .unwrap_or_default(),
         );
 
         let elapsed = time_elapsed(&self.creation_time);
@@ -1052,7 +1090,6 @@ impl Context {
         #[derive(Default)]
         struct ChatNumbers {
             protected: u32,
-            protection_broken: u32,
             opportunistic_dc: u32,
             opportunistic_mua: u32,
             unencrypted_dc: u32,
@@ -1088,7 +1125,6 @@ impl Context {
 
         // how many of the chats active in the last months are:
         // - protected
-        // - protection-broken
         // - opportunistic-encrypted and the contact uses Delta Chat
         // - opportunistic-encrypted and the contact uses a classical MUA
         // - unencrypted and the contact uses Delta Chat
@@ -1131,8 +1167,6 @@ impl Context {
 
                         if protected == ProtectionStatus::Protected {
                             chats.protected += 1;
-                        } else if protected == ProtectionStatus::ProtectionBroken {
-                            chats.protection_broken += 1;
                         } else if encrypted {
                             if is_dc_message {
                                 chats.opportunistic_dc += 1;
@@ -1150,7 +1184,6 @@ impl Context {
             )
             .await?;
         res += &format!("chats_protected {}\n", chats.protected);
-        res += &format!("chats_protection_broken {}\n", chats.protection_broken);
         res += &format!("chats_opportunistic_dc {}\n", chats.opportunistic_dc);
         res += &format!("chats_opportunistic_mua {}\n", chats.opportunistic_mua);
         res += &format!("chats_unencrypted_dc {}\n", chats.unencrypted_dc);
@@ -1180,7 +1213,7 @@ impl Context {
             .await?
             .first()
             .context("Self reporting bot vCard does not contain a contact")?;
-        mark_contact_id_as_verified(self, contact_id, ContactId::SELF).await?;
+        mark_contact_id_as_verified(self, contact_id, Some(ContactId::SELF)).await?;
 
         let chat_id = ChatId::create_for_contact(self, contact_id).await?;
         chat_id

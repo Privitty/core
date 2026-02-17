@@ -78,6 +78,27 @@ All errors should be handled in one of these ways:
 - With `.log_err().ok()`.
 - Bubbled up with `?`.
 
+When working with [async streams](https://docs.rs/futures/0.3.31/futures/stream/index.html),
+prefer [`try_next`](https://docs.rs/futures/0.3.31/futures/stream/trait.TryStreamExt.html#method.try_next) over `next()`, e.g. do
+```
+while let Some(event) = stream.try_next().await? {
+    todo!();
+}
+```
+instead of
+```
+while let Some(event_res) = stream.next().await {
+    todo!();
+}
+```
+as it allows bubbling up the error early with `?`
+with no way to accidentally skip error processing
+with early `continue` or `break`.
+Some streams reading from a connection
+return infinite number of `Some(Err(_))`
+items when connection breaks and not processing
+errors may result in infinite loop.
+
 `backtrace` feature is enabled for `anyhow` crate
 and `debug = 1` option is set in the test profile.
 This allows to run `RUST_BACKTRACE=1 cargo test`
@@ -90,6 +111,18 @@ However, in the tests `.expect` may be used.
 Follow
 <https://doc.rust-lang.org/core/error/index.html#common-message-styles>
 for `.expect` message style.
+
+## BTreeMap vs HashMap
+
+Prefer [BTreeMap](https://doc.rust-lang.org/std/collections/struct.BTreeMap.html)
+over [HashMap](https://doc.rust-lang.org/std/collections/struct.HashMap.html)
+and [BTreeSet](https://doc.rust-lang.org/std/collections/struct.BTreeSet.html)
+over [HashSet](https://doc.rust-lang.org/std/collections/struct.HashSet.html)
+as iterating over these structures returns items in deterministic order.
+
+Non-deterministic code may result in difficult to reproduce bugs,
+flaky tests, regression tests that miss bugs
+or different behavior on different devices when processing the same messages.
 
 ## Logging
 

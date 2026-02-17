@@ -179,9 +179,11 @@ const DB_COMMANDS: [&str; 11] = [
     "housekeeping",
 ];
 
-const CHAT_COMMANDS: [&str; 36] = [
+const CHAT_COMMANDS: [&str; 39] = [
     "listchats",
     "listarchived",
+    "start-realtime",
+    "send-realtime",
     "chat",
     "createchat",
     "creategroup",
@@ -197,13 +199,16 @@ const CHAT_COMMANDS: [&str; 36] = [
     "dellocations",
     "getlocations",
     "send",
+    "send-sync",
+    "sendempty",
     "sendimage",
+    "sendsticker",
     "sendfile",
     "sendhtml",
     "sendsyncmsg",
     "sendupdate",
-    "videochat",
     "draft",
+    "devicemsg",
     "listmedia",
     "archive",
     "unarchive",
@@ -211,47 +216,48 @@ const CHAT_COMMANDS: [&str; 36] = [
     "unpin",
     "mute",
     "unmute",
-    "protect",
-    "unprotect",
     "delchat",
     "accept",
     "blockchat",
 ];
-const MESSAGE_COMMANDS: [&str; 9] = [
+const MESSAGE_COMMANDS: [&str; 10] = [
     "listmsgs",
     "msginfo",
+    "download",
+    "html",
     "listfresh",
     "forward",
     "resend",
     "markseen",
     "delmsg",
-    "download",
     "react",
 ];
 const CONTACT_COMMANDS: [&str; 9] = [
     "listcontacts",
-    "listverified",
     "addcontact",
     "contactinfo",
     "delcontact",
-    "cleanupcontacts",
     "block",
     "unblock",
     "listblocked",
+    "import-vcard",
+    "make-vcard",
 ];
-const MISC_COMMANDS: [&str; 12] = [
+const MISC_COMMANDS: [&str; 14] = [
     "getqr",
     "getqrsvg",
     "getbadqr",
     "checkqr",
     "joinqr",
+    "setqr",
     "createqrsvg",
+    "providerinfo",
     "fileinfo",
+    "estimatedeletion",
     "clear",
     "exit",
     "quit",
     "help",
-    "estimatedeletion",
 ];
 
 impl Hinter for DcHelper {
@@ -307,7 +313,7 @@ impl Validator for DcHelper {}
 
 async fn start(args: Vec<String>) -> Result<(), Error> {
     if args.len() < 2 {
-        println!("Error: Bad arguments, expected [db-name].");
+        eprintln!("Error: Bad arguments, expected [db-name].");
         bail!("No db-name specified");
     }
     let context = ContextBuilder::new(args[1].clone().into())
@@ -362,7 +368,7 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
                                 false
                             }
                             Err(err) => {
-                                println!("Error: {err:#}");
+                                eprintln!("Error: {err:#}");
                                 true
                             }
                         }
@@ -377,7 +383,7 @@ async fn start(args: Vec<String>) -> Result<(), Error> {
                     break;
                 }
                 Err(err) => {
-                    println!("Error: {err:#}");
+                    eprintln!("Error: {err:#}");
                     break;
                 }
             }
@@ -461,7 +467,7 @@ async fn handle_cmd(
                     println!("QR code svg written to: {file:#?}");
                 }
                 Err(err) => {
-                    bail!("Failed to get QR code svg: {}", err);
+                    bail!("Failed to get QR code svg: {err}");
                 }
             }
         }

@@ -20,7 +20,7 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
-  RUST_VERSION: 1.87.0
+  RUST_VERSION: 1.90.0
 
   # Minimum Supported Rust Version
   MSRV: 1.85.0
@@ -30,7 +30,7 @@ jobs:
     name: Lint Rust
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -53,7 +53,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -67,10 +67,12 @@ jobs:
     name: Check provider database
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
+      - name: Install rustfmt
+        run: rustup component add --toolchain stable-x86_64-unknown-linux-gnu rustfmt
       - name: Check provider database
         run: scripts/update-provider-database.sh
 
@@ -80,7 +82,7 @@ jobs:
     env:
       RUSTDOCFLAGS: -Dwarnings
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -115,7 +117,7 @@ jobs:
         shell: bash
         if: matrix.rust == 'latest'
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -137,12 +139,12 @@ jobs:
       - name: Tests
         env:
           RUST_BACKTRACE: 1
-        run: cargo nextest run --workspace
+        run: cargo nextest run --workspace --locked
 
       - name: Doc-Tests
         env:
           RUST_BACKTRACE: 1
-        run: cargo test --workspace --doc
+        run: cargo test --workspace --locked --doc
 
       - name: Test cargo vendor
         run: cargo vendor
@@ -154,7 +156,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -179,7 +181,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -201,7 +203,7 @@ jobs:
     name: Python lint
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -226,9 +228,9 @@ jobs:
         include:
           # Currently used Rust version.
           - os: ubuntu-latest
-            python: 3.13
+            python: 3.14
           - os: macos-latest
-            python: 3.13
+            python: 3.14
 
           # PyPy tests
           - os: ubuntu-latest
@@ -244,19 +246,19 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
 
       - name: Download libdeltachat.a
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ${{ matrix.os }}-libdeltachat.a
           path: target/debug
 
       - name: Install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -279,11 +281,11 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            python: 3.13
+            python: 3.14
           - os: macos-latest
-            python: 3.13
+            python: 3.14
           - os: windows-latest
-            python: 3.13
+            python: 3.14
 
           # PyPy tests
           - os: ubuntu-latest
@@ -297,13 +299,13 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
 
       - name: Install python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
 
@@ -311,7 +313,7 @@ jobs:
         run: pip install tox
 
       - name: Download deltachat-rpc-server
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ${{ matrix.os }}-deltachat-rpc-server
           path: target/debug

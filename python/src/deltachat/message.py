@@ -8,7 +8,6 @@ from typing import Optional, Union
 from . import const, props
 from .capi import ffi, lib
 from .cutil import as_dc_charpointer, from_dc_charpointer, from_optional_dc_charpointer
-from .reactions import Reactions
 
 
 class Message:
@@ -163,17 +162,6 @@ class Message:
                 as_dc_charpointer(description),
             ),
         )
-
-    def send_reaction(self, reaction: str):
-        """Send a reaction to message and return the resulting Message instance."""
-        msg_id = lib.dc_send_reaction(self.account._dc_context, self.id, as_dc_charpointer(reaction))
-        if msg_id == 0:
-            raise ValueError("reaction could not be send")
-        return Message.from_db(self.account, msg_id)
-
-    def get_reactions(self) -> Reactions:
-        """Get :class:`deltachat.reactions.Reactions` to the message."""
-        return Reactions.from_msg(self)
 
     def is_system_message(self):
         """return True if this message is a system/info message."""
@@ -447,10 +435,6 @@ class Message:
         """return True if it's a video message."""
         return self._view_type == const.DC_MSG_VIDEO
 
-    def is_videochat_invitation(self):
-        """return True if it's a videochat invitation message."""
-        return self._view_type == const.DC_MSG_VIDEOCHAT_INVITATION
-
     def is_webxdc(self):
         """return True if it's a Webxdc message."""
         return self._view_type == const.DC_MSG_WEBXDC
@@ -491,7 +475,6 @@ _view_type_mapping = {
     "video": const.DC_MSG_VIDEO,
     "file": const.DC_MSG_FILE,
     "sticker": const.DC_MSG_STICKER,
-    "videochat": const.DC_MSG_VIDEOCHAT_INVITATION,
     "webxdc": const.DC_MSG_WEBXDC,
 }
 

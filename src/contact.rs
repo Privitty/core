@@ -21,10 +21,10 @@ use tokio::task;
 use tokio::time::{Duration, timeout};
 
 use crate::blob::BlobObject;
-use crate::chat::{ChatId, ChatIdBlocked, ProtectionStatus};
+use crate::chat::ChatId;
 use crate::color::str_to_color;
 use crate::config::Config;
-use crate::constants::{Blocked, Chattype, DC_GCL_ADD_SELF};
+use crate::constants::{self, Blocked, Chattype};
 use crate::context::Context;
 use crate::events::EventType;
 use crate::key::{
@@ -36,8 +36,8 @@ use crate::message::MessageState;
 use crate::mimeparser::AvatarAction;
 use crate::param::{Param, Params};
 use crate::sync::{self, Sync::*};
-use crate::tools::{SystemTime, duration_to_str, get_abs_path, time};
-use crate::{chat, chatlist_events, stock_str};
+use crate::tools::{SystemTime, duration_to_str, get_abs_path, time, to_lowercase};
+use crate::{chat, chatlist_events, ensure_and_debug_assert_ne, stock_str};
 
 /// Time during which a contact is considered as seen recently.
 const SEEN_RECENTLY_SECONDS: i64 = 600;
@@ -755,7 +755,19 @@ impl Contact {
         self.is_bot
     }
 
-    /// Check if an e-mail address belongs to a known and unblocked contact.
+    /// Looks up a known and unblocked contact with a given e-mail address.
+    /// To get a list of all known and unblocked contacts, use contacts_get_contacts().
+    ///
+    ///
+    /// **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+    /// (e.g. an address-contact and a key-contact),
+    /// this looks up the most recently seen contact,
+    /// i.e. which contact is returned depends on which contact last sent a message.
+    /// If the user just clicked on a mailto: link, then this is the best thing you can do.
+    /// But **DO NOT** internally represent contacts by their email address
+    /// and do not use this function to look them up;
+    /// otherwise this function will sometimes look up the wrong contact.
+    /// Instead, you should internally represent contacts by their ids.
     ///
     /// Known and unblocked contacts will be returned by `get_contacts()`.
     ///
@@ -786,7 +798,7 @@ impl Contact {
 
         let addr_normalized = addr_normalize(addr);
 
-        if context.is_self_addr(&addr_normalized).await? {
+        if context.is_configured().await? && context.is_self_addr(addr).await? {
             return Ok(Some(ContactId::SELF));
         }
 
@@ -795,14 +807,28 @@ impl Contact {
             .query_get_value(
                 "SELECT id FROM contacts
                  WHERE addr=?1 COLLATE NOCASE
-                 AND fingerprint='' -- Do not lookup key-contacts
-                 AND id>?2 AND origin>=?3 AND (? OR blocked=?)",
+                     AND id>?2 AND origin>=?3 AND (? OR blocked=?)
+                 ORDER BY
+                     (
+                         SELECT COUNT(*) FROM chats c
+                         INNER JOIN chats_contacts cc
+                         ON c.id=cc.chat_id
+                         WHERE c.type=?
+                             AND c.id>?
+                             AND c.blocked=?
+                             AND cc.contact_id=contacts.id
+                     ) DESC,
+                     last_seen DESC, fingerprint DESC
+                 LIMIT 1",
                 (
                     &addr_normalized,
                     ContactId::LAST_SPECIAL,
                     min_origin as u32,
                     blocked.is_none(),
-                    blocked.unwrap_or_default(),
+                    blocked.unwrap_or(Blocked::Not),
+                    Chattype::Single,
+                    constants::DC_CHAT_ID_LAST_SPECIAL,
+                    blocked.unwrap_or(Blocked::Not),
                 ),
             )
             .await?;
@@ -860,12 +886,14 @@ impl Contact {
         );
         ensure!(origin != Origin::Unknown, "Missing valid origin");
 
-        if context.is_self_addr(addr).await? {
+        if context.is_configured().await? && context.is_self_addr(addr).await? {
             return Ok((ContactId::SELF, sth_modified));
         }
 
-        if !fingerprint.is_empty() {
-            let fingerprint_self = self_fingerprint(context).await?;
+        if !fingerprint.is_empty() && context.is_configured().await? {
+            let fingerprint_self = self_fingerprint(context)
+                .await
+                .context("self_fingerprint")?;
             if fingerprint == fingerprint_self {
                 return Ok((ContactId::SELF, sth_modified));
             }
@@ -1061,11 +1089,12 @@ impl Contact {
     /// Returns known and unblocked contacts.
     ///
     /// To get information about a single contact, see get_contact().
+    /// By default, key-contacts are listed.
     ///
-    /// `listflags` is a combination of flags:
-    /// - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
-    ///
-    /// `query` is a string to filter the list.
+    /// * `listflags` - A combination of flags:
+    ///   - `DC_GCL_ADD_SELF` - Add SELF unless filtered by other parameters.
+    ///   - `DC_GCL_ADDRESS` - List address-contacts instead of key-contacts.
+    /// * `query` - A string to filter the list.
     pub async fn get_all(
         context: &Context,
         listflags: u32,
@@ -1078,7 +1107,8 @@ impl Contact {
             .collect::<HashSet<_>>();
         let mut add_self = false;
         let mut ret = Vec::new();
-        let flag_add_self = (listflags & DC_GCL_ADD_SELF) != 0;
+        let flag_add_self = (listflags & constants::DC_GCL_ADD_SELF) != 0;
+        let flag_address = (listflags & constants::DC_GCL_ADDRESS) != 0;
         let minimal_origin = if context.get_config_bool(Config::Bot).await? {
             Origin::Unknown
         } else {
@@ -1091,13 +1121,14 @@ impl Contact {
                 .query_map(
                     "SELECT c.id, c.addr FROM contacts c
                  WHERE c.id>?
-                 AND c.fingerprint!='' \
+                 AND (c.fingerprint='')=?
                  AND c.origin>=? \
                  AND c.blocked=0 \
                  AND (iif(c.name='',c.authname,c.name) LIKE ? OR c.addr LIKE ?) \
                  ORDER BY c.last_seen DESC, c.id DESC;",
                     (
                         ContactId::LAST_SPECIAL,
+                        flag_address,
                         minimal_origin,
                         &s3str_like_cmd,
                         &s3str_like_cmd,
@@ -1147,11 +1178,11 @@ impl Contact {
                 .query_map(
                     "SELECT id, addr FROM contacts
                  WHERE id>?
-                 AND fingerprint!=''
+                 AND (fingerprint='')=?
                  AND origin>=?
                  AND blocked=0
                  ORDER BY last_seen DESC, id DESC;",
-                    (ContactId::LAST_SPECIAL, minimal_origin),
+                    (ContactId::LAST_SPECIAL, flag_address, minimal_origin),
                     |row| {
                         let id: ContactId = row.get(0)?;
                         let addr: String = row.get(1)?;
@@ -1177,7 +1208,7 @@ impl Contact {
         Ok(ret)
     }
 
-    /// Adds blocked mailinglists as contacts
+    /// Adds blocked mailinglists and broadcast channels as pseudo-contacts
     /// to allow unblocking them as if they are contacts
     /// (this way, only one unblock-ffi is needed and only one set of ui-functions,
     /// from the users perspective,
@@ -1186,15 +1217,20 @@ impl Contact {
         context
             .sql
             .transaction(move |transaction| {
-                let mut stmt = transaction
-                    .prepare("SELECT name, grpid FROM chats WHERE type=? AND blocked=?")?;
-                let rows = stmt.query_map((Chattype::Mailinglist, Blocked::Yes), |row| {
-                    let name: String = row.get(0)?;
-                    let grpid: String = row.get(1)?;
-                    Ok((name, grpid))
-                })?;
+                let mut stmt = transaction.prepare(
+                    "SELECT name, grpid, type FROM chats WHERE (type=? OR type=?) AND blocked=?",
+                )?;
+                let rows = stmt.query_map(
+                    (Chattype::Mailinglist, Chattype::InBroadcast, Blocked::Yes),
+                    |row| {
+                        let name: String = row.get(0)?;
+                        let grpid: String = row.get(1)?;
+                        let typ: Chattype = row.get(2)?;
+                        Ok((name, grpid, typ))
+                    },
+                )?;
                 let blocked_mailinglists = rows.collect::<std::result::Result<Vec<_>, _>>()?;
-                for (name, grpid) in blocked_mailinglists {
+                for (name, grpid, typ) in blocked_mailinglists {
                     let count = transaction.query_row(
                         "SELECT COUNT(id) FROM contacts WHERE addr=?",
                         [&grpid],
@@ -1207,10 +1243,17 @@ impl Contact {
                         transaction.execute("INSERT INTO contacts (addr) VALUES (?)", [&grpid])?;
                     }
 
+                    let fingerprint = if typ == Chattype::InBroadcast {
+                        // Set some fingerprint so that is_pgp_contact() returns true,
+                        // and the contact isn't marked with a letter icon.
+                        "Blocked_broadcast"
+                    } else {
+                        ""
+                    };
                     // Always do an update in case the blocking is reset or name is changed.
                     transaction.execute(
-                        "UPDATE contacts SET name=?, origin=?, blocked=1 WHERE addr=?",
-                        (&name, Origin::MailinglistAddress, &grpid),
+                        "UPDATE contacts SET name=?, origin=?, blocked=1, fingerprint=? WHERE addr=?",
+                        (&name, Origin::MailinglistAddress, fingerprint, &grpid),
                     )?;
                 }
                 Ok(())
@@ -1521,7 +1564,7 @@ impl Contact {
             return Ok(Some(chat::get_device_icon(context).await?));
         }
         if show_fallback_icon && !self.id.is_special() && !self.is_key_contact() {
-            return Ok(Some(chat::get_address_contact_icon(context).await?));
+            return Ok(Some(chat::get_unencrypted_icon(context).await?));
         }
         if let Some(image_rel) = self.param.get(Param::ProfileImage) {
             if !image_rel.is_empty() {
@@ -1531,12 +1574,10 @@ impl Contact {
         Ok(None)
     }
 
-    /// Get a color for the contact.
-    /// The color is calculated from the contact's email address
-    /// and can be used for an fallback avatar with white initials
-    /// as well as for headlines in bubbles of group chats.
+    /// Returns a color for the contact.
+    /// See [`self::get_color`].
     pub fn get_color(&self) -> u32 {
-        str_to_color(&self.addr.to_lowercase())
+        get_color(self.id == ContactId::SELF, &self.addr, &self.fingerprint())
     }
 
     /// Gets the contact's status.
@@ -1602,29 +1643,6 @@ impl Contact {
         }
     }
 
-    /// Returns if the contact profile title should display a green checkmark.
-    ///
-    /// This generally should be consistent with the 1:1 chat with the contact
-    /// so 1:1 chat with the contact and the contact profile
-    /// either both display the green checkmark or both don't display a green checkmark.
-    ///
-    /// UI often knows beforehand if a chat exists and can also call
-    /// `chat.is_protected()` (if there is a chat)
-    /// or `contact.is_verified()` (if there is no chat) directly.
-    /// This is often easier and also skips some database calls.
-    pub async fn is_profile_verified(&self, context: &Context) -> Result<bool> {
-        let contact_id = self.id;
-
-        if let Some(ChatIdBlocked { id: chat_id, .. }) =
-            ChatIdBlocked::lookup_by_contact(context, contact_id).await?
-        {
-            Ok(chat_id.is_protected(context).await? == ProtectionStatus::Protected)
-        } else {
-            // 1:1 chat does not exist.
-            Ok(self.is_verified(context).await?)
-        }
-    }
-
     /// Returns the number of real (i.e. non-special) contacts in the database.
     pub async fn get_real_cnt(context: &Context) -> Result<usize> {
         if !context.sql.is_open().await {
@@ -1652,6 +1670,21 @@ impl Contact {
             .exists("SELECT COUNT(*) FROM contacts WHERE id=?;", (contact_id,))
             .await?;
         Ok(exists)
+    }
+}
+
+/// Returns a color for a contact having given attributes.
+///
+/// The color is calculated from contact's fingerprint (for key-contacts) or email address (for
+/// address-contacts; should be lowercased to avoid allocation) and can be used for an fallback
+/// avatar with white initials as well as for headlines in bubbles of group chats.
+pub fn get_color(is_self: bool, addr: &str, fingerprint: &Option<Fingerprint>) -> u32 {
+    if let Some(fingerprint) = fingerprint {
+        str_to_color(&fingerprint.hex())
+    } else if is_self {
+        0x808080
+    } else {
+        str_to_color(&to_lowercase(addr))
     }
 }
 
@@ -1717,8 +1750,7 @@ pub(crate) async fn set_blocked(
 ) -> Result<()> {
     ensure!(
         !contact_id.is_special(),
-        "Can't block special contact {}",
-        contact_id
+        "Can't block special contact {contact_id}"
     );
     let contact = Contact::get_by_id(context, contact_id).await?;
 
@@ -1900,15 +1932,21 @@ pub(crate) async fn update_last_seen(
 }
 
 /// Marks contact `contact_id` as verified by `verifier_id`.
+///
+/// `verifier_id == None` means that the verifier is unknown.
 pub(crate) async fn mark_contact_id_as_verified(
     context: &Context,
     contact_id: ContactId,
-    verifier_id: ContactId,
+    verifier_id: Option<ContactId>,
 ) -> Result<()> {
-    debug_assert_ne!(
-        contact_id, verifier_id,
-        "Contact cannot be verified by self"
+    ensure_and_debug_assert_ne!(contact_id, ContactId::SELF,);
+    ensure_and_debug_assert_ne!(
+        Some(contact_id),
+        verifier_id,
+        "Contact cannot be verified by self",
     );
+    let by_self = verifier_id == Some(ContactId::SELF);
+    let mut verifier_id = verifier_id.unwrap_or(contact_id);
     context
         .sql
         .transaction(|transaction| {
@@ -1921,20 +1959,33 @@ pub(crate) async fn mark_contact_id_as_verified(
                 bail!("Non-key-contact {contact_id} cannot be verified");
             }
             if verifier_id != ContactId::SELF {
-                let verifier_fingerprint: String = transaction.query_row(
-                    "SELECT fingerprint FROM contacts WHERE id=?",
-                    (verifier_id,),
-                    |row| row.get(0),
-                )?;
+                let (verifier_fingerprint, verifier_verifier_id): (String, ContactId) = transaction
+                    .query_row(
+                        "SELECT fingerprint, verifier FROM contacts WHERE id=?",
+                        (verifier_id,),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )?;
                 if verifier_fingerprint.is_empty() {
                     bail!(
                         "Contact {contact_id} cannot be verified by non-key-contact {verifier_id}"
                     );
                 }
+                ensure!(
+                    verifier_id == contact_id || verifier_verifier_id != ContactId::UNDEFINED,
+                    "Contact {contact_id} cannot be verified by unverified contact {verifier_id}",
+                );
+                if verifier_verifier_id == verifier_id {
+                    // Avoid introducing incorrect reverse chains: if the verifier itself has an
+                    // unknown verifier, it may be `contact_id` actually (directly or indirectly) on
+                    // the other device (which is needed for getting "verified by unknown contact"
+                    // in the first place).
+                    verifier_id = contact_id;
+                }
             }
             transaction.execute(
-                "UPDATE contacts SET verifier=? WHERE id=?",
-                (verifier_id, contact_id),
+                "UPDATE contacts SET verifier=?1
+                 WHERE id=?2 AND (verifier=0 OR verifier=id OR ?3)",
+                (verifier_id, contact_id, by_self),
             )?;
             Ok(())
         })

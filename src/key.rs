@@ -15,6 +15,7 @@ use rand::thread_rng;
 use tokio::runtime::Handle;
 
 use crate::context::Context;
+use crate::events::EventType;
 use crate::log::{LogExt, info};
 use crate::pgp::KeyPair;
 use crate::tools::{self, time_elapsed};
@@ -24,7 +25,7 @@ use crate::tools::{self, time_elapsed};
 /// This trait is implemented for rPGP's [SignedPublicKey] and
 /// [SignedSecretKey] types and makes working with them a little
 /// easier in the deltachat world.
-pub(crate) trait DcKey: Serialize + Deserializable + Clone {
+pub trait DcKey: Serialize + Deserializable + Clone {
     /// Create a key from some bytes.
     fn from_slice(bytes: &[u8]) -> Result<Self> {
         let res = <Self as Deserializable>::from_bytes(Cursor::new(bytes));
@@ -71,31 +72,17 @@ pub(crate) trait DcKey: Serialize + Deserializable + Clone {
     }
 
     /// Create a key from an ASCII-armored string.
-    ///
-    /// Returns the key and a map of any headers which might have been set in
-    /// the ASCII-armored representation.
-    fn from_asc(data: &str) -> Result<(Self, BTreeMap<String, String>)> {
+    fn from_asc(data: &str) -> Result<Self> {
         let bytes = data.as_bytes();
         let res = Self::from_armor_single(Cursor::new(bytes));
-        let (key, headers) = match res {
+        let (key, _headers) = match res {
             Err(pgp::errors::Error::NoMatchingPacket { .. }) => match Self::is_private() {
                 true => bail!("No private key packet found"),
                 false => bail!("No public key packet found"),
             },
             _ => res.context("rPGP error")?,
         };
-        let headers = headers
-            .into_iter()
-            .map(|(key, values)| {
-                (
-                    key.trim().to_lowercase(),
-                    values
-                        .last()
-                        .map_or_else(String::new, |s| s.trim().to_string()),
-                )
-            })
-            .collect();
-        Ok((key, headers))
+        Ok(key)
     }
 
     /// Serialise the key as bytes.
@@ -125,7 +112,10 @@ pub(crate) trait DcKey: Serialize + Deserializable + Clone {
     /// The fingerprint for the key.
     fn dc_fingerprint(&self) -> Fingerprint;
 
+    /// Whether the key is private (or public).
     fn is_private() -> bool;
+
+    /// Returns the OpenPGP Key ID.
     fn key_id(&self) -> KeyId;
 }
 
@@ -428,15 +418,11 @@ pub(crate) async fn store_self_keypair(context: &Context, keypair: &KeyPair) -> 
                 "INSERT INTO config (keyname, value) VALUES ('key_id', ?)",
                 (new_key_id,),
             )?;
-            Ok(Some(new_key_id))
+            Ok(new_key_id)
         })
         .await?;
-
-    if let Some(new_key_id) = new_key_id {
-        // Update config cache if transaction succeeded and changed current default key.
-        config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
-    }
-
+    context.emit_event(EventType::AccountsItemChanged);
+    config_cache_lock.insert("key_id".to_string(), Some(new_key_id.to_string()));
     Ok(())
 }
 
@@ -446,7 +432,7 @@ pub(crate) async fn store_self_keypair(context: &Context, keypair: &KeyPair) -> 
 /// to avoid generating the key in tests.
 /// Use import/export APIs instead.
 pub async fn preconfigure_keypair(context: &Context, secret_data: &str) -> Result<()> {
-    let secret = SignedSecretKey::from_asc(secret_data)?.0;
+    let secret = SignedSecretKey::from_asc(secret_data)?;
     let public = secret.split_public_key()?;
     let keypair = KeyPair { public, secret };
     store_self_keypair(context, &keypair).await?;
@@ -514,7 +500,7 @@ impl std::str::FromStr for Fingerprint {
             .filter(|&c| c.is_ascii_hexdigit())
             .collect();
         let v: Vec<u8> = hex::decode(&hex_repr)?;
-        ensure!(v.len() == 20, "wrong fingerprint length: {}", hex_repr);
+        ensure!(v.len() == 20, "wrong fingerprint length: {hex_repr}");
         let fp = Fingerprint::new(v);
         Ok(fp)
     }
@@ -532,7 +518,7 @@ mod tests {
 
     #[test]
     fn test_from_armored_string() {
-        let (private_key, _) = SignedSecretKey::from_asc(
+        let private_key = SignedSecretKey::from_asc(
             "-----BEGIN PGP PRIVATE KEY BLOCK-----
 
 xcLYBF0fgz4BCADnRUV52V4xhSsU56ZaAn3+3oG86MZhXy4X8w14WZZDf0VJGeTh
@@ -600,17 +586,13 @@ i8pcjGO+IZffvyZJVRWfVooBJmWWbPB1pueo3tx8w3+fcuzpxz+RLFKaPyqXO+dD
     fn test_asc_roundtrip() {
         let key = KEYPAIR.public.clone();
         let asc = key.to_asc(Some(("spam", "ham")));
-        let (key2, hdrs) = SignedPublicKey::from_asc(&asc).unwrap();
+        let key2 = SignedPublicKey::from_asc(&asc).unwrap();
         assert_eq!(key, key2);
-        assert_eq!(hdrs.len(), 1);
-        assert_eq!(hdrs.get("spam"), Some(&String::from("ham")));
 
         let key = KEYPAIR.secret.clone();
         let asc = key.to_asc(Some(("spam", "ham")));
-        let (key2, hdrs) = SignedSecretKey::from_asc(&asc).unwrap();
+        let key2 = SignedSecretKey::from_asc(&asc).unwrap();
         assert_eq!(key, key2);
-        assert_eq!(hdrs.len(), 1);
-        assert_eq!(hdrs.get("spam"), Some(&String::from("ham")));
     }
 
     #[test]

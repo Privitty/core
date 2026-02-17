@@ -65,9 +65,6 @@ pub enum StockMessage {
     #[strum(props(fallback = "GIF"))]
     Gif = 23,
 
-    #[strum(props(fallback = "Encrypted message"))]
-    EncryptedMsg = 24,
-
     #[strum(props(fallback = "End-to-end encryption available"))]
     E2eAvailable = 25,
 
@@ -126,21 +123,12 @@ pub enum StockMessage {
                     however, of course, if they like, you may point them to 👉 https://get.delta.chat"))]
     WelcomeMessage = 71,
 
-    #[strum(props(fallback = "Unknown sender for this chat."))]
-    UnknownSenderForChat = 72,
-
     #[strum(props(fallback = "Message from %1$s"))]
     SubjectForNewContact = 73,
 
     /// Unused. Was used in group chat status messages.
     #[strum(props(fallback = "Failed to send message to %1$s."))]
     FailedSendingTo = 74,
-
-    #[strum(props(fallback = "Video chat invitation"))]
-    VideochatInvitation = 82,
-
-    #[strum(props(fallback = "You are invited to a video chat, click %1$s to join."))]
-    VideochatInviteMsgBody = 83,
 
     #[strum(props(fallback = "Error:\n\n“%1$s”"))]
     ConfigurationFailed = 84,
@@ -236,9 +224,6 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Messages"))]
     Messages = 114,
-
-    #[strum(props(fallback = "Broadcast List"))]
-    BroadcastList = 115,
 
     #[strum(props(fallback = "%1$s of %2$s used"))]
     PartOfTotallUsed = 116,
@@ -368,6 +353,12 @@ pub enum StockMessage {
     #[strum(props(fallback = "Message deletion timer is set to %1$s weeks by %2$s."))]
     MsgEphemeralTimerWeeksBy = 157,
 
+    #[strum(props(fallback = "You set message deletion timer to 1 year."))]
+    MsgYouEphemeralTimerYear = 158,
+
+    #[strum(props(fallback = "Message deletion timer is set to 1 year by %1$s."))]
+    MsgEphemeralTimerYearBy = 159,
+
     #[strum(props(fallback = "Scan to set up second device for %1$s"))]
     BackupTransferQr = 162,
 
@@ -383,9 +374,10 @@ pub enum StockMessage {
     #[strum(props(fallback = "I left the group."))]
     MsgILeftGroup = 166,
 
-    #[strum(props(fallback = "Messages are guaranteed to be end-to-end encrypted from now on."))]
+    #[strum(props(fallback = "Messages are end-to-end encrypted."))]
     ChatProtectionEnabled = 170,
 
+    // deprecated 2025-07
     #[strum(props(fallback = "%1$s sent a message from another device."))]
     ChatProtectionDisabled = 171,
 
@@ -416,6 +408,37 @@ pub enum StockMessage {
 
     #[strum(props(fallback = "Establishing guaranteed end-to-end encryption, please wait…"))]
     SecurejoinWait = 190,
+
+    #[strum(props(fallback = "❤️ Seems you're enjoying Delta Chat!
+
+Please consider donating to help that Delta Chat stays free for everyone.
+
+While Delta Chat is free to use and open source, development costs money.
+Help keeping us to keep Delta Chat independent and make it more awesome in the future.
+
+https://delta.chat/donate"))]
+    DonationRequest = 193,
+
+    #[strum(props(fallback = "Outgoing call"))]
+    OutgoingCall = 194,
+
+    #[strum(props(fallback = "Incoming call"))]
+    IncomingCall = 195,
+
+    #[strum(props(fallback = "Declined call"))]
+    DeclinedCall = 196,
+
+    #[strum(props(fallback = "Canceled call"))]
+    CanceledCall = 197,
+
+    #[strum(props(fallback = "Missed call"))]
+    MissedCall = 198,
+
+    #[strum(props(fallback = "You left the channel."))]
+    MsgYouLeftBroadcast = 200,
+
+    #[strum(props(fallback = "Scan to join channel %1$s"))]
+    SecureJoinBrodcastQRDescription = 201,
 }
 
 impl StockMessage {
@@ -699,6 +722,11 @@ pub(crate) async fn msg_group_left_local(context: &Context, by_contact: ContactI
     }
 }
 
+/// Stock string: `You left the channel.`
+pub(crate) async fn msg_you_left_broadcast(context: &Context) -> String {
+    translated(context, StockMessage::MsgYouLeftBroadcast).await
+}
+
 /// Stock string: `You reacted %1$s to "%2$s"` or `%1$s reacted %2$s to "%3$s"`.
 pub(crate) async fn msg_reacted(
     context: &Context,
@@ -788,6 +816,36 @@ pub(crate) async fn securejoin_wait(context: &Context) -> String {
     translated(context, StockMessage::SecurejoinWait).await
 }
 
+/// Stock string: `❤️ Seems you're enjoying Delta Chat!`…
+pub(crate) async fn donation_request(context: &Context) -> String {
+    translated(context, StockMessage::DonationRequest).await
+}
+
+/// Stock string: `Outgoing call`.
+pub(crate) async fn outgoing_call(context: &Context) -> String {
+    translated(context, StockMessage::OutgoingCall).await
+}
+
+/// Stock string: `Incoming call`.
+pub(crate) async fn incoming_call(context: &Context) -> String {
+    translated(context, StockMessage::IncomingCall).await
+}
+
+/// Stock string: `Declined call`.
+pub(crate) async fn declined_call(context: &Context) -> String {
+    translated(context, StockMessage::DeclinedCall).await
+}
+
+/// Stock string: `Canceled call`.
+pub(crate) async fn canceled_call(context: &Context) -> String {
+    translated(context, StockMessage::CanceledCall).await
+}
+
+/// Stock string: `Missed call`.
+pub(crate) async fn missed_call(context: &Context) -> String {
+    translated(context, StockMessage::MissedCall).await
+}
+
 /// Stock string: `Scan to chat with %1$s`.
 pub(crate) async fn setup_contact_qr_description(
     context: &Context,
@@ -804,9 +862,16 @@ pub(crate) async fn setup_contact_qr_description(
         .replace1(&name)
 }
 
-/// Stock string: `Scan to join %1$s`.
+/// Stock string: `Scan to join group %1$s`.
 pub(crate) async fn secure_join_group_qr_description(context: &Context, chat: &Chat) -> String {
     translated(context, StockMessage::SecureJoinGroupQRDescription)
+        .await
+        .replace1(chat.get_name())
+}
+
+/// Stock string: `Scan to join channel %1$s`.
+pub(crate) async fn secure_join_broadcast_qr_description(context: &Context, chat: &Chat) -> String {
+    translated(context, StockMessage::SecureJoinBrodcastQRDescription)
         .await
         .replace1(chat.get_name())
 }
@@ -893,11 +958,6 @@ pub(crate) async fn welcome_message(context: &Context) -> String {
     translated(context, StockMessage::WelcomeMessage).await
 }
 
-/// Stock string: `Unknown sender for this chat.`.
-pub(crate) async fn unknown_sender_for_chat(context: &Context) -> String {
-    translated(context, StockMessage::UnknownSenderForChat).await
-}
-
 /// Stock string: `Message from %1$s`.
 // TODO: This can compute `self_name` itself instead of asking the caller to do this.
 pub(crate) async fn subject_for_new_contact(context: &Context, self_name: &str) -> String {
@@ -982,16 +1042,15 @@ pub(crate) async fn msg_ephemeral_timer_week(context: &Context, by_contact: Cont
     }
 }
 
-/// Stock string: `Video chat invitation`.
-pub(crate) async fn videochat_invitation(context: &Context) -> String {
-    translated(context, StockMessage::VideochatInvitation).await
-}
-
-/// Stock string: `You are invited to a video chat, click %1$s to join.`.
-pub(crate) async fn videochat_invite_msg_body(context: &Context, url: &str) -> String {
-    translated(context, StockMessage::VideochatInviteMsgBody)
-        .await
-        .replace1(url)
+/// Stock string: `Message deletion timer is set to 1 year.`.
+pub(crate) async fn msg_ephemeral_timer_year(context: &Context, by_contact: ContactId) -> String {
+    if by_contact == ContactId::SELF {
+        translated(context, StockMessage::MsgYouEphemeralTimerYear).await
+    } else {
+        translated(context, StockMessage::MsgEphemeralTimerYearBy)
+            .await
+            .replace1(&by_contact.get_stock_name(context).await)
+    }
 }
 
 /// Stock string: `Error:\n\n“%1$s”`.
@@ -1019,8 +1078,8 @@ pub(crate) async fn error_no_network(context: &Context) -> String {
     translated(context, StockMessage::ErrorNoNetwork).await
 }
 
-/// Stock string: `Messages are guaranteed to be end-to-end encrypted from now on.`
-pub(crate) async fn chat_protection_enabled(context: &Context) -> String {
+/// Stock string: `Messages are end-to-end encrypted.`
+pub(crate) async fn messages_e2e_encrypted(context: &Context) -> String {
     translated(context, StockMessage::ChatProtectionEnabled).await
 }
 
@@ -1221,12 +1280,6 @@ pub(crate) async fn part_of_total_used(context: &Context, part: &str, total: &st
         .replace2(total)
 }
 
-/// Stock string: `Broadcast List`.
-/// Used as the default name for broadcast lists; a number may be added.
-pub(crate) async fn broadcast_list(context: &Context) -> String {
-    translated(context, StockMessage::BroadcastList).await
-}
-
 /// Stock string: `⚠️ Your email provider %1$s requires end-to-end encryption which is not setup yet. Tap to learn more.`.
 pub(crate) async fn unencrypted_email(context: &Context, provider: &str) -> String {
     translated(context, StockMessage::InvalidUnencryptedMail)
@@ -1288,7 +1341,7 @@ impl Context {
         contact_id: Option<ContactId>,
     ) -> String {
         match protect {
-            ProtectionStatus::Unprotected | ProtectionStatus::ProtectionBroken => {
+            ProtectionStatus::Unprotected => {
                 if let Some(contact_id) = contact_id {
                     chat_protection_disabled(self, contact_id).await
                 } else {
@@ -1297,7 +1350,7 @@ impl Context {
                     "[Error] No contact_id given".to_string()
                 }
             }
-            ProtectionStatus::Protected => chat_protection_enabled(self).await,
+            ProtectionStatus::Protected => messages_e2e_encrypted(self).await,
         }
     }
 

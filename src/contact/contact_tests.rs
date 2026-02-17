@@ -1,9 +1,10 @@
 use deltachat_contact_tools::{addr_cmp, may_be_valid_addr};
 
 use super::*;
-use crate::chat::{Chat, get_chat_contacts, send_text_msg};
+use crate::chat::{Chat, ProtectionStatus, get_chat_contacts, send_text_msg};
 use crate::chatlist::Chatlist;
 use crate::receive_imf::receive_imf;
+use crate::securejoin::get_securejoin_qr;
 use crate::test_utils::{self, TestContext, TestContextManager, TimeShiftFalsePositiveNote};
 
 #[test]
@@ -69,6 +70,9 @@ async fn test_get_contacts() -> Result<()> {
     let contacts = Contact::get_all(&context.ctx, 0, Some("MyName")).await?;
     assert_eq!(contacts.len(), 0);
 
+    let claire_id = Contact::create(&context, "someone", "claire@example.org").await?;
+    let dave_id = Contact::create(&context, "", "dave@example.org").await?;
+
     let id = context.add_or_lookup_contact_id(&alice).await;
     assert_ne!(id, ContactId::UNDEFINED);
 
@@ -101,10 +105,35 @@ async fn test_get_contacts() -> Result<()> {
     let contacts = Contact::get_all(&context, 0, Some("MyName")).await?;
     assert_eq!(contacts.len(), 0);
 
-    // Search by display name (same as manually set name).
-    let contacts = Contact::get_all(&context.ctx, 0, Some("someone")).await?;
-    assert_eq!(contacts.len(), 1);
-    assert_eq!(contacts.first(), Some(&id));
+    for add_self in [0, constants::DC_GCL_ADD_SELF] {
+        info!(&context, "add_self={add_self}");
+
+        // Search key-contacts by display name (same as manually set name).
+        let contacts = Contact::get_all(&context.ctx, add_self, Some("someone")).await?;
+        assert_eq!(contacts, vec![id]);
+
+        // Get all key-contacts.
+        let contacts = Contact::get_all(&context, add_self, None).await?;
+        match add_self {
+            0 => assert_eq!(contacts, vec![id]),
+            _ => assert_eq!(contacts, vec![id, ContactId::SELF]),
+        }
+    }
+
+    // Search address-contacts by display name.
+    let contacts = Contact::get_all(&context, constants::DC_GCL_ADDRESS, Some("someone")).await?;
+    assert_eq!(contacts, vec![claire_id]);
+
+    // Get all address-contacts. Newer contacts go first.
+    let contacts = Contact::get_all(&context, constants::DC_GCL_ADDRESS, None).await?;
+    assert_eq!(contacts, vec![dave_id, claire_id]);
+    let contacts = Contact::get_all(
+        &context,
+        constants::DC_GCL_ADDRESS | constants::DC_GCL_ADD_SELF,
+        None,
+    )
+    .await?;
+    assert_eq!(contacts, vec![dave_id, claire_id, ContactId::SELF]);
 
     Ok(())
 }
@@ -731,7 +760,7 @@ async fn test_contact_get_color() -> Result<()> {
     let t = TestContext::new().await;
     let contact_id = Contact::create(&t, "name", "name@example.net").await?;
     let color1 = Contact::get_by_id(&t, contact_id).await?.get_color();
-    assert_eq!(color1, 0xA739FF);
+    assert_eq!(color1, 0x4844e2);
 
     let t = TestContext::new().await;
     let contact_id = Contact::create(&t, "prename name", "name@example.net").await?;
@@ -742,6 +771,20 @@ async fn test_contact_get_color() -> Result<()> {
     let contact_id = Contact::create(&t, "Name", "nAme@exAmple.NET").await?;
     let color3 = Contact::get_by_id(&t, contact_id).await?.get_color();
     assert_eq!(color3, color1);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_self_color_vs_key() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let t = &tcm.unconfigured().await;
+    t.configure_addr("alice@example.org").await;
+    assert!(t.is_configured().await?);
+    let color = Contact::get_by_id(t, ContactId::SELF).await?.get_color();
+    assert_eq!(color, 0x808080);
+    get_securejoin_qr(t, None).await?;
+    let color1 = Contact::get_by_id(t, ContactId::SELF).await?.get_color();
+    assert_ne!(color1, color);
     Ok(())
 }
 
@@ -1007,6 +1050,50 @@ async fn test_was_seen_recently_event() -> Result<()> {
     Ok(())
 }
 
+async fn test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat: bool) -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let bob = &tcm.bob().await;
+
+    let raw = include_bytes!("../../test-data/message/thunderbird_with_autocrypt.eml");
+    assert!(std::str::from_utf8(raw)?.contains("Date: Thu, 24 Nov 2022 20:05:57 +0100"));
+    let received_msg = receive_imf(bob, raw, false).await?.unwrap();
+    received_msg.chat_id.accept(bob).await?;
+
+    let raw = r#"From: Alice <alice@example.org>
+To: bob@example.net
+Message-ID: message$TIME@example.org
+Content-Type: text/plain; charset=utf-8; format=flowed; delsp=no
+Date: Thu, 24 Nov 2022 $TIME +0100
+
+Hi"#
+    .to_string();
+    for (time, is_key_contact) in [("20:05:57", true), ("20:05:58", !accept_unencrypted_chat)] {
+        let raw = raw.replace("$TIME", time);
+        let received_msg = receive_imf(bob, raw.as_bytes(), false).await?.unwrap();
+        if accept_unencrypted_chat {
+            received_msg.chat_id.accept(bob).await?;
+        }
+        let contact_id = Contact::lookup_id_by_addr(bob, "alice@example.org", Origin::Unknown)
+            .await?
+            .unwrap();
+        let contact = Contact::get_by_id(bob, contact_id).await?;
+        assert_eq!(contact.is_key_contact(), is_key_contact);
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lookup_id_by_addr_recent() -> Result<()> {
+    let accept_unencrypted_chat = true;
+    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lookup_id_by_addr_recent_accepted() -> Result<()> {
+    let accept_unencrypted_chat = false;
+    test_lookup_id_by_addr_recent_ex(accept_unencrypted_chat).await
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_verified_by_none() -> Result<()> {
     let mut tcm = TestContextManager::new();
@@ -1044,6 +1131,7 @@ async fn test_sync_create() -> Result<()> {
             .unwrap();
     let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
     assert_eq!(a1b_contact.name, "Bob");
+    assert_eq!(a1b_contact.is_key_contact(), false);
 
     Contact::create(alice0, "Bob Renamed", "bob@example.net").await?;
     test_utils::sync(alice0, alice1).await;
@@ -1053,6 +1141,7 @@ async fn test_sync_create() -> Result<()> {
     assert_eq!(id, a1b_contact_id);
     let a1b_contact = Contact::get_by_id(alice1, a1b_contact_id).await?;
     assert_eq!(a1b_contact.name, "Bob Renamed");
+    assert_eq!(a1b_contact.is_key_contact(), false);
 
     Ok(())
 }
@@ -1228,7 +1317,6 @@ async fn test_self_is_verified() -> Result<()> {
 
     let contact = Contact::get_by_id(&alice, ContactId::SELF).await?;
     assert_eq!(contact.is_verified(&alice).await?, true);
-    assert!(contact.is_profile_verified(&alice).await?);
     assert!(contact.get_verifier_id(&alice).await?.is_none());
     assert!(contact.is_key_contact());
 

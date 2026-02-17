@@ -415,7 +415,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    As for `displayname` and `selfstatus`, also the avatar is sent to the recipients.
  *                    To save traffic, however, the avatar is attached only as needed
  *                    and also recoded to a reasonable size.
- * - `e2ee_enabled` = 0=no end-to-end-encryption, 1=prefer end-to-end-encryption (default)
  * - `mdns_enabled` = 0=do not send or request read receipts,
  *                    1=send and request read receipts
  *                    default=send and request read receipts, only send but not request if `bot` is set
@@ -459,12 +458,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  *                    The library uses the `media_quality` setting to use different defaults
  *                    for recoding images sent with type #DC_MSG_IMAGE.
  *                    If needed, recoding other file types is up to the UI.
- * - `webrtc_instance` = webrtc instance to use for videochats in the form
- *                    `[basicwebrtc:|jitsi:]https://example.com/subdir#roomname=$ROOM`
- *                    if the URL is prefixed by `basicwebrtc`, the server is assumed to be of the type
- *                    https://github.com/cracker0dks/basicwebrtc which some UIs have native support for.
- *                    The type `jitsi:` may be handled by external apps.
- *                    If no type is prefixed, the videochat is handled completely in a browser.
  * - `bot`          = Set to "1" if this is a bot.
  *                    Prevents adding the "Device messages" and "Saved messages" chats,
  *                    adds Auto-Submitted header to outgoing messages,
@@ -503,13 +496,6 @@ char*           dc_get_blobdir               (const dc_context_t* context);
  * - `gossip_period` = How often to gossip Autocrypt keys in chats with multiple recipients, in
  *                    seconds. 2 days by default.
  *                    This is not supposed to be changed by UIs and only used for testing.
- * - `verified_one_on_one_chats` = Feature flag for verified 1:1 chats; the UI should set it
- *                    to 1 if it supports verified 1:1 chats.
- *                    Regardless of this setting, `dc_chat_is_protected()` returns true while the key is verified,
- *                    and when the key changes, an info message is posted into the chat.
- *                    0=Nothing else happens when the key changes.
- *                    1=After the key changed, `dc_chat_can_send()` returns false and `dc_chat_is_protection_broken()` returns true
- *                    until `dc_accept_chat()` is called.
  * - `is_chatmail` = 1 if the the server is a chatmail server, 0 otherwise.
  * - `is_muted`     = Whether a context is muted by the user.
  *                    Muted contexts should not sound, vibrate or show notifications.
@@ -583,11 +569,10 @@ int             dc_set_stock_translation(dc_context_t* context, uint32_t stock_i
 /**
  * Set configuration values from a QR code.
  * Before this function is called, dc_check_qr() should confirm the type of the
- * QR code is DC_QR_ACCOUNT, DC_QR_LOGIN or DC_QR_WEBRTC_INSTANCE.
+ * QR code is DC_QR_ACCOUNT or DC_QR_LOGIN.
  *
  * Internally, the function will call dc_set_config() with the appropriate keys,
- * e.g. `addr` and `mail_pw` for DC_QR_ACCOUNT and DC_QR_LOGIN
- * or `webrtc_instance` for DC_QR_WEBRTC_INSTANCE.
+ * e.g. `addr` and `mail_pw` for DC_QR_ACCOUNT and DC_QR_LOGIN.
  *
  * @memberof dc_context_t
  * @param context The context object.
@@ -1061,42 +1046,6 @@ void            dc_send_edit_request         (dc_context_t* context, uint32_t ms
 
 
 /**
- * Send invitation to a videochat.
- *
- * This function reads the `webrtc_instance` config value,
- * may check that the server is working in some way
- * and creates a unique room for this chat, if needed doing a TOKEN roundtrip for that.
- *
- * After that, the function sends out a message that contains information to join the room:
- *
- * - To allow non-delta-clients to join the chat,
- *   the message contains a text-area with some descriptive text
- *   and a URL that can be opened in a supported browser to join the videochat.
- *
- * - delta-clients can get all information needed from
- *   the message object, using e.g.
- *   dc_msg_get_videochat_url() and check dc_msg_get_viewtype() for #DC_MSG_VIDEOCHAT_INVITATION.
- *
- * dc_send_videochat_invitation() is blocking and may take a while,
- * so the UIs will typically call the function from within a thread.
- * Moreover, UIs will typically enter the room directly without an additional click on the message,
- * for this purpose, the function returns the message id directly.
- *
- * As for other messages sent, this function
- * sends the event #DC_EVENT_MSGS_CHANGED on success, the message has a delivery state, and so on.
- * The recipient will get noticed by the call as usual by #DC_EVENT_INCOMING_MSG or #DC_EVENT_MSGS_CHANGED,
- * However, UIs might some things differently, e.g. play a different sound.
- *
- * @memberof dc_context_t
- * @param context The context object.
- * @param chat_id The chat to start a videochat for.
- * @return The ID of the message sent out
- *     or 0 for errors.
- */
-uint32_t dc_send_videochat_invitation (dc_context_t* context, uint32_t chat_id);
-
-
-/**
  * A webxdc instance sends a status update to its other members.
  *
  * In JS land, that would be mapped to something as:
@@ -1223,6 +1172,117 @@ uint32_t        dc_init_webxdc_integration    (dc_context_t* context, uint32_t c
 
 
 /**
+ * Start an outgoing call.
+ * This sends a message of type #DC_MSG_CALL with all relevant information to the callee,
+ * who will get informed by an #DC_EVENT_INCOMING_CALL event and rings.
+ *
+ * Possible actions during ringing:
+ *
+ * - caller cancels the call using dc_end_call():
+ *   callee receives #DC_EVENT_CALL_ENDED and has a "Missed call"
+ *
+ * - callee accepts using dc_accept_incoming_call():
+ *   caller receives #DC_EVENT_OUTGOING_CALL_ACCEPTED.
+ *   callee's devices receive #DC_EVENT_INCOMING_CALL_ACCEPTED, call starts
+ *
+ * - callee declines using dc_end_call():
+ *   caller receives #DC_EVENT_CALL_ENDED and has a "Declinced Call".
+ *   callee's other devices receive #DC_EVENT_CALL_ENDED and have a "Canceled Call",
+ *
+ * - callee is already in a call:
+ *   what to do depends on the capabilities of UI to handle calls.
+ *   if UI cannot handle multiple calls, an easy approach would be to decline the new call automatically
+ *   and make that visble to the user in the call, e.g. by a notification
+ *
+ * - timeout:
+ *   after 1 minute without action,
+ *   caller and callee receive #DC_EVENT_CALL_ENDED
+ *   to prevent endless ringing of callee
+ *   in case caller got offline without being able to send cancellation message.
+ *   for caller, this is a "Canceled call";
+ *   for callee, this is a "Missed call"
+ *
+ * Actions during the call:
+ *
+ * - caller ends the call using dc_end_call():
+ *   callee receives #DC_EVENT_CALL_ENDED
+ *
+ * - callee ends the call using dc_end_call():
+ *   caller receives #DC_EVENT_CALL_ENDED
+ *
+ * Contact request handling:
+ *
+ * - placing or accepting calls implies accepting contact requests
+ *
+ * - ending a call does not accept a contact request;
+ *   instead, the call will timeout on all affected devices.
+ *
+ * Note, that the events are for updating the call screen,
+ * possible status messages are added and updated as usual, including the known events.
+ * In the UI, the sorted chatlist is used as an overview about calls as well as messages.
+ * To place a call with a contact that has no chat yet, use dc_create_chat_by_contact_id() first.
+ *
+ * UI will usually allow only one call at the same time,
+ * this has to be tracked by UI across profile, the core does not track this.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param chat_id The chat to place a call for.
+ *     This needs to be a one-to-one chat.
+ * @param place_call_info any data that other devices receive
+ *     in #DC_EVENT_INCOMING_CALL.
+ * @return ID of the system message announcing the call.
+ */
+uint32_t        dc_place_outgoing_call       (dc_context_t* context, uint32_t chat_id, const char* place_call_info);
+
+
+/**
+ * Accept incoming call.
+ *
+ * This implicitly accepts the contact request, if not yet done.
+ * All affected devices will receive
+ * either #DC_EVENT_OUTGOING_CALL_ACCEPTED or #DC_EVENT_INCOMING_CALL_ACCEPTED.
+ *
+ * If the call is already accepted or ended, nothing happens.
+ * If the chat is a contact request, it is accepted implicitly.
+ *
+ * @memberof dc_context_t
+ * @param context The context object.
+ * @param msg_id The ID of the call to accept.
+ *     This is the ID reported by #DC_EVENT_INCOMING_CALL
+ *     and equals to the ID of the corresponding info message.
+ * @param accept_call_info any data that other devices receive
+ *     in #DC_EVENT_OUTGOING_CALL_ACCEPTED.
+ * @return 1=success, 0=error
+ */
+ int            dc_accept_incoming_call      (dc_context_t* context, uint32_t msg_id, const char* accept_call_info);
+
+
+ /**
+  * End incoming or outgoing call.
+  *
+  * For unaccepted calls ended by the caller, this is a "cancellation".
+  * Unaccepted calls ended by the callee are a "decline".
+  * If the call was accepted, this is a "hangup".
+  *
+  * All participant devices get informed about the ended call via #DC_EVENT_CALL_ENDED unless they are contact requests.
+  * For contact requests, the call times out on all other affected devices.
+  *
+  * If the message ID is wrong or does not exist for whatever reasons, nothing happens.
+  * Therefore, and for resilience, UI should remove the call UI directly when calling
+  * this function and not only on the event.
+  *
+  * If the call is already ended, nothing happens.
+  *
+  * @memberof dc_context_t
+  * @param context The context object.
+  * @param msg_id the ID of the call.
+  * @return 1=success, 0=error
+  */
+ int            dc_end_call                  (dc_context_t* context, uint32_t msg_id);
+
+
+/**
  * Save a draft for a chat in the database.
  *
  * The UI should call this function if the user has prepared a message
@@ -1339,12 +1399,14 @@ dc_msg_t*       dc_get_draft                 (dc_context_t* context, uint32_t ch
  * Optionally, some special markers added to the ID array may help to
  * implement virtual lists.
  *
+ * To get the concrete time of the message, use dc_array_get_timestamp().
+ *
  * @memberof dc_context_t
  * @param context The context object as returned from dc_context_new().
  * @param chat_id The chat ID of which the messages IDs should be queried.
  * @param flags If set to DC_GCM_ADDDAYMARKER, the marker DC_MSG_ID_DAYMARKER will
  *     be added before each day (regarding the local timezone). Set this to 0 if you do not want this behaviour.
- *     To get the concrete time of the marker, use dc_array_get_timestamp().
+ *     The day marker timestamp is the midnight one for the corresponding (following) day in the local timezone.
  *     If set to DC_GCM_INFO_ONLY, only system messages will be returned, can be combined with DC_GCM_ADDDAYMARKER.
  * @param marker1before Deprecated, set this to 0.
  * @return Array of message IDs, must be dc_array_unref()'d when no longer used.
@@ -2094,8 +2156,18 @@ int             dc_may_be_valid_addr         (const char* addr);
 
 
 /**
- * Check if an e-mail address belongs to a known and unblocked contact.
+ * Looks up a known and unblocked contact with a given e-mail address.
  * To get a list of all known and unblocked contacts, use dc_get_contacts().
+ *
+ * **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+ * (e.g. an address-contact and a key-contact),
+ * this looks up the most recently seen contact,
+ * i.e. which contact is returned depends on which contact last sent a message.
+ * If the user just clicked on a mailto: link, then this is the best thing you can do.
+ * But **DO NOT** internally represent contacts by their email address
+ * and do not use this function to look them up;
+ * otherwise this function will sometimes look up the wrong contact.
+ * Instead, you should internally represent contacts by their ids.
  *
  * To validate an e-mail address independently of the contact database
  * use dc_may_be_valid_addr().
@@ -2118,6 +2190,13 @@ uint32_t        dc_lookup_contact_id_by_addr (dc_context_t* context, const char*
  * To add a number of contacts, see dc_add_address_book() which is much faster for adding
  * a bunch of addresses.
  *
+ * This will always create or look up an address-contact,
+ * i.e. a contact identified by an email address,
+ * with all messages sent to and from this contact being unencrypted.
+ * If the user just clicked on an email address,
+ * you should first check `lookup_contact_id_by_addr`,
+ * and only if there is no contact yet, call this function here.
+ *
  * May result in a #DC_EVENT_CONTACTS_CHANGED event.
  *
  * @memberof dc_context_t
@@ -2137,6 +2216,7 @@ uint32_t        dc_create_contact            (dc_context_t* context, const char*
 #define         DC_GCL_DEPRECATED_VERIFIED_ONLY         0x01
 
 #define         DC_GCL_ADD_SELF              0x02
+#define         DC_GCL_ADDRESS               0x04
 
 
 /**
@@ -2192,11 +2272,13 @@ dc_array_t*     dc_import_vcard              (dc_context_t* context, const char*
  * Returns known and unblocked contacts.
  *
  * To get information about a single contact, see dc_get_contact().
+ * By default, key-contacts are listed.
  *
  * @memberof dc_context_t
  * @param context The context object.
  * @param flags A combination of flags:
- *     - if the flag DC_GCL_ADD_SELF is set, SELF is added to the list unless filtered by other parameters
+ *     - DC_GCL_ADD_SELF: SELF is added to the list unless filtered by other parameters
+ *     - DC_GCL_ADDRESS: List address-contacts instead of key-contacts.
  * @param query A string to filter the list. Typically used to implement an
  *     incremental search. NULL for no filtering.
  * @return An array containing all contact IDs. Must be dc_array_unref()'d
@@ -2490,7 +2572,6 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
 #define         DC_QR_BACKUP                 251 // deprecated
 #define         DC_QR_BACKUP2                252
 #define         DC_QR_BACKUP_TOO_NEW         255
-#define         DC_QR_WEBRTC_INSTANCE        260 // text1=domain, text2=instance pattern
 #define         DC_QR_PROXY                  271 // text1=address (e.g. "127.0.0.1:9050")
 #define         DC_QR_ADDR                   320 // id=contact
 #define         DC_QR_TEXT                   330 // text1=text
@@ -2543,10 +2624,6 @@ void            dc_stop_ongoing_process      (dc_context_t* context);
  * - DC_QR_BACKUP_TOO_NEW:
  *   show a hint to the user that this backup comes from a newer Delta Chat version
  *   and this device needs an update
- *
- * - DC_QR_WEBRTC_INSTANCE with dc_lot_t::text1=domain:
- *   ask the user if they want to use the given service for video chats;
- *   if so, call dc_set_config_from_qr().
  *
  * - DC_QR_PROXY with dc_lot_t::text1=address:
  *   ask the user if they want to use the given proxy.
@@ -3815,21 +3892,12 @@ int             dc_chat_can_send              (const dc_chat_t* chat);
 /**
  * Check if a chat is protected.
  *
- * End-to-end encryption is guaranteed in protected chats
- * and only verified contacts
+ * Only verified contacts
  * as determined by dc_contact_is_verified()
  * can be added to protected chats.
  *
  * Protected chats are created using dc_create_group_chat()
  * by setting the 'protect' parameter to 1.
- * 1:1 chats become protected or unprotected automatically
- * if `verified_one_on_one_chats` setting is enabled.
- *
- * UI should display a green checkmark
- * in the chat title,
- * in the chatlist item
- * and in the chat profile
- * if chat protection is enabled.
  *
  * @memberof dc_chat_t
  * @param chat The chat object.
@@ -3851,26 +3919,6 @@ int             dc_chat_is_protected         (const dc_chat_t* chat);
  * @return 1=chat is encrypted, 0=chat is not encrypted.
  */
 int             dc_chat_is_encrypted         (const dc_chat_t *chat);
-
-
-/**
- * Checks if the chat was protected, and then an incoming message broke this protection.
- *
- * This function is only useful if the UI enabled the `verified_one_on_one_chats` feature flag,
- * otherwise it will return false for all chats.
- *
- * 1:1 chats are automatically set as protected when a contact is verified.
- * When a message comes in that is not encrypted / signed correctly,
- * the chat is automatically set as unprotected again.
- * dc_chat_is_protection_broken() will return true until dc_accept_chat() is called.
- *
- * The UI should let the user confirm that this is OK with a message like
- * `Bob sent a message from another device. Tap to learn more` and then call dc_accept_chat().
- * @memberof dc_chat_t
- * @param chat The chat object.
- * @return 1=chat protection broken, 0=otherwise.
- */
-int             dc_chat_is_protection_broken (const dc_chat_t* chat);
 
 
 /**
@@ -4300,11 +4348,16 @@ int             dc_msg_get_duration           (const dc_msg_t* msg);
 
 
 /**
- * Check if a padlock should be shown beside the message.
+ * Check if message was correctly encrypted and signed.
+ *
+ * Historically, UIs showed a small padlock on the message then.
+ * Today, the UIs should instead
+ * show a small email-icon on the message if the message is not encrypted or signed,
+ * and nothing otherwise.
  *
  * @memberof dc_msg_t
  * @param msg The message object.
- * @return 1=padlock should be shown beside message, 0=do not show a padlock beside the message.
+ * @return 1=message correctly encrypted and signed, no need to show anything; 0=show email-icon beside the message.
  */
 int             dc_msg_get_showpadlock        (const dc_msg_t* msg);
 
@@ -4527,12 +4580,12 @@ int             dc_msg_is_info                (const dc_msg_t* msg);
  * - DC_INFO_MEMBER_ADDED_TO_GROUP (4) - "Member CONTACT added by OTHER_CONTACT"
  * - DC_INFO_MEMBER_REMOVED_FROM_GROUP (5) - "Member CONTACT removed by OTHER_CONTACT"
  * - DC_INFO_EPHEMERAL_TIMER_CHANGED (10) - "Disappearing messages CHANGED_TO by CONTACT"
- * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is now protected"
- * - DC_INFO_PROTECTION_DISABLED (12) - Info-message for "Chat is no longer protected"
+ * - DC_INFO_PROTECTION_ENABLED (11) - Info-message for "Chat is protected"
  * - DC_INFO_INVALID_UNENCRYPTED_MAIL (13) - Info-message for "Provider requires end-to-end encryption which is not setup yet",
  *   the UI should change the corresponding string using #DC_STR_INVALID_UNENCRYPTED_MAIL
  *   and also offer a way to fix the encryption, eg. by a button offering a QR scan
  * - DC_INFO_WEBXDC_INFO_MESSAGE (32) - Info-message created by webxdc app sending `update.info`
+ * - DC_INFO_CHAT_E2EE (50) - Info-message for "Chat is end-to-end-encrypted"
  *
  * For the messages that refer to a CONTACT,
  * dc_msg_get_info_contact_id() returns the contact ID.
@@ -4585,9 +4638,10 @@ uint32_t        dc_msg_get_info_contact_id    (const dc_msg_t* msg);
 #define         DC_INFO_LOCATION_ONLY              9
 #define         DC_INFO_EPHEMERAL_TIMER_CHANGED   10
 #define         DC_INFO_PROTECTION_ENABLED        11
-#define         DC_INFO_PROTECTION_DISABLED       12
+#define         DC_INFO_PROTECTION_DISABLED       12 // deprecated 2025-07
 #define         DC_INFO_INVALID_UNENCRYPTED_MAIL  13
 #define         DC_INFO_WEBXDC_INFO_MESSAGE       32
+#define         DC_INFO_CHAT_E2EE                 50
 
 
 /**
@@ -4643,22 +4697,6 @@ char*           dc_msg_get_setupcodebegin     (const dc_msg_t* msg);
 
 
 /**
- * Get URL of a videochat invitation.
- *
- * Videochat invitations are sent out using dc_send_videochat_invitation()
- * and dc_msg_get_viewtype() returns #DC_MSG_VIDEOCHAT_INVITATION for such invitations.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return If the message contains a videochat invitation,
- *     the URL of the invitation is returned.
- *     If the message is no videochat invitation, NULL is returned.
- *     Must be released using dc_str_unref() when done.
- */
-char*           dc_msg_get_videochat_url (const dc_msg_t* msg);
-
-
-/**
  * Gets the error status of the message.
  * If there is no error associated with the message, NULL is returned.
  *
@@ -4678,41 +4716,6 @@ char*           dc_msg_get_videochat_url (const dc_msg_t* msg);
  * @return An error or NULL. The result must be released using dc_str_unref().
  */
 char*           dc_msg_get_error               (const dc_msg_t* msg);
-
-
-/**
- * Get type of videochat.
- *
- * Calling this functions only makes sense for messages of type #DC_MSG_VIDEOCHAT_INVITATION,
- * in this case, if `basicwebrtc:` as of https://github.com/cracker0dks/basicwebrtc or `jitsi`
- * were used to initiate the videochat,
- * dc_msg_get_videochat_type() returns the corresponding type.
- *
- * The videochat URL can be retrieved using dc_msg_get_videochat_url().
- * To check if a message is a videochat invitation at all, check the message type for #DC_MSG_VIDEOCHAT_INVITATION.
- *
- * @memberof dc_msg_t
- * @param msg The message object.
- * @return Type of the videochat as of DC_VIDEOCHATTYPE_BASICWEBRTC, DC_VIDEOCHATTYPE_JITSI or DC_VIDEOCHATTYPE_UNKNOWN.
- *
- * Example:
- * ~~~
- * if (dc_msg_get_viewtype(msg) == DC_MSG_VIDEOCHAT_INVITATION) {
- *   if (dc_msg_get_videochat_type(msg) == DC_VIDEOCHATTYPE_BASICWEBRTC) {
- *       // videochat invitation that we ship a client for
- *   } else {
- *       // use browser for videochat - or add an additional check for DC_VIDEOCHATTYPE_JITSI
- *   }
- * } else {
- *    // not a videochat invitation
- * }
- * ~~~
- */
-int dc_msg_get_videochat_type (const dc_msg_t* msg);
-
-#define DC_VIDEOCHATTYPE_UNKNOWN     0
-#define DC_VIDEOCHATTYPE_BASICWEBRTC 1
-#define DC_VIDEOCHATTYPE_JITSI       2
 
 
 /**
@@ -5258,20 +5261,14 @@ int             dc_contact_is_blocked        (const dc_contact_t* contact);
 
 /**
  * Check if the contact
- * can be added to verified chats,
- * i.e. has a verified key
- * and Autocrypt key matches the verified key.
+ * can be added to protected chats.
  *
- * If contact is verified
- * UI should display green checkmark after the contact name
- * in contact list items,
- * in chat member list items
- * and in profiles if no chat with the contact exist (otherwise, use dc_chat_is_protected()).
+ * See dc_contact_get_verifier_id() for a guidance how to display these information.
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
  * @return 0: contact is not verified.
- *    2: SELF and contact have verified their fingerprints in both directions; in the UI typically checkmarks are shown.
+ *    2: SELF and contact have verified their fingerprints in both directions.
  */
 int             dc_contact_is_verified       (dc_contact_t* contact);
 
@@ -5286,18 +5283,38 @@ int             dc_contact_is_bot            (dc_contact_t* contact);
 
 
 /**
+ * Returns whether contact is a key-contact,
+ * i.e. it is identified by the public key
+ * rather than the email address.
+ *
+ * If so, all messages to and from this contact are encrypted.
+ *
+ * @memberof dc_contact_t
+ * @param contact The contact object.
+ * @return 1 if the contact is a key-contact, 0 if it is an address-contact.
+ */
+int             dc_contact_is_key_contact    (dc_contact_t* contact);
+
+
+/**
  * Return the contact ID that verified a contact.
  *
- * If the function returns non-zero result,
- * display green checkmark in the profile and "Introduced by ..." line
- * with the name and address of the contact
- * formatted by dc_contact_get_name_n_addr.
+ * As verifier may be unknown,
+ * use dc_contact_is_verified() to check if a contact can be added to a protected chat.
  *
- * If this function returns a verifier,
- * this does not necessarily mean
- * you can add the contact to verified chats.
- * Use dc_contact_is_verified() to check
- * if a contact can be added to a verified chat instead.
+ * UI should display the information in the contact's profile as follows:
+ *
+ * - If dc_contact_get_verifier_id() != 0,
+ *   display text "Introduced by ..."
+ *   with the name and address of the contact
+ *   formatted by dc_contact_get_name_n_addr().
+ *   Prefix the text by a green checkmark.
+ *
+ * - If dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() != 0,
+ *   display "Introduced" prefixed by a green checkmark.
+ *
+ * - if dc_contact_get_verifier_id() == 0 and dc_contact_is_verified() == 0,
+ *   display nothing
  *
  * @memberof dc_contact_t
  * @param contact The contact object.
@@ -5600,14 +5617,21 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 
 
 /**
- * Message indicating an incoming or outgoing videochat.
- * The message was created via dc_send_videochat_invitation() on this or a remote device.
+ * Message indicating an incoming or outgoing call.
  *
- * Typically, such messages are rendered differently by the UIs,
- * e.g. contain a button to join the videochat.
- * The URL for joining can be retrieved using dc_msg_get_videochat_url().
+ * These messages are created by dc_place_outgoing_call()
+ * and should be rendered by UI similar to text messages,
+ * maybe with some "phone icon" at the side.
+ *
+ * The message text is updated as needed
+ * and UI will be informed via #DC_EVENT_MSGS_CHANGED as usual.
+ *
+ * Do not start ringing when seeing this message;
+ * the mesage may belong e.g. to an old missed call.
+ *
+ * Instead, ringing should start on the event #DC_EVENT_INCOMING_CALL
  */
-#define DC_MSG_VIDEOCHAT_INVITATION 70
+#define DC_MSG_CALL 71
 
 
 /**
@@ -5730,9 +5754,33 @@ int64_t         dc_lot_get_timestamp     (const dc_lot_t* lot);
 #define         DC_CHAT_TYPE_MAILINGLIST     140
 
 /**
- * A broadcast list. See dc_chat_get_type() for details.
+ * Outgoing broadcast channel, called "Channel" in the UI.
+ *
+ * The user can send into this chat,
+ * and all recipients will receive messages
+ * in a `DC_CHAT_TYPE_IN_BROADCAST`.
+ *
+ * Called `broadcast` here rather than `channel`,
+ * because the word "channel" already appears a lot in the code,
+ * which would make it hard to grep for it.
  */
-#define         DC_CHAT_TYPE_BROADCAST       160
+#define         DC_CHAT_TYPE_OUT_BROADCAST   160
+
+/**
+ * Incoming broadcast channel, called "Channel" in the UI.
+ *
+ * This chat is read-only,
+ * and we do not know who the other recipients are.
+ *
+ * This is similar to `DC_CHAT_TYPE_MAILINGLIST`,
+ * with the main difference being that
+ * broadcasts are encrypted.
+ *
+ * Called `broadcast` here rather than `channel`,
+ * because the word "channel" already appears a lot in the code,
+ * which would make it hard to grep for it.
+ */
+#define         DC_CHAT_TYPE_IN_BROADCAST    165
 
 /**
  * @}
@@ -6339,7 +6387,6 @@ void dc_event_unref(dc_event_t* event);
 
 /**
  * Chat changed. The name or the image of a chat group was changed or members were added or removed.
- * Or the verify state of a chat has changed.
  * See dc_set_chat_name(), dc_set_chat_profile_image(), dc_add_contact_to_chat()
  * and dc_remove_contact_from_chat().
  *
@@ -6429,11 +6476,7 @@ void dc_event_unref(dc_event_t* event);
  * generated by dc_get_securejoin_qr().
  *
  * @param data1 (int) The ID of the contact that wants to join.
- * @param data2 (int) The progress as:
- *     300=vg-/vc-request received, typically shown as "bob@addr joins".
- *     600=vg-/vc-request-with-auth received, vg-member-added/vc-contact-confirm sent, typically shown as "bob@addr verified".
- *     800=contact added to chat, shown as "bob@addr securely joined GROUP". Only for the verified-group-protocol.
- *     1000=Protocol finished for this contact.
+ * @param data2 (int) The progress, always 1000.
  */
 #define DC_EVENT_SECUREJOIN_INVITER_PROGRESS      2060
 
@@ -6584,6 +6627,60 @@ void dc_event_unref(dc_event_t* event);
  * @param data1 (int) number of events that have been skipped
  */
 #define DC_EVENT_CHANNEL_OVERFLOW              2400
+
+
+
+/**
+ * Incoming call.
+ * UI will usually start ringing,
+ * or show a notification if there is already a call in some profile.
+ *
+ * Together with this event,
+ * a message of type #DC_MSG_CALL is added to the corresponding chat;
+ * this message is announced and updated by the usual event as #DC_EVENT_MSGS_CHANGED,
+ * there is usually no need to take care of this message from any of the CALL events.
+ *
+ * If user takes action, dc_accept_incoming_call() or dc_end_call() should be called.
+ *
+ * Otherwise, ringing should end on #DC_EVENT_CALL_ENDED
+ * or #DC_EVENT_INCOMING_CALL_ACCEPTED
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call.
+ * @param data2 (char*) place_call_info, text passed to dc_place_outgoing_call()
+ * @param data2 (int) 1 if incoming call is a video call, 0 otherwise
+ */
+#define DC_EVENT_INCOMING_CALL                            2550
+
+/**
+ * The callee accepted an incoming call on this or another device using dc_accept_incoming_call().
+ * The caller gets the event #DC_EVENT_OUTGOING_CALL_ACCEPTED at the same time.
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ */
+ #define DC_EVENT_INCOMING_CALL_ACCEPTED                  2560
+
+/**
+ * A call placed using dc_place_outgoing_call() was accepted by the callee using dc_accept_incoming_call().
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ * @param data2 (char*) accept_call_info, text passed to dc_accept_incoming_call()
+ */
+#define DC_EVENT_OUTGOING_CALL_ACCEPTED                   2570
+
+/**
+ * An incoming or outgoing call was ended using dc_end_call() on this or another device, by caller or callee.
+ * Moreover, the event is sent when the call was not accepted within 1 minute timeout.
+ *
+ * UI usually only takes action in case call UI was opened before, otherwise the event should be ignored.
+ *
+ * @param data1 (int) msg_id ID of the message referring to the call
+ */
+#define DC_EVENT_CALL_ENDED                               2580
+
 
 /**
  * @}
@@ -6852,9 +6949,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used in summaries.
 #define DC_STR_GIF                        23
 
-/// "Encrypted message"
-///
-/// Used in subjects of outgoing messages.
+/// @deprecated 2025-07, this string is no longer needed.
 #define DC_STR_ENCRYPTEDMSG               24
 
 /// "End-to-end encryption available."
@@ -7007,6 +7102,8 @@ void dc_event_unref(dc_event_t* event);
 /// "Unknown sender for this chat. See 'info' for more details."
 ///
 /// Use as message text if assigning the message to a chat is not totally correct.
+///
+/// @deprecated 2025-08-18
 #define DC_STR_UNKNOWN_SENDER_FOR_CHAT    72
 
 /// "Message from %1$s"
@@ -7068,17 +7165,6 @@ void dc_event_unref(dc_event_t* event);
 
 /// @deprecated Deprecated 2021-01-30, DC_STR_EPHEMERAL_WEEKS is used instead.
 #define DC_STR_EPHEMERAL_FOUR_WEEKS       81
-
-/// "Video chat invitation"
-///
-/// Used in summaries.
-#define DC_STR_VIDEOCHAT_INVITATION       82
-
-/// "You are invited to a video chat, click %1$s to join."
-///
-/// Used as message text of outgoing video chat invitations.
-/// - %1$s will be replaced by the URL of the video chat
-#define DC_STR_VIDEOCHAT_INVITE_MSG_BODY  83
 
 /// "Error: %1$s"
 ///
@@ -7549,6 +7635,18 @@ void dc_event_unref(dc_event_t* event);
 /// `%2$s` will be replaced by name and address of the contact.
 #define DC_STR_EPHEMERAL_TIMER_WEEKS_BY_OTHER 157
 
+/// "You set message deletion timer to 1 year."
+///
+/// Used in status messages.
+#define DC_STR_EPHEMERAL_TIMER_1_YEAR_BY_YOU 158
+
+/// "Message deletion timer is set to 1 year by %1$s."
+///
+/// `%1$s` will be replaced by name and address of the contact.
+///
+/// Used in status messages.
+#define DC_STR_EPHEMERAL_TIMER_1_YEAR_BY_OTHER 159
+
 /// "Scan to set up second device for %1$s"
 ///
 /// `%1$s` will be replaced by name and address of the account.
@@ -7559,7 +7657,7 @@ void dc_event_unref(dc_event_t* event);
 /// Used as a device message after a successful backup transfer.
 #define DC_STR_BACKUP_TRANSFER_MSG_BODY 163
 
-/// "Messages are guaranteed to be end-to-end encrypted from now on."
+/// "Messages are end-to-end encrypted."
 ///
 /// Used in info messages.
 #define DC_STR_CHAT_PROTECTION_ENABLED 170
@@ -7567,6 +7665,7 @@ void dc_event_unref(dc_event_t* event);
 /// "%1$s sent a message from another device."
 ///
 /// Used in info messages.
+/// @deprecated 2025-07
 #define DC_STR_CHAT_PROTECTION_DISABLED 171
 
 /// "Others will only see this group after you sent a first message."
@@ -7587,6 +7686,12 @@ void dc_event_unref(dc_event_t* event);
 ///
 /// `%1$s` will be replaced by the provider's domain.
 #define DC_STR_INVALID_UNENCRYPTED_MAIL 174
+
+/// "⚠️ It seems you are using Delta Chat on multiple devices that cannot decrypt each other's outgoing messages. To fix this, on the older device use \"Settings / Add Second Device\" and follow the instructions."
+///
+/// Added to the device chat if could not decrypt a new outgoing message (i.e. not when fetching
+/// existing messages). But no more than once a day.
+#define DC_STR_CANT_DECRYPT_OUTGOING_MSGS 175
 
 /// "You reacted %1$s to '%2$s'"
 ///
@@ -7621,8 +7726,35 @@ void dc_event_unref(dc_event_t* event);
 /// @deprecated 2025-06-05
 #define DC_STR_SECUREJOIN_TAKES_LONGER 192
 
-/// "Contact". Deprecated, currently unused.
-#define DC_STR_CONTACT 200
+/// "❤️ Seems you're enjoying Delta Chat!"… (donation request device message)
+#define DC_STR_DONATION_REQUEST 193
+
+/// "Outgoing call"
+#define DC_STR_OUTGOING_CALL 194
+
+/// "Incoming call"
+#define DC_STR_INCOMING_CALL 195
+
+/// "Declined call"
+#define DC_STR_DECLINED_CALL 196
+
+/// "Canceled call"
+#define DC_STR_CANCELED_CALL 197
+
+/// "Missed call"
+#define DC_STR_MISSED_CALL 198
+
+/// "You left the channel."
+///
+/// Used in status messages.
+#define DC_STR_CHANNEL_LEFT_BY_YOU 200
+
+/// "Scan to join channel %1$s"
+///
+/// Subtitle for channel join qrcode svg image generated by the core.
+///
+/// `%1$s` will be replaced with the channel name.
+#define DC_STR_SECURE_JOIN_CHANNEL_QR_DESC  201
 
 /**
  * @}

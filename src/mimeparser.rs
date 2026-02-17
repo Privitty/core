@@ -1,7 +1,7 @@
 //! # MIME message parsing module.
 
 use std::cmp::min;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::str;
 use std::str::FromStr;
@@ -35,6 +35,17 @@ use crate::tools::{
     get_filemeta, parse_receive_headers, smeared_time, time, truncate_msg_text, validate_id,
 };
 use crate::{chatlist_events, location, stock_str, tools};
+
+/// Public key extracted from `Autocrypt-Gossip`
+/// header with associated information.
+#[derive(Debug)]
+pub struct GossipedKey {
+    /// Public key extracted from `keydata` attribute.
+    pub public_key: SignedPublicKey,
+
+    /// True if `Autocrypt-Gossip` has a `_verified` attribute.
+    pub verified: bool,
+}
 
 /// A parsed MIME message.
 ///
@@ -76,16 +87,16 @@ pub(crate) struct MimeMessage {
     pub chat_disposition_notification_to: Option<SingleInfo>,
     pub decrypting_failed: bool,
 
-    /// Set of valid signature fingerprints if a message is an
+    /// Valid signature fingerprint if a message is an
     /// Autocrypt encrypted and signed message.
     ///
     /// If a message is not encrypted or the signature is not valid,
-    /// this set is empty.
-    pub signatures: HashSet<Fingerprint>,
+    /// this is `None`.
+    pub signature: Option<Fingerprint>,
 
     /// The addresses for which there was a gossip header
     /// and their respective gossiped keys.
-    pub gossiped_keys: HashMap<String, SignedPublicKey>,
+    pub gossiped_keys: BTreeMap<String, GossipedKey>,
 
     /// Fingerprint of the key in the Autocrypt header.
     ///
@@ -181,10 +192,10 @@ pub enum SystemMessage {
     /// Chat ephemeral message timer is changed.
     EphemeralTimerChanged = 10,
 
-    /// "Messages are guaranteed to be end-to-end encrypted from now on."
+    /// "Messages are end-to-end encrypted."
     ChatProtectionEnabled = 11,
 
-    /// "%1$s sent a message from another device."
+    /// "%1$s sent a message from another device.", deprecated 2025-07
     ChatProtectionDisabled = 12,
 
     /// Message can't be sent because of `Invalid unencrypted mail to <>`
@@ -213,6 +224,15 @@ pub enum SystemMessage {
 
     /// This message contains a users iroh node address.
     IrohNodeAddr = 40,
+
+    /// "Messages are end-to-end encrypted."
+    ChatE2ee = 50,
+
+    /// Message indicating that a call was accepted.
+    CallAccepted = 66,
+
+    /// Message indicating that a call was ended.
+    CallEnded = 67,
 }
 
 const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
@@ -220,12 +240,12 @@ const MIME_AC_SETUP_FILE: &str = "application/autocrypt-setup";
 impl MimeMessage {
     /// Parse a mime message.
     ///
-    /// If `partial` is set, it contains the full message size in bytes
-    /// and `body` contains the header only.
+    /// If `partial` is set, it contains the full message size in bytes and an optional error text
+    /// for the partially downloaded message, and `body` contains the HEADER only.
     pub(crate) async fn from_bytes(
         context: &Context,
         body: &[u8],
-        partial: Option<u32>,
+        partial: Option<(u32, Option<String>)>,
     ) -> Result<Self> {
         let mail = mailparse::parse_mail(body)?;
 
@@ -246,6 +266,7 @@ impl MimeMessage {
         MimeMessage::merge_headers(
             context,
             &mut headers,
+            &mut headers_removed,
             &mut recipients,
             &mut past_members,
             &mut from,
@@ -273,6 +294,7 @@ impl MimeMessage {
                     MimeMessage::merge_headers(
                         context,
                         &mut headers,
+                        &mut headers_removed,
                         &mut recipients,
                         &mut past_members,
                         &mut from,
@@ -329,7 +351,7 @@ impl MimeMessage {
 
         let incoming = !context.is_self_addr(&from.addr).await?;
 
-        let mut aheader_value: Option<String> = mail.headers.get_header_value(HeaderDef::Autocrypt);
+        let mut aheader_values = mail.headers.get_all_values(HeaderDef::Autocrypt.into());
 
         let mail_raw; // Memory location for a possible decrypted message.
         let decrypted_msg; // Decrypted signed OpenPGP message.
@@ -356,11 +378,11 @@ impl MimeMessage {
                         timestamp_rcvd,
                     );
 
-                    if let Some(protected_aheader_value) = decrypted_mail
+                    let protected_aheader_values = decrypted_mail
                         .headers
-                        .get_header_value(HeaderDef::Autocrypt)
-                    {
-                        aheader_value = Some(protected_aheader_value);
+                        .get_all_values(HeaderDef::Autocrypt.into());
+                    if !protected_aheader_values.is_empty() {
+                        aheader_values = protected_aheader_values;
                     }
 
                     (Ok(decrypted_mail), true)
@@ -378,26 +400,27 @@ impl MimeMessage {
                 }
             };
 
-        let autocrypt_header = if !incoming {
-            None
-        } else if let Some(aheader_value) = aheader_value {
-            match Aheader::from_str(&aheader_value) {
-                Ok(header) if addr_cmp(&header.addr, &from.addr) => Some(header),
-                Ok(header) => {
-                    warn!(
-                        context,
-                        "Autocrypt header address {:?} is not {:?}.", header.addr, from.addr
-                    );
-                    None
-                }
-                Err(err) => {
-                    warn!(context, "Failed to parse Autocrypt header: {:#}.", err);
-                    None
-                }
+        let mut autocrypt_header = None;
+        if incoming {
+            // See `get_all_addresses_from_header()` for why we take the last valid header.
+            for val in aheader_values.iter().rev() {
+                autocrypt_header = match Aheader::from_str(val) {
+                    Ok(header) if addr_cmp(&header.addr, &from.addr) => Some(header),
+                    Ok(header) => {
+                        warn!(
+                            context,
+                            "Autocrypt header address {:?} is not {:?}.", header.addr, from.addr
+                        );
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!(context, "Failed to parse Autocrypt header: {:#}.", err);
+                        continue;
+                    }
+                };
+                break;
             }
-        } else {
-            None
-        };
+        }
 
         let autocrypt_fingerprint = if let Some(autocrypt_header) = &autocrypt_header {
             let fingerprint = autocrypt_header.public_key.dc_fingerprint().hex();
@@ -422,7 +445,7 @@ impl MimeMessage {
             None
         };
 
-        let public_keyring = if incoming {
+        let mut public_keyring = if incoming {
             if let Some(autocrypt_header) = autocrypt_header {
                 vec![autocrypt_header.public_key]
             } else {
@@ -432,8 +455,46 @@ impl MimeMessage {
             key::load_self_public_keyring(context).await?
         };
 
+        if let Some(signature) = match &decrypted_msg {
+            Some(pgp::composed::Message::Literal { .. }) => None,
+            Some(pgp::composed::Message::Compressed { .. }) => {
+                // One layer of compression should already be handled by now.
+                // We don't decompress messages compressed multiple times.
+                None
+            }
+            Some(pgp::composed::Message::SignedOnePass { reader, .. }) => reader.signature(),
+            Some(pgp::composed::Message::Signed { reader, .. }) => Some(reader.signature()),
+            Some(pgp::composed::Message::Encrypted { .. }) => {
+                // The message is already decrypted once.
+                None
+            }
+            None => None,
+        } {
+            for issuer_fingerprint in signature.issuer_fingerprint() {
+                let issuer_fingerprint =
+                    crate::key::Fingerprint::from(issuer_fingerprint.clone()).hex();
+                if let Some(public_key_bytes) = context
+                    .sql
+                    .query_row_optional(
+                        "SELECT public_key
+                         FROM public_keys
+                         WHERE fingerprint=?",
+                        (&issuer_fingerprint,),
+                        |row| {
+                            let bytes: Vec<u8> = row.get(0)?;
+                            Ok(bytes)
+                        },
+                    )
+                    .await?
+                {
+                    let public_key = SignedPublicKey::from_slice(&public_key_bytes)?;
+                    public_keyring.push(public_key)
+                }
+            }
+        }
+
         let mut signatures = if let Some(ref decrypted_msg) = decrypted_msg {
-            crate::pgp::valid_signature_fingerprints(decrypted_msg, &public_keyring)?
+            crate::pgp::valid_signature_fingerprints(decrypted_msg, &public_keyring)
         } else {
             HashSet::new()
         };
@@ -446,26 +507,11 @@ impl MimeMessage {
         });
         if let (Ok(mail), true) = (mail, is_encrypted) {
             if !signatures.is_empty() {
-                // Remove unsigned opportunistically protected headers from messages considered
-                // Autocrypt-encrypted / displayed with padlock.
-                // For "Subject" see <https://github.com/deltachat/deltachat-core-rust/issues/1790>.
-                for h in [
-                    HeaderDef::Subject,
-                    HeaderDef::ChatGroupId,
-                    HeaderDef::ChatGroupName,
-                    HeaderDef::ChatGroupNameChanged,
-                    HeaderDef::ChatGroupNameTimestamp,
-                    HeaderDef::ChatGroupAvatar,
-                    HeaderDef::ChatGroupMemberRemoved,
-                    HeaderDef::ChatGroupMemberAdded,
-                    HeaderDef::ChatGroupMemberTimestamps,
-                    HeaderDef::ChatGroupPastMembers,
-                    HeaderDef::ChatDelete,
-                    HeaderDef::ChatEdit,
-                    HeaderDef::ChatUserAvatar,
-                ] {
-                    remove_header(&mut headers, h.get_headername(), &mut headers_removed);
-                }
+                // Unsigned "Subject" mustn't be prepended to messages shown as encrypted
+                // (<https://github.com/deltachat/deltachat-core-rust/issues/1790>).
+                // Other headers are removed by `MimeMessage::merge_headers()` except for "List-ID".
+                remove_header(&mut headers, "subject", &mut headers_removed);
+                remove_header(&mut headers, "list-id", &mut headers_removed);
             }
 
             // let known protected headers from the decrypted
@@ -478,6 +524,7 @@ impl MimeMessage {
             MimeMessage::merge_headers(
                 context,
                 &mut headers,
+                &mut headers_removed,
                 &mut recipients,
                 &mut past_members,
                 &mut inner_from,
@@ -542,7 +589,7 @@ impl MimeMessage {
             decrypting_failed: mail.is_err(),
 
             // only non-empty if it was a valid autocrypt message
-            signatures,
+            signature: signatures.into_iter().last(),
             autocrypt_fingerprint,
             gossiped_keys,
             is_forwarded: false,
@@ -565,9 +612,9 @@ impl MimeMessage {
         };
 
         match partial {
-            Some(org_bytes) => {
+            Some((org_bytes, err)) => {
                 parser
-                    .create_stub_from_partial_download(context, org_bytes)
+                    .create_stub_from_partial_download(context, org_bytes, err)
                     .await?;
             }
             None => match mail {
@@ -587,7 +634,7 @@ impl MimeMessage {
                         error: Some(format!("Decrypting failed: {err:#}")),
                         ..Default::default()
                     };
-                    parser.parts.push(part);
+                    parser.do_add_single_part(part);
                 }
             },
         };
@@ -647,6 +694,10 @@ impl MimeMessage {
                 self.is_system_message = SystemMessage::ChatProtectionDisabled;
             } else if value == "group-avatar-changed" {
                 self.is_system_message = SystemMessage::GroupImageChanged;
+            } else if value == "call-accepted" {
+                self.is_system_message = SystemMessage::CallAccepted;
+            } else if value == "call-ended" {
+                self.is_system_message = SystemMessage::CallEnded;
             }
         } else if self.get_header(HeaderDef::ChatGroupMemberRemoved).is_some() {
             self.is_system_message = SystemMessage::MemberRemovedFromGroup;
@@ -669,16 +720,24 @@ impl MimeMessage {
     }
 
     fn parse_videochat_headers(&mut self) {
-        if let Some(value) = self.get_header(HeaderDef::ChatContent) {
-            if value == "videochat-invitation" {
-                let instance = self
-                    .get_header(HeaderDef::ChatWebrtcRoom)
-                    .map(|s| s.to_string());
-                if let Some(part) = self.parts.first_mut() {
-                    part.typ = Viewtype::VideochatInvitation;
-                    part.param
-                        .set(Param::WebrtcRoom, instance.unwrap_or_default());
+        let content = self
+            .get_header(HeaderDef::ChatContent)
+            .unwrap_or_default()
+            .to_string();
+        let room = self
+            .get_header(HeaderDef::ChatWebrtcRoom)
+            .map(|s| s.to_string());
+        let accepted = self
+            .get_header(HeaderDef::ChatWebrtcAccepted)
+            .map(|s| s.to_string());
+        if let Some(part) = self.parts.first_mut() {
+            if let Some(room) = room {
+                if content == "call" {
+                    part.typ = Viewtype::Call;
+                    part.param.set(Param::WebrtcRoom, room);
                 }
+            } else if let Some(accepted) = accepted {
+                part.param.set(Param::WebrtcAccepted, accepted);
             }
         }
     }
@@ -704,7 +763,7 @@ impl MimeMessage {
                     | Viewtype::Vcard
                     | Viewtype::File
                     | Viewtype::Webxdc => true,
-                    Viewtype::Unknown | Viewtype::Text | Viewtype::VideochatInvitation => false,
+                    Viewtype::Unknown | Viewtype::Text | Viewtype::Call => false,
                 })
         {
             let mut parts = std::mem::take(&mut self.parts);
@@ -907,7 +966,7 @@ impl MimeMessage {
     /// This means the message was both encrypted and signed with a
     /// valid signature.
     pub fn was_encrypted(&self) -> bool {
-        !self.signatures.is_empty()
+        self.signature.is_some()
     }
 
     /// Returns whether the email contains a `chat-version` header.
@@ -1001,41 +1060,68 @@ impl MimeMessage {
         is_related: bool,
     ) -> Result<bool> {
         let mut any_part_added = false;
-        let mimetype = get_mime_type(mail, &get_attachment_filename(context, mail)?)?.0;
+        let mimetype = get_mime_type(
+            mail,
+            &get_attachment_filename(context, mail)?,
+            self.has_chat_version(),
+        )?
+        .0;
         match (mimetype.type_(), mimetype.subtype().as_str()) {
-            /* Most times, multipart/alternative contains true alternatives
-            as text/plain and text/html.  If we find a multipart/mixed
-            inside multipart/alternative, we use this (happens eg in
-            apple mail: "plaintext" as an alternative to "html+PDF attachment") */
             (mime::MULTIPART, "alternative") => {
-                for cur_data in &mail.subparts {
-                    let mime_type =
-                        get_mime_type(cur_data, &get_attachment_filename(context, cur_data)?)?.0;
-                    if mime_type == "multipart/mixed" || mime_type == "multipart/related" {
+                // multipart/alternative is described in
+                // <https://datatracker.ietf.org/doc/html/rfc2046#section-5.1.4>.
+                // Specification says that last part should be preferred,
+                // so we iterate over parts in reverse order.
+
+                // Search for plain text or multipart part.
+                //
+                // If we find a multipart inside multipart/alternative
+                // and it has usable subparts, we only parse multipart.
+                // This happens e.g. in Apple Mail:
+                // "plaintext" as an alternative to "html+PDF attachment".
+                for cur_data in mail.subparts.iter().rev() {
+                    let (mime_type, _viewtype) = get_mime_type(
+                        cur_data,
+                        &get_attachment_filename(context, cur_data)?,
+                        self.has_chat_version(),
+                    )?;
+
+                    if mime_type == mime::TEXT_PLAIN || mime_type.type_() == mime::MULTIPART {
                         any_part_added = self
                             .parse_mime_recursive(context, cur_data, is_related)
                             .await?;
                         break;
                     }
                 }
-                if !any_part_added {
-                    /* search for text/plain and add this */
-                    for cur_data in &mail.subparts {
-                        if get_mime_type(cur_data, &get_attachment_filename(context, cur_data)?)?
-                            .0
-                            .type_()
-                            == mime::TEXT
-                        {
-                            any_part_added = self
-                                .parse_mime_recursive(context, cur_data, is_related)
-                                .await?;
-                            break;
-                        }
+
+                // Explicitly look for a `text/calendar` part.
+                // Messages conforming to <https://datatracker.ietf.org/doc/html/rfc6047>
+                // contain `text/calendar` part as an alternative
+                // to the text or HTML representation.
+                //
+                // While we cannot display `text/calendar` and therefore do not prefer it,
+                // we still make it available by presenting as an attachment
+                // with a generic filename.
+                for cur_data in mail.subparts.iter().rev() {
+                    let mimetype = cur_data.ctype.mimetype.parse::<Mime>()?;
+                    if mimetype.type_() == mime::TEXT && mimetype.subtype() == "calendar" {
+                        let filename = get_attachment_filename(context, cur_data)?
+                            .unwrap_or_else(|| "calendar.ics".to_string());
+                        self.do_add_single_file_part(
+                            context,
+                            Viewtype::File,
+                            mimetype,
+                            &mail.ctype.mimetype.to_lowercase(),
+                            &mail.get_body_raw()?,
+                            &filename,
+                            is_related,
+                        )
+                        .await?;
                     }
                 }
+
                 if !any_part_added {
-                    /* `text/plain` not found - use the first part */
-                    for cur_part in &mail.subparts {
+                    for cur_part in mail.subparts.iter().rev() {
                         if self
                             .parse_mime_recursive(context, cur_part, is_related)
                             .await?
@@ -1155,7 +1241,7 @@ impl MimeMessage {
     ) -> Result<bool> {
         // return true if a part was added
         let filename = get_attachment_filename(context, mail)?;
-        let (mime_type, msg_type) = get_mime_type(mail, &filename)?;
+        let (mime_type, msg_type) = get_mime_type(mail, &filename, self.has_chat_version())?;
         let raw_mime = mail.ctype.mimetype.to_lowercase();
 
         let old_part_count = self.parts.len();
@@ -1318,10 +1404,6 @@ impl MimeMessage {
         filename: &str,
         is_related: bool,
     ) -> Result<()> {
-        if decoded_data.is_empty() {
-            return Ok(());
-        }
-
         // Process attached PGP keys.
         if mime_type.type_() == mime::APPLICATION
             && mime_type.subtype().as_str() == "pgp-keys"
@@ -1380,6 +1462,20 @@ impl MimeMessage {
             } else {
                 Viewtype::File
             }
+        } else if msg_type == Viewtype::Image
+            || msg_type == Viewtype::Gif
+            || msg_type == Viewtype::Sticker
+        {
+            match get_filemeta(decoded_data) {
+                // image size is known, not too big, keep msg_type:
+                Ok((width, height)) if width * height <= constants::MAX_RCVD_IMAGE_PIXELS => {
+                    part.param.set_i64(Param::Width, width.into());
+                    part.param.set_i64(Param::Height, height.into());
+                    msg_type
+                }
+                // image is too big or size is unknown, display as file:
+                _ => Viewtype::File,
+            }
         } else {
             msg_type
         };
@@ -1399,13 +1495,6 @@ impl MimeMessage {
                 }
             };
         info!(context, "added blobfile: {:?}", blob.as_name());
-
-        if mime_type.type_() == mime::IMAGE {
-            if let Ok((width, height)) = get_filemeta(decoded_data) {
-                part.param.set_int(Param::Width, width as i32);
-                part.param.set_int(Param::Height, height as i32);
-            }
-        }
 
         part.typ = msg_type;
         part.org_filename = Some(filename.to_string());
@@ -1440,7 +1529,7 @@ impl MimeMessage {
                 );
                 return Ok(false);
             }
-            Ok((key, _)) => key,
+            Ok(key) => key,
         };
         if let Err(err) = key.verify() {
             warn!(context, "Attached PGP key verification failed: {err:#}.");
@@ -1463,7 +1552,7 @@ impl MimeMessage {
         Ok(true)
     }
 
-    fn do_add_single_part(&mut self, mut part: Part) {
+    pub(crate) fn do_add_single_part(&mut self, mut part: Part) {
         if self.was_encrypted() {
             part.param.set_int(Param::GuaranteeE2ee, 1);
         }
@@ -1503,13 +1592,11 @@ impl MimeMessage {
         }
     }
 
-    pub fn replace_msg_by_error(&mut self, error_msg: &str) {
-        self.is_system_message = SystemMessage::Unknown;
-        if let Some(part) = self.parts.first_mut() {
-            part.typ = Viewtype::Text;
-            part.msg = format!("[{error_msg}]");
-            self.parts.truncate(1);
-        }
+    /// Check if a message is a call.
+    pub(crate) fn is_call(&self) -> bool {
+        self.parts
+            .first()
+            .is_some_and(|part| part.typ == Viewtype::Call)
     }
 
     pub(crate) fn get_rfc724_mid(&self) -> Option<String> {
@@ -1538,6 +1625,7 @@ impl MimeMessage {
     fn merge_headers(
         context: &Context,
         headers: &mut HashMap<String, String>,
+        headers_removed: &mut HashSet<String>,
         recipients: &mut Vec<SingleInfo>,
         past_members: &mut Vec<SingleInfo>,
         from: &mut Option<SingleInfo>,
@@ -1545,23 +1633,25 @@ impl MimeMessage {
         chat_disposition_notification_to: &mut Option<SingleInfo>,
         fields: &[mailparse::MailHeader<'_>],
     ) {
+        headers.retain(|k, _| {
+            !is_protected(k) || {
+                headers_removed.insert(k.to_string());
+                false
+            }
+        });
         for field in fields {
             // lowercasing all headers is technically not correct, but makes things work better
             let key = field.get_key().to_lowercase();
-            if !headers.contains_key(&key) || // key already exists, only overwrite known types (protected headers)
-                    is_known(&key) || key.starts_with("chat-")
-            {
-                if key == HeaderDef::ChatDispositionNotificationTo.get_headername() {
-                    match addrparse_header(field) {
-                        Ok(addrlist) => {
-                            *chat_disposition_notification_to = addrlist.extract_single_info();
-                        }
-                        Err(e) => warn!(context, "Could not read {} address: {}", key, e),
+            if key == HeaderDef::ChatDispositionNotificationTo.get_headername() {
+                match addrparse_header(field) {
+                    Ok(addrlist) => {
+                        *chat_disposition_notification_to = addrlist.extract_single_info();
                     }
-                } else {
-                    let value = field.get_value();
-                    headers.insert(key.to_string(), value);
+                    Err(e) => warn!(context, "Could not read {} address: {}", key, e),
                 }
+            } else {
+                let value = field.get_value();
+                headers.insert(key.to_string(), value);
             }
         }
         let recipients_new = get_recipients(fields);
@@ -1894,9 +1984,9 @@ async fn parse_gossip_headers(
     from: &str,
     recipients: &[SingleInfo],
     gossip_headers: Vec<String>,
-) -> Result<HashMap<String, SignedPublicKey>> {
+) -> Result<BTreeMap<String, GossipedKey>> {
     // XXX split the parsing from the modification part
-    let mut gossiped_keys: HashMap<String, SignedPublicKey> = Default::default();
+    let mut gossiped_keys: BTreeMap<String, GossipedKey> = Default::default();
 
     for value in &gossip_headers {
         let header = match value.parse::<Aheader>() {
@@ -1938,7 +2028,12 @@ async fn parse_gossip_headers(
             )
             .await?;
 
-        gossiped_keys.insert(header.addr.to_lowercase(), header.public_key);
+        let gossiped_key = GossipedKey {
+            public_key: header.public_key,
+
+            verified: header.verified,
+        };
+        gossiped_keys.insert(header.addr.to_lowercase(), gossiped_key);
     }
 
     Ok(gossiped_keys)
@@ -1985,29 +2080,34 @@ pub(crate) fn parse_message_id(ids: &str) -> Result<String> {
     if let Some(id) = parse_message_ids(ids).first() {
         Ok(id.to_string())
     } else {
-        bail!("could not parse message_id: {}", ids);
+        bail!("could not parse message_id: {ids}");
     }
 }
 
-/// Returns true if the header overwrites outer header
-/// when it comes from protected headers.
-fn is_known(key: &str) -> bool {
-    matches!(
-        key,
-        "return-path"
-            | "date"
-            | "from"
-            | "sender"
-            | "reply-to"
-            | "to"
-            | "cc"
-            | "bcc"
-            | "message-id"
-            | "in-reply-to"
-            | "references"
-            | "subject"
-            | "secure-join"
-    )
+/// Returns whether the outer header value must be ignored if the message contains a signed (and
+/// optionally encrypted) part.
+///
+/// NB: There are known cases when Subject and List-ID only appear in the outer headers of
+/// signed-only messages. Such messages are shown as unencrypted anyway.
+fn is_protected(key: &str) -> bool {
+    key.starts_with("chat-")
+        || matches!(
+            key,
+            "return-path"
+                | "auto-submitted"
+                | "autocrypt-setup-message"
+                | "date"
+                | "from"
+                | "sender"
+                | "reply-to"
+                | "to"
+                | "cc"
+                | "bcc"
+                | "message-id"
+                | "in-reply-to"
+                | "references"
+                | "secure-join"
+        )
 }
 
 /// Returns if the header is hidden and must be ignored in the IMF section.
@@ -2067,6 +2167,7 @@ pub struct Part {
 fn get_mime_type(
     mail: &mailparse::ParsedMail<'_>,
     filename: &Option<String>,
+    is_chat_msg: bool,
 ) -> Result<(Mime, Viewtype)> {
     let mimetype = mail.ctype.mimetype.parse::<Mime>()?;
 
@@ -2100,13 +2201,13 @@ fn get_mime_type(
         }
         mime::APPLICATION => match mimetype.subtype() {
             mime::OCTET_STREAM => match filename {
-                Some(filename) => {
+                Some(filename) if !is_chat_msg => {
                     match message::guess_msgtype_from_path_suffix(Path::new(&filename)) {
                         Some((viewtype, _)) => viewtype,
                         None => Viewtype::File,
                     }
                 }
-                None => Viewtype::File,
+                _ => Viewtype::File,
             },
             _ => Viewtype::File,
         },

@@ -105,7 +105,7 @@ impl BackupProvider {
 
         // Acquire global "ongoing" mutex.
         let cancel_token = context.alloc_ongoing().await?;
-        let paused_guard = context.scheduler.pause(context.clone()).await?;
+        let paused_guard = context.scheduler.pause(context).await?;
         let context_dir = context
             .get_blobdir()
             .parent()
@@ -250,7 +250,7 @@ impl BackupProvider {
                         if let Err(err) = Self::handle_connection(context.clone(), conn, auth_token, dbfile).race(
                             async {
                                 cancel_token.recv().await.ok();
-                                Err(format_err!("Backup transfer cancelled"))
+                                Err(format_err!("Backup transfer canceled"))
                             }
                         ).race(
                             async {
@@ -258,7 +258,7 @@ impl BackupProvider {
                                 Err(format_err!("Backup provider dropped"))
                             }
                         ).await {
-                            warn!(context, "Error while handling backup connection: {err:#}.");
+                            error!(context, "Error while handling backup connection: {err:#}.");
                             context.emit_event(EventType::ImexProgress(0));
                             break;
                         } else {
@@ -270,12 +270,12 @@ impl BackupProvider {
                     }
                 },
                 _ = cancel_token.recv() => {
-                    info!(context, "Backup transfer cancelled by the user, stopping accept loop.");
+                    info!(context, "Backup transfer canceled by the user, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
                 _ = drop_token.cancelled() => {
-                    info!(context, "Backup transfer cancelled by dropping the provider, stopping accept loop.");
+                    info!(context, "Backup transfer canceled by dropping the provider, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
@@ -372,10 +372,11 @@ pub async fn get_backup(context: &Context, qr: Qr) -> Result<()> {
             let res = get_backup2(context, node_addr, auth_token)
                 .race(async {
                     cancel_token.recv().await.ok();
-                    Err(format_err!("Backup reception cancelled"))
+                    Err(format_err!("Backup reception canceled"))
                 })
                 .await;
-            if res.is_err() {
+            if let Err(ref res) = res {
+                error!(context, "{:#}", res);
                 context.emit_event(EventType::ImexProgress(0));
             }
             context.free_ongoing().await;

@@ -1,6 +1,6 @@
 use anyhow::Result;
-use deltachat::color;
 use deltachat::context::Context;
+use deltachat::key::{DcKey, SignedPublicKey};
 use serde::Serialize;
 use typescript_type_def::TypeDef;
 
@@ -31,27 +31,36 @@ pub struct ContactObject {
     /// e.g. if we just scanned the fingerprint from a QR code.
     e2ee_avail: bool,
 
-    /// True if the contact can be added to verified groups.
+    /// True if the contact
+    /// can be added to protected chats
+    /// because SELF and contact have verified their fingerprints in both directions.
     ///
-    /// If this is true
-    /// UI should display green checkmark after the contact name
-    /// in contact list items,
-    /// in chat member list items
-    /// and in profiles if no chat with the contact exist.
+    /// See [`Self::verifier_id`]/`Contact.verifierId` for a guidance how to display these information.
     is_verified: bool,
 
-    /// True if the contact profile title should have a green checkmark.
+    /// The contact ID that verified a contact.
     ///
-    /// This indicates whether 1:1 chat has a green checkmark
-    /// or will have a green checkmark if created.
-    is_profile_verified: bool,
-
-    /// The ID of the contact that verified this contact.
+    /// As verifier may be unknown,
+    /// use [`Self::is_verified`]/`Contact.isVerified` to check if a contact can be added to a protected chat.
     ///
-    /// If this is present,
-    /// display a green checkmark and "Introduced by ..."
-    /// string followed by the verifier contact name and address
-    /// in the contact profile.
+    /// UI should display the information in the contact's profile as follows:
+    ///
+    /// - If `verifierId` != 0,
+    ///   display text "Introduced by ..."
+    ///   with the name and address of the contact
+    ///   formatted by `name_and_addr`/`nameAndAddr`.
+    ///   Prefix the text by a green checkmark.
+    ///
+    /// - If `verifierId` == 0 and `isVerified` != 0,
+    ///   display "Introduced" prefixed by a green checkmark.
+    ///
+    /// - if `verifierId` == 0 and `isVerified` == 0,
+    ///   display nothing
+    ///
+    /// This contains the contact ID of the verifier.
+    /// If it is `DC_CONTACT_ID_SELF`, we verified the contact ourself.
+    /// If it is None/Null, we don't have verifier information or
+    /// the contact is not verified.
     verifier_id: Option<u32>,
 
     /// the contact's last seen timestamp
@@ -72,7 +81,6 @@ impl ContactObject {
             None => None,
         };
         let is_verified = contact.is_verified(context).await?;
-        let is_profile_verified = contact.is_profile_verified(context).await?;
 
         let verifier_id = contact
             .get_verifier_id(context)
@@ -94,7 +102,6 @@ impl ContactObject {
             is_key_contact: contact.is_key_contact(),
             e2ee_avail: contact.e2ee_avail(context).await?,
             is_verified,
-            is_profile_verified,
             verifier_id,
             last_seen: contact.last_seen(),
             was_seen_recently: contact.was_seen_recently(),
@@ -123,7 +130,13 @@ pub struct VcardContact {
 impl From<deltachat_contact_tools::VcardContact> for VcardContact {
     fn from(vc: deltachat_contact_tools::VcardContact) -> Self {
         let display_name = vc.display_name().to_string();
-        let color = color::str_to_color(&vc.addr.to_lowercase());
+        let is_self = false;
+        let fpr = vc.key.as_deref().and_then(|k| {
+            SignedPublicKey::from_base64(k)
+                .ok()
+                .map(|k| k.dc_fingerprint())
+        });
+        let color = deltachat::contact::get_color(is_self, &vc.addr, &fpr);
         Self {
             addr: vc.addr,
             display_name,

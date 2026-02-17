@@ -2,7 +2,7 @@
 
 import json
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from ._utils import AttrDict, futuremethod
 from .const import EventType
@@ -38,6 +38,11 @@ class Message:
         snapshot["sender"] = Contact(self.account, snapshot.from_id)
         snapshot["message"] = self
         return snapshot
+
+    def get_read_receipts(self) -> List[AttrDict]:
+        """Get message read receipts."""
+        read_receipts = self._rpc.get_message_read_receipts(self.account.id, self.id)
+        return [AttrDict(read_receipt) for read_receipt in read_receipts]
 
     def get_reactions(self) -> Optional[AttrDict]:
         """Get message reactions."""
@@ -97,3 +102,15 @@ class Message:
     def send_webxdc_realtime_data(self, data) -> None:
         """Send data to the realtime channel."""
         yield self._rpc.send_webxdc_realtime_data.future(self.account.id, self.id, list(data))
+
+    def accept_incoming_call(self, accept_call_info):
+        """Accepts an incoming call."""
+        self._rpc.accept_incoming_call(self.account.id, self.id, accept_call_info)
+
+    def end_call(self):
+        """Ends incoming or outgoing call."""
+        self._rpc.end_call(self.account.id, self.id)
+
+    def get_call_info(self) -> AttrDict:
+        """Return information about the call."""
+        return AttrDict(self._rpc.call_info(self.account.id, self.id))

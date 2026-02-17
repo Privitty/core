@@ -15,9 +15,7 @@ use crate::blob::BlobObject;
 use crate::chat::{Chat, ChatId, ChatIdBlocked, ChatVisibility, send_msg};
 use crate::chatlist_events;
 use crate::config::Config;
-use crate::constants::{
-    Blocked, Chattype, DC_CHAT_ID_TRASH, DC_MSG_ID_LAST_SPECIAL, VideochatType,
-};
+use crate::constants::{Blocked, Chattype, DC_CHAT_ID_TRASH, DC_MSG_ID_LAST_SPECIAL};
 use crate::contact::{self, Contact, ContactId};
 use crate::context::Context;
 use crate::debug_logging::set_debug_logging_xdc;
@@ -125,27 +123,16 @@ impl MsgId {
     ///   if all parts of the message are trashed with this flag. `true` if the user explicitly
     ///   deletes the message. As for trashing a partially downloaded message when replacing it with
     ///   a fully downloaded one, see `receive_imf::add_parts()`.
-    pub async fn trash(self, context: &Context, on_server: bool) -> Result<()> {
-        let chat_id = DC_CHAT_ID_TRASH;
-        let deleted_subst = match on_server {
-            true => ", deleted=1",
-            false => "",
-        };
+    pub(crate) async fn trash(self, context: &Context, on_server: bool) -> Result<()> {
         context
             .sql
             .execute(
-                // If you change which information is removed here, also change delete_expired_messages() and
-                // which information receive_imf::add_parts() still adds to the db if the chat_id is TRASH
-                &format!(
-                    "UPDATE msgs SET \
-                     chat_id=?, txt='', txt_normalized=NULL, \
-                     subject='', txt_raw='', \
-                     mime_headers='', \
-                     from_id=0, to_id=0, \
-                     param=''{deleted_subst} \
-                     WHERE id=?"
-                ),
-                (chat_id, self),
+                // If you change which information is preserved here, also change
+                // `delete_expired_messages()` and which information `receive_imf::add_parts()`
+                // still adds to the db if chat_id is TRASH.
+                "INSERT OR REPLACE INTO msgs (id, rfc724_mid, timestamp, chat_id, deleted)
+                 SELECT ?1, rfc724_mid, timestamp, ?, ? FROM msgs WHERE id=?1",
+                (self, DC_CHAT_ID_TRASH, on_server),
             )
             .await?;
 
@@ -503,8 +490,7 @@ impl Message {
     pub async fn load_from_db_optional(context: &Context, id: MsgId) -> Result<Option<Message>> {
         ensure!(
             !id.is_special(),
-            "Can not load special message ID {} from DB",
-            id
+            "Can not load special message ID {id} from DB"
         );
         let msg = context
             .sql
@@ -579,7 +565,7 @@ impl Message {
                         timestamp_rcvd: row.get("timestamp_rcvd")?,
                         ephemeral_timer: row.get("ephemeral_timer")?,
                         ephemeral_timestamp: row.get("ephemeral_timestamp")?,
-                        viewtype: row.get("type")?,
+                        viewtype: row.get("type").unwrap_or_default(),
                         state: state.with_mdns(mdn_msg_id.is_some()),
                         download_state: row.get("download_state")?,
                         error: Some(row.get::<_, String>("error")?)
@@ -662,8 +648,10 @@ impl Message {
         if self.viewtype.has_file() {
             let file_param = self.param.get_file_path(context)?;
             if let Some(path_and_filename) = file_param {
-                if (self.viewtype == Viewtype::Image || self.viewtype == Viewtype::Gif)
-                    && !self.param.exists(Param::Width)
+                if matches!(
+                    self.viewtype,
+                    Viewtype::Image | Viewtype::Gif | Viewtype::Sticker
+                ) && !self.param.exists(Param::Width)
                 {
                     let buf = read_file(context, &path_and_filename).await?;
 
@@ -866,9 +854,10 @@ impl Message {
 
         let contact = if self.from_id != ContactId::SELF {
             match chat.typ {
-                Chattype::Group | Chattype::Broadcast | Chattype::Mailinglist => {
-                    Some(Contact::get_by_id(context, self.from_id).await?)
-                }
+                Chattype::Group
+                | Chattype::OutBroadcast
+                | Chattype::InBroadcast
+                | Chattype::Mailinglist => Some(Contact::get_by_id(context, self.from_id).await?),
                 Chattype::Single => None,
             }
         } else {
@@ -973,6 +962,7 @@ impl Message {
             | SystemMessage::SecurejoinMessage
             | SystemMessage::LocationStreamingEnabled
             | SystemMessage::LocationOnly
+            | SystemMessage::ChatE2ee
             | SystemMessage::ChatProtectionEnabled
             | SystemMessage::ChatProtectionDisabled
             | SystemMessage::InvalidUnencryptedMail
@@ -982,6 +972,8 @@ impl Message {
             | SystemMessage::WebxdcStatusUpdate
             | SystemMessage::WebxdcInfoMessage
             | SystemMessage::IrohNodeAddr
+            | SystemMessage::CallAccepted
+            | SystemMessage::CallEnded
             | SystemMessage::Unknown => Ok(None),
         }
     }
@@ -1019,85 +1011,6 @@ impl Message {
             }
         }
 
-        None
-    }
-
-    // add room to a webrtc_instance as defined by the corresponding config-value;
-    // the result may still be prefixed by the type
-    pub(crate) fn create_webrtc_instance(instance: &str, room: &str) -> String {
-        let (videochat_type, mut url) = Message::parse_webrtc_instance(instance);
-
-        // make sure, there is a scheme in the url
-        if !url.contains(':') {
-            url = format!("https://{url}");
-        }
-
-        // add/replace room
-        let url = if url.contains("$ROOM") {
-            url.replace("$ROOM", room)
-        } else if url.contains("$NOROOM") {
-            // there are some usecases where a separate room is not needed to use a service
-            // eg. if you let in people manually anyway, see discussion at
-            // <https://support.delta.chat/t/videochat-with-webex/1412/4>.
-            // hacks as hiding the room behind `#` are not reliable, therefore,
-            // these services are supported by adding the string `$NOROOM` to the url.
-            url.replace("$NOROOM", "")
-        } else {
-            // if there nothing that would separate the room, add a slash as a separator;
-            // this way, urls can be given as "https://meet.jit.si" as well as "https://meet.jit.si/"
-            let maybe_slash = if url.ends_with('/')
-                || url.ends_with('?')
-                || url.ends_with('#')
-                || url.ends_with('=')
-            {
-                ""
-            } else {
-                "/"
-            };
-            format!("{url}{maybe_slash}{room}")
-        };
-
-        // re-add and normalize type
-        match videochat_type {
-            VideochatType::BasicWebrtc => format!("basicwebrtc:{url}"),
-            VideochatType::Jitsi => format!("jitsi:{url}"),
-            VideochatType::Unknown => url,
-        }
-    }
-
-    /// split a webrtc_instance as defined by the corresponding config-value into a type and a url
-    pub fn parse_webrtc_instance(instance: &str) -> (VideochatType, String) {
-        let instance: String = instance.split_whitespace().collect();
-        let mut split = instance.splitn(2, ':');
-        let type_str = split.next().unwrap_or_default().to_lowercase();
-        let url = split.next();
-        match type_str.as_str() {
-            "basicwebrtc" => (
-                VideochatType::BasicWebrtc,
-                url.unwrap_or_default().to_string(),
-            ),
-            "jitsi" => (VideochatType::Jitsi, url.unwrap_or_default().to_string()),
-            _ => (VideochatType::Unknown, instance.to_string()),
-        }
-    }
-
-    /// Returns videochat URL if the message is a videochat invitation.
-    pub fn get_videochat_url(&self) -> Option<String> {
-        if self.viewtype == Viewtype::VideochatInvitation {
-            if let Some(instance) = self.param.get(Param::WebrtcRoom) {
-                return Some(Message::parse_webrtc_instance(instance).1);
-            }
-        }
-        None
-    }
-
-    /// Returns videochat type if the message is a videochat invitation.
-    pub fn get_videochat_type(&self) -> Option<VideochatType> {
-        if self.viewtype == Viewtype::VideochatInvitation {
-            if let Some(instance) = self.param.get(Param::WebrtcRoom) {
-                return Some(Message::parse_webrtc_instance(instance).0);
-            }
-        }
         None
     }
 
@@ -1375,17 +1288,6 @@ impl Message {
         Ok(())
     }
 
-    pub(crate) async fn update_subject(&self, context: &Context) -> Result<()> {
-        context
-            .sql
-            .execute(
-                "UPDATE msgs SET subject=? WHERE id=?;",
-                (&self.subject, self.id),
-            )
-            .await?;
-        Ok(())
-    }
-
     /// Gets the error status of the message.
     ///
     /// A message can have an associated error status if something went wrong when sending or
@@ -1602,7 +1504,7 @@ pub(crate) fn guess_msgtype_from_path_suffix(path: &Path) -> Option<(Viewtype, &
         "rtf" => (Viewtype::File, "application/rtf"),
         "spx" => (Viewtype::File, "audio/ogg"), // Ogg Speex Profile
         "svg" => (Viewtype::File, "image/svg+xml"),
-        "tgs" => (Viewtype::Sticker, "application/x-tgsticker"),
+        "tgs" => (Viewtype::File, "application/x-tgsticker"),
         "tiff" => (Viewtype::File, "image/tiff"),
         "tif" => (Viewtype::File, "image/tiff"),
         "ttf" => (Viewtype::File, "font/ttf"),
@@ -2293,8 +2195,8 @@ pub enum Viewtype {
     /// and retrieved via dc_msg_get_file().
     File = 60,
 
-    /// Message is an invitation to a videochat.
-    VideochatInvitation = 70,
+    /// Message is an incoming or outgoing call.
+    Call = 71,
 
     /// Message is an webxdc instance.
     Webxdc = 80,
@@ -2318,7 +2220,7 @@ impl Viewtype {
             Viewtype::Voice => true,
             Viewtype::Video => true,
             Viewtype::File => true,
-            Viewtype::VideochatInvitation => false,
+            Viewtype::Call => false,
             Viewtype::Webxdc => true,
             Viewtype::Vcard => true,
         }

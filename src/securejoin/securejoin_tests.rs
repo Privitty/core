@@ -5,8 +5,9 @@ use crate::chat::{CantSendReason, remove_contact_from_chat};
 use crate::chatlist::Chatlist;
 use crate::constants::Chattype;
 use crate::key::self_fingerprint;
+use crate::mimeparser::GossipedKey;
 use crate::receive_imf::receive_imf;
-use crate::stock_str::{self, chat_protection_enabled};
+use crate::stock_str::{self, messages_e2e_encrypted};
 use crate::test_utils::{
     TestContext, TestContextManager, TimeShiftFalsePositiveNote, get_chat_msg,
 };
@@ -71,11 +72,6 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         }
         _ => alice_auto_submitted_hdr = "Auto-Submitted: auto-replied",
     };
-    for t in [&alice, &bob] {
-        t.set_config_bool(Config::VerifiedOneOnOneChats, true)
-            .await
-            .unwrap();
-    }
 
     assert_eq!(
         Chatlist::try_load(&alice, 0, None, None)
@@ -185,7 +181,10 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     );
 
     if case == SetupContactCase::WrongAliceGossip {
-        let wrong_pubkey = load_self_public_key(&bob).await.unwrap();
+        let wrong_pubkey = GossipedKey {
+            public_key: load_self_public_key(&bob).await.unwrap(),
+            verified: false,
+        };
         let alice_pubkey = msg
             .gossiped_keys
             .insert(alice_addr.to_string(), wrong_pubkey)
@@ -246,7 +245,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
         let chat = alice.get_chat(&bob).await;
         let msg = get_chat_msg(&alice, chat.get_id(), 0, 1).await;
         assert!(msg.is_info());
-        let expected_text = chat_protection_enabled(&alice).await;
+        let expected_text = messages_e2e_encrypted(&alice).await;
         assert_eq!(msg.get_text(), expected_text);
         if case == SetupContactCase::CheckProtectionTimestamp {
             assert_eq!(msg.timestamp_sort, vc_request_with_auth_ts_sent + 1);
@@ -296,7 +295,7 @@ async fn test_setup_contact_ex(case: SetupContactCase) {
     assert_eq!(msg.get_text(), stock_str::securejoin_wait(&bob).await);
     let msg = get_chat_msg(&bob, bob_chat.get_id(), i.next().unwrap(), msg_cnt).await;
     assert!(msg.is_info());
-    assert_eq!(msg.get_text(), chat_protection_enabled(&bob).await);
+    assert_eq!(msg.get_text(), messages_e2e_encrypted(&bob).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -360,6 +359,30 @@ async fn test_setup_contact_bob_knows_alice() -> Result<()> {
     tcm.section("Step 5+6: Alice receives vc-request-with-auth, sends vc-contact-confirm");
     alice.recv_msg_trash(&sent).await;
     assert_eq!(contact_bob.is_verified(alice).await?, true);
+
+    // Check Alice signalled success via the SecurejoinInviterProgress event.
+    let event = alice
+        .evtracker
+        .get_matching(|evt| {
+            matches!(
+                evt,
+                EventType::SecurejoinInviterProgress { progress: 1000, .. }
+            )
+        })
+        .await;
+    match event {
+        EventType::SecurejoinInviterProgress {
+            contact_id,
+            chat_type,
+            progress,
+            ..
+        } => {
+            assert_eq!(contact_id, contact_bob.id);
+            assert_eq!(chat_type, Chattype::Single);
+            assert_eq!(progress, 1000);
+        }
+        _ => unreachable!(),
+    }
 
     let sent = alice.pop_sent_msg().await;
     let msg = bob.parse_msg(&sent).await;
@@ -511,6 +534,31 @@ async fn test_secure_join() -> Result<()> {
     alice.recv_msg_trash(&sent).await;
     assert_eq!(contact_bob.is_verified(&alice).await?, true);
 
+    // Check Alice signalled success via the SecurejoinInviterProgress event.
+    let event = alice
+        .evtracker
+        .get_matching(|evt| {
+            matches!(
+                evt,
+                EventType::SecurejoinInviterProgress { progress: 1000, .. }
+            )
+        })
+        .await;
+    match event {
+        EventType::SecurejoinInviterProgress {
+            contact_id,
+            chat_type,
+            chat_id,
+            progress,
+        } => {
+            assert_eq!(contact_id, contact_bob.id);
+            assert_eq!(chat_type, Chattype::Group);
+            assert_eq!(chat_id, alice_chatid);
+            assert_eq!(progress, 1000);
+        }
+        _ => unreachable!(),
+    }
+
     let sent = alice.pop_sent_msg().await;
     let msg = bob.parse_msg(&sent).await;
     assert!(msg.was_encrypted());
@@ -540,7 +588,7 @@ async fn test_secure_join() -> Result<()> {
         // - You added member bob@example.net
         let msg = get_chat_msg(&alice, alice_chatid, 0, 2).await;
         assert!(msg.is_info());
-        let expected_text = chat_protection_enabled(&alice).await;
+        let expected_text = messages_e2e_encrypted(&alice).await;
         assert_eq!(msg.get_text(), expected_text);
     }
 
@@ -634,7 +682,7 @@ async fn test_unknown_sender() -> Result<()> {
     // The message from Bob is delivered late, Bob is already removed.
     let msg = alice.recv_msg(&sent).await;
     assert_eq!(msg.text, "Hi hi!");
-    assert_eq!(msg.error.unwrap(), "Unknown sender for this chat.");
+    assert_eq!(msg.get_override_sender_name().unwrap(), "bob@example.net");
 
     Ok(())
 }
@@ -649,11 +697,6 @@ async fn test_lost_contact_confirm() {
     let mut tcm = TestContextManager::new();
     let alice = tcm.alice().await;
     let bob = tcm.bob().await;
-    for t in [&alice, &bob] {
-        t.set_config_bool(Config::VerifiedOneOnOneChats, true)
-            .await
-            .unwrap();
-    }
 
     let qr = get_securejoin_qr(&alice, None).await.unwrap();
     join_securejoin(&bob.ctx, &qr).await.unwrap();

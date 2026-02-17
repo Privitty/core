@@ -5,10 +5,12 @@ on:
     paths:
       - flake.nix
       - flake.lock
+      - .github/workflows/nix.yml
   push:
     paths:
       - flake.nix
       - flake.lock
+      - .github/workflows/nix.yml
     branches:
       - main
 
@@ -19,15 +21,12 @@ jobs:
     name: check flake formatting
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
-      - run: nix fmt
-
-      # Check that formatting does not change anything.
-      - run: git diff --exit-code
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
+      - run: nix fmt flake.nix -- --check
 
   build:
     name: nix build
@@ -81,11 +80,11 @@ jobs:
           #- deltachat-rpc-server-x86_64-android
           #- deltachat-rpc-server-x86-android
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
       - run: nix build .#${{ matrix.installable }}
 
   build-macos:
@@ -101,9 +100,9 @@ jobs:
           # - deltachat-rpc-server-aarch64-darwin
           # - deltachat-rpc-server-x86_64-darwin
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
       - run: nix build .#${{ matrix.installable }}

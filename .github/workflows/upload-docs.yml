@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
@@ -31,12 +31,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
           fetch-depth: 0 # Fetch history to calculate VCS version number.
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
       - name: Build Python documentation
         run: nix build .#python-docs
       - name: Upload to py.delta.chat
@@ -50,12 +50,12 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
           fetch-depth: 0 # Fetch history to calculate VCS version number.
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: cachix/install-nix-action@7ab6e7fd29da88e74b1e314a4ae9ac6b5cda3801 # v31
       - name: Build C documentation
         run: nix build .#docs
       - name: Upload to c.delta.chat
@@ -72,13 +72,13 @@ jobs:
         working-directory: ./deltachat-jsonrpc/typescript
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           show-progress: false
           persist-credentials: false
           fetch-depth: 0 # Fetch history to calculate VCS version number.
       - name: Use Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: '18'
       - name: npm install

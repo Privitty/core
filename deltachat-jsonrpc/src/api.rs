@@ -8,6 +8,7 @@ use std::{collections::HashMap, str::FromStr};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 pub use deltachat::accounts::Accounts;
 use deltachat::blob::BlobObject;
+use deltachat::calls::ice_servers;
 use deltachat::chat::{
     self, add_contact_to_chat, forward_msgs, get_chat_media, get_chat_msgs, get_chat_msgs_ex,
     marknoticed_chat, remove_contact_from_chat, Chat, ChatId, ChatItem, MessageListOptions,
@@ -47,6 +48,7 @@ pub mod types;
 
 use num_traits::FromPrimitive;
 use types::account::Account;
+use types::calls::JsonrpcCallInfo;
 use types::chat::FullChat;
 use types::contact::{ContactObject, VcardContact};
 use types::events::Event;
@@ -91,7 +93,8 @@ pub struct CommandApi {
 
     /// Receiver side of the event channel.
     ///
-    /// Events from it can be received by calling `get_next_event` method.
+    /// Events from it can be received by calling
+    /// [`CommandApi::get_next_event`] method.
     event_emitter: Arc<EventEmitter>,
 
     states: Arc<Mutex<BTreeMap<u32, AccountState>>>,
@@ -123,7 +126,7 @@ impl CommandApi {
             .read()
             .await
             .get_account(id)
-            .ok_or_else(|| anyhow!("account with id {} not found", id))?;
+            .ok_or_else(|| anyhow!("account with id {id} not found"))?;
         Ok(sc)
     }
 
@@ -173,7 +176,15 @@ impl CommandApi {
         get_info()
     }
 
-    /// Get the next event.
+    /// Get the next event, and remove it from the event queue.
+    ///
+    /// If no events have happened since the last `get_next_event`
+    /// (i.e. if the event queue is empty), the response will be returned
+    /// only when a new event fires.
+    ///
+    /// Note that if you are using the `BaseDeltaChat` JavaScript class
+    /// or the `Rpc` Python class, this function will be invoked
+    /// by those classes internally and should not be used manually.
     async fn get_next_event(&self) -> Result<Event> {
         self.event_emitter
             .recv()
@@ -222,6 +233,14 @@ impl CommandApi {
     /// Get the selected account from the account manager (on startup it is read from accounts.toml)
     async fn get_selected_account_id(&self) -> Option<u32> {
         self.accounts.read().await.get_selected_account_id()
+    }
+
+    /// Set the order of accounts.
+    /// The provided list should contain all account IDs in the desired order.
+    /// If an account ID is missing from the list, it will be appended at the end.
+    /// If the list contains non-existent account IDs, they will be ignored.
+    async fn set_accounts_order(&self, order: Vec<u32>) -> Result<()> {
+        self.accounts.write().await.set_accounts_order(order).await
     }
 
     /// Get a list of all configured accounts.
@@ -289,8 +308,7 @@ impl CommandApi {
             Ok(Account::from_context(&ctx, account_id).await?)
         } else {
             Err(anyhow!(
-                "account with id {} doesn't exist anymore",
-                account_id
+                "account with id {account_id} doesn't exist anymore"
             ))
         }
     }
@@ -926,7 +944,7 @@ impl CommandApi {
     ///   explicitly as it may happen that oneself gets removed from a still existing
     ///   group
     ///
-    /// - for broadcasts, all recipients are returned, DC_CONTACT_ID_SELF is not included
+    /// - for broadcast channels, all recipients are returned, DC_CONTACT_ID_SELF is not included
     ///
     /// - for mailing lists, the behavior is not documented currently, we will decide on that later.
     ///   for now, the UI should not show the list for mailing lists.
@@ -945,7 +963,7 @@ impl CommandApi {
         Ok(contacts.iter().map(|id| id.to_u32()).collect::<Vec<u32>>())
     }
 
-    /// Create a new group chat.
+    /// Create a new encrypted group chat (with key-contacts).
     ///
     /// After creation,
     /// the group has one member with the ID DC_CONTACT_ID_SELF
@@ -963,30 +981,52 @@ impl CommandApi {
     ///
     /// @param protect If set to 1 the function creates group with protection initially enabled.
     ///     Only verified members are allowed in these groups
-    ///     and end-to-end-encryption is always enabled.
     async fn create_group_chat(&self, account_id: u32, name: String, protect: bool) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
         let protect = match protect {
             true => ProtectionStatus::Protected,
             false => ProtectionStatus::Unprotected,
         };
-        chat::create_group_chat(&ctx, protect, &name)
+        chat::create_group_ex(&ctx, Some(protect), &name)
             .await
             .map(|id| id.to_u32())
     }
 
-    /// Create a new broadcast list.
+    /// Create a new unencrypted group chat.
     ///
-    /// Broadcast lists are similar to groups on the sending device,
-    /// however, recipients get the messages in a read-only chat
-    /// and will see who the other members are.
-    ///
-    /// For historical reasons, this function does not take a name directly,
-    /// instead you have to set the name using dc_set_chat_name()
-    /// after creating the broadcast list.
-    async fn create_broadcast_list(&self, account_id: u32) -> Result<u32> {
+    /// Same as [`Self::create_group_chat`], but the chat is unencrypted and can only have
+    /// address-contacts.
+    async fn create_group_chat_unencrypted(&self, account_id: u32, name: String) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        chat::create_broadcast_list(&ctx)
+        chat::create_group_ex(&ctx, None, &name)
+            .await
+            .map(|id| id.to_u32())
+    }
+
+    /// Deprecated 2025-07 in favor of create_broadcast().
+    async fn create_broadcast_list(&self, account_id: u32) -> Result<u32> {
+        self.create_broadcast(account_id, "Channel".to_string())
+            .await
+    }
+
+    /// Create a new **broadcast channel**
+    /// (called "Channel" in the UI).
+    ///
+    /// Broadcast channels are similar to groups on the sending device,
+    /// however, recipients get the messages in a read-only chat
+    /// and will not see who the other members are.
+    ///
+    /// Called `broadcast` here rather than `channel`,
+    /// because the word "channel" already appears a lot in the code,
+    /// which would make it hard to grep for it.
+    ///
+    /// After creation, the chat contains no recipients and is in _unpromoted_ state;
+    /// see [`CommandApi::create_group_chat`] for more information on the unpromoted state.
+    ///
+    /// Returns the created chat's id.
+    async fn create_broadcast(&self, account_id: u32, chat_name: String) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        chat::create_broadcast(&ctx, chat_name)
             .await
             .map(|id| id.to_u32())
     }
@@ -1197,8 +1237,10 @@ impl CommandApi {
     }
 
     /// Returns all messages of a particular chat.
-    /// If `add_daymarker` is `true`, it will return them as
-    /// `DC_MSG_ID_DAYMARKER`, e.g. [1234, 1237, 9, 1239].
+    ///
+    /// * `add_daymarker` - If `true`, add day markers as `DC_MSG_ID_DAYMARKER` to the result,
+    ///   e.g. [1234, 1237, 9, 1239]. The day marker timestamp is the midnight one for the
+    ///   corresponding (following) day in the local timezone.
     async fn get_message_ids(
         &self,
         account_id: u32,
@@ -1441,7 +1483,14 @@ impl CommandApi {
 
     /// Add a single contact as a result of an explicit user action.
     ///
-    /// Returns contact id of the created or existing contact
+    /// This will always create or look up an address-contact,
+    /// i.e. a contact identified by an email address,
+    /// with all messages sent to and from this contact being unencrypted.
+    /// If the user just clicked on an email address,
+    /// you should first check [`Self::lookup_contact_id_by_addr`]/`lookupContactIdByAddr.`,
+    /// and only if there is no contact yet, call this function here.
+    ///
+    /// Returns contact id of the created or existing contact.
     async fn create_contact(
         &self,
         account_id: u32,
@@ -1493,6 +1542,14 @@ impl CommandApi {
         Ok(contacts)
     }
 
+    /// Returns ids of known and unblocked contacts.
+    ///
+    /// By default, key-contacts are listed.
+    ///
+    /// * `list_flags` - A combination of flags:
+    ///   - `DC_GCL_ADD_SELF` - Add SELF unless filtered by other parameters.
+    ///   - `DC_GCL_ADDRESS` - List address-contacts instead of key-contacts.
+    /// * `query` - A string to filter the list.
     async fn get_contact_ids(
         &self,
         account_id: u32,
@@ -1504,8 +1561,10 @@ impl CommandApi {
         Ok(contacts.into_iter().map(|c| c.to_u32()).collect())
     }
 
-    /// Get a list of contacts.
-    /// (formerly called getContacts2 in desktop)
+    /// Returns known and unblocked contacts.
+    ///
+    /// Formerly called `getContacts2` in Desktop.
+    /// See [`Self::get_contact_ids`] for parameters and more info.
     async fn get_contacts(
         &self,
         account_id: u32,
@@ -1581,8 +1640,18 @@ impl CommandApi {
         Contact::get_encrinfo(&ctx, ContactId::new(contact_id)).await
     }
 
-    /// Check if an e-mail address belongs to a known and unblocked contact.
+    /// Looks up a known and unblocked contact with a given e-mail address.
     /// To get a list of all known and unblocked contacts, use contacts_get_contacts().
+    ///
+    /// **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+    /// (e.g. an address-contact and a key-contact),
+    /// this looks up the most recently seen contact,
+    /// i.e. which contact is returned depends on which contact last sent a message.
+    /// If the user just clicked on a mailto: link, then this is the best thing you can do.
+    /// But **DO NOT** internally represent contacts by their email address
+    /// and do not use this function to look them up;
+    /// otherwise this function will sometimes look up the wrong contact.
+    /// Instead, you should internally represent contacts by their ids.
     ///
     /// To validate an e-mail address independently of the contact database
     /// use check_email_validity().
@@ -1739,13 +1808,13 @@ impl CommandApi {
 
     /// Offers a backup for remote devices to retrieve.
     ///
-    /// Can be cancelled by stopping the ongoing process.  Success or failure can be tracked
+    /// Can be canceled by stopping the ongoing process.  Success or failure can be tracked
     /// via the `ImexProgress` event which should either reach `1000` for success or `0` for
     /// failure.
     ///
     /// This **stops IO** while it is running.
     ///
-    /// Returns once a remote device has retrieved the backup, or is cancelled.
+    /// Returns once a remote device has retrieved the backup, or is canceled.
     async fn provide_backup(&self, account_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
 
@@ -1811,7 +1880,7 @@ impl CommandApi {
     /// This retrieves the backup from a remote device over the network and imports it into
     /// the current device.
     ///
-    /// Can be cancelled by stopping the ongoing process.
+    /// Can be canceled by stopping the ongoing process.
     ///
     /// Do not forget to call start_io on the account after a successful import,
     /// otherwise it will not connect to the email server.
@@ -1849,7 +1918,7 @@ impl CommandApi {
     /// If the connectivity changes, a #DC_EVENT_CONNECTIVITY_CHANGED will be emitted.
     async fn get_connectivity(&self, account_id: u32) -> Result<u32> {
         let ctx = self.get_context(account_id).await?;
-        Ok(ctx.get_connectivity().await as u32)
+        Ok(ctx.get_connectivity() as u32)
     }
 
     /// Get an overview of the current connectivity, and possibly more statistics.
@@ -1932,6 +2001,11 @@ impl CommandApi {
         Ok(())
     }
 
+    /// Leaves the gossip of the webxdc with the given message id.
+    ///
+    /// NB: When this is called before closing a webxdc app in UIs, it must be guaranteed that
+    /// `send_webxdc_realtime_*()` functions aren't called for the given `instance_message_id`
+    /// anymore until the app is open again.
     async fn leave_webxdc_realtime(&self, account_id: u32, instance_message_id: u32) -> Result<()> {
         let ctx = self.get_context(account_id).await?;
         leave_webxdc_realtime(&ctx, MsgId::new(instance_message_id)).await
@@ -2007,6 +2081,53 @@ impl CommandApi {
             .init_webxdc_integration(chat_id.map(ChatId::new))
             .await?
             .map(|msg_id| msg_id.to_u32()))
+    }
+
+    /// Starts an outgoing call.
+    async fn place_outgoing_call(
+        &self,
+        account_id: u32,
+        chat_id: u32,
+        place_call_info: String,
+    ) -> Result<u32> {
+        let ctx = self.get_context(account_id).await?;
+        let msg_id = ctx
+            .place_outgoing_call(ChatId::new(chat_id), place_call_info)
+            .await?;
+        Ok(msg_id.to_u32())
+    }
+
+    /// Accepts an incoming call.
+    async fn accept_incoming_call(
+        &self,
+        account_id: u32,
+        msg_id: u32,
+        accept_call_info: String,
+    ) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.accept_incoming_call(MsgId::new(msg_id), accept_call_info)
+            .await?;
+        Ok(())
+    }
+
+    /// Ends incoming or outgoing call.
+    async fn end_call(&self, account_id: u32, msg_id: u32) -> Result<()> {
+        let ctx = self.get_context(account_id).await?;
+        ctx.end_call(MsgId::new(msg_id)).await?;
+        Ok(())
+    }
+
+    /// Returns information about the call.
+    async fn call_info(&self, account_id: u32, msg_id: u32) -> Result<JsonrpcCallInfo> {
+        let ctx = self.get_context(account_id).await?;
+        let call_info = JsonrpcCallInfo::from_msg_id(&ctx, MsgId::new(msg_id)).await?;
+        Ok(call_info)
+    }
+
+    /// Returns JSON with ICE servers, to be used for WebRTC video calls.
+    async fn ice_servers(&self, account_id: u32) -> Result<String> {
+        let ctx = self.get_context(account_id).await?;
+        ice_servers(&ctx).await
     }
 
     /// Makes an HTTP GET request and returns a response.
@@ -2160,13 +2281,6 @@ impl CommandApi {
         }
     }
 
-    async fn send_videochat_invitation(&self, account_id: u32, chat_id: u32) -> Result<u32> {
-        let ctx = self.get_context(account_id).await?;
-        chat::send_videochat_invitation(&ctx, ChatId::new(chat_id))
-            .await
-            .map(|msg_id| msg_id.to_u32())
-    }
-
     // ---------------------------------------------
     //           misc prototyping functions
     //       that might get removed later again
@@ -2197,8 +2311,7 @@ impl CommandApi {
         let message = Message::load_from_db(&ctx, MsgId::new(msg_id)).await?;
         ensure!(
             message.get_viewtype() == Viewtype::Sticker,
-            "message {} is not a sticker",
-            msg_id
+            "message {msg_id} is not a sticker"
         );
         let account_folder = ctx
             .get_dbfile()
@@ -2418,10 +2531,7 @@ impl CommandApi {
                 .to_u32();
             Ok(msg_id)
         } else {
-            Err(anyhow!(
-                "chat with id {} doesn't have draft message",
-                chat_id
-            ))
+            Err(anyhow!("chat with id {chat_id} doesn't have draft message"))
         }
     }
 }

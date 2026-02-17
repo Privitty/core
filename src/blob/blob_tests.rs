@@ -4,7 +4,7 @@ use super::*;
 use crate::message::{Message, Viewtype};
 use crate::param::Param;
 use crate::sql;
-use crate::test_utils::{self, TestContext};
+use crate::test_utils::{self, AVATAR_64x64_BYTES, AVATAR_64x64_DEDUPLICATED, TestContext};
 use crate::tools::SystemTime;
 
 fn check_image_size(path: impl AsRef<Path>, width: u32, height: u32) -> image::DynamicImage {
@@ -140,9 +140,9 @@ async fn test_add_white_bg() {
 
         let mut blob = BlobObject::create_and_deduplicate(&t, &avatar_src, &avatar_src).unwrap();
         let img_wh = 128;
-        let maybe_sticker = &mut false;
+        let viewtype = &mut Viewtype::Image;
         let strict_limits = true;
-        blob.recode_to_size(&t, None, maybe_sticker, img_wh, 20_000, strict_limits)
+        blob.check_or_recode_to_size(&t, None, viewtype, img_wh, 20_000, strict_limits)
             .unwrap();
         tokio::task::block_in_place(move || {
             let img = ImageReader::open(blob.to_abs_path())
@@ -188,9 +188,9 @@ async fn test_selfavatar_outside_blobdir() {
     );
 
     let mut blob = BlobObject::create_and_deduplicate(&t, avatar_path, avatar_path).unwrap();
-    let maybe_sticker = &mut false;
+    let viewtype = &mut Viewtype::Image;
     let strict_limits = true;
-    blob.recode_to_size(&t, None, maybe_sticker, 1000, 3000, strict_limits)
+    blob.check_or_recode_to_size(&t, None, viewtype, 1000, 3000, strict_limits)
         .unwrap();
     let new_file_size = file_size(&blob.to_abs_path()).await;
     assert!(new_file_size <= 3000);
@@ -241,9 +241,8 @@ async fn test_selfavatar_in_blobdir() {
 async fn test_selfavatar_copy_without_recode() {
     let t = TestContext::new().await;
     let avatar_src = t.dir.path().join("avatar.png");
-    let avatar_bytes = include_bytes!("../../test-data/image/avatar64x64.png");
-    fs::write(&avatar_src, avatar_bytes).await.unwrap();
-    let avatar_blob = t.get_blobdir().join("e9b6c7a78aa2e4f415644f55a553e73.png");
+    fs::write(&avatar_src, AVATAR_64x64_BYTES).await.unwrap();
+    let avatar_blob = t.get_blobdir().join(AVATAR_64x64_DEDUPLICATED);
     assert!(!avatar_blob.exists());
     t.set_config(Config::Selfavatar, Some(avatar_src.to_str().unwrap()))
         .await
@@ -251,7 +250,7 @@ async fn test_selfavatar_copy_without_recode() {
     assert!(avatar_blob.exists());
     assert_eq!(
         fs::metadata(&avatar_blob).await.unwrap().len(),
-        avatar_bytes.len() as u64
+        AVATAR_64x64_BYTES.len() as u64
     );
     let avatar_cfg = t.get_config(Config::Selfavatar).await.unwrap();
     assert_eq!(avatar_cfg, avatar_blob.to_str().map(|s| s.to_string()));
@@ -336,6 +335,28 @@ async fn test_recode_image_2() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recode_image_bad_exif() {
+    // `exiftool` reports for this file "Bad offset for IFD0 XResolution", still Exif must be
+    // detected and removed.
+    let bytes = include_bytes!("../../test-data/image/1000x1000-bad-exif.jpg");
+    SendImageCheckMediaquality {
+        viewtype: Viewtype::Image,
+        media_quality_config: "0",
+        bytes,
+        extension: "jpg",
+        has_exif: true,
+        original_width: 1000,
+        original_height: 1000,
+        compressed_width: 1000,
+        compressed_height: 1000,
+        ..Default::default()
+    }
+    .test()
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recode_image_balanced_png() {
     let bytes = include_bytes!("../../test-data/image/screenshot.png");
 
@@ -400,7 +421,7 @@ async fn test_recode_image_balanced_png() {
     .await
     .unwrap();
 
-    // This will be sent as Image, see [`BlobObject::maybe_sticker`] for explanation.
+    // This will be sent as Image, see [`BlobObject::check_or_recode_image()`] for explanation.
     SendImageCheckMediaquality {
         viewtype: Viewtype::Sticker,
         media_quality_config: "0",
@@ -410,6 +431,28 @@ async fn test_recode_image_balanced_png() {
         original_height: 1080,
         compressed_width: 1920,
         compressed_height: 1080,
+        ..Default::default()
+    }
+    .test()
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sticker_with_exif() {
+    let bytes = include_bytes!("../../test-data/image/logo-exif.png");
+    SendImageCheckMediaquality {
+        viewtype: Viewtype::Sticker,
+        bytes,
+        extension: "png",
+        // TODO: Pretend there's no Exif. Currently `exif` crate doesn't detect Exif in this image,
+        // so the test doesn't check all the logic it should.
+        has_exif: false,
+        original_width: 135,
+        original_height: 135,
+        res_viewtype: Some(Viewtype::Sticker),
+        compressed_width: 135,
+        compressed_height: 135,
         ..Default::default()
     }
     .test()
@@ -486,6 +529,7 @@ struct SendImageCheckMediaquality<'a> {
     pub(crate) original_width: u32,
     pub(crate) original_height: u32,
     pub(crate) orientation: i32,
+    pub(crate) res_viewtype: Option<Viewtype>,
     pub(crate) compressed_width: u32,
     pub(crate) compressed_height: u32,
     pub(crate) set_draft: bool,
@@ -501,6 +545,7 @@ impl SendImageCheckMediaquality<'_> {
         let original_width = self.original_width;
         let original_height = self.original_height;
         let orientation = self.orientation;
+        let res_viewtype = self.res_viewtype.unwrap_or(Viewtype::Image);
         let compressed_width = self.compressed_width;
         let compressed_height = self.compressed_height;
         let set_draft = self.set_draft;
@@ -551,7 +596,7 @@ impl SendImageCheckMediaquality<'_> {
         }
 
         let bob_msg = bob.recv_msg(&sent).await;
-        assert_eq!(bob_msg.get_viewtype(), Viewtype::Image);
+        assert_eq!(bob_msg.get_viewtype(), res_viewtype);
         assert_eq!(bob_msg.get_width() as u32, compressed_width);
         assert_eq!(bob_msg.get_height() as u32, compressed_height);
         let file_saved = bob
@@ -565,7 +610,7 @@ impl SendImageCheckMediaquality<'_> {
         }
 
         let (_, exif) = image_metadata(&std::fs::File::open(&file_saved)?)?;
-        assert!(exif.is_none());
+        assert!(res_viewtype != Viewtype::Image || exif.is_none());
 
         let img = check_image_size(file_saved, compressed_width, compressed_height);
 

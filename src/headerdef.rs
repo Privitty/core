@@ -86,6 +86,7 @@ pub enum HeaderDef {
 
     ChatDispositionNotificationTo,
     ChatWebrtcRoom,
+    ChatWebrtcAccepted,
 
     /// This message deletes the messages listed in the value by rfc724_mid.
     ChatDelete,
@@ -118,6 +119,11 @@ pub enum HeaderDef {
     AuthenticationResults,
 
     /// Node address from iroh where direct addresses have been removed.
+    ///
+    /// The node address sent in this header must have
+    /// a non-null relay URL as contacting home relay
+    /// is the only way to reach the node without
+    /// direct addresses and global discovery.
     IrohNodeAddr,
 
     /// Advertised gossip topic for one webxdc.

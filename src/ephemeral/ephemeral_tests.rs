@@ -128,31 +128,33 @@ async fn test_stock_ephemeral_messages() {
 /// Test enabling and disabling ephemeral timer remotely.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ephemeral_enable_disable() -> Result<()> {
-    let alice = TestContext::new_alice().await;
-    let bob = TestContext::new_bob().await;
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
 
-    let chat_alice = alice.create_chat(&bob).await.id;
-    let chat_bob = bob.create_chat(&alice).await.id;
+    let chat_alice = alice.create_chat(bob).await.id;
+    let chat_bob = bob.create_chat(alice).await.id;
 
     chat_alice
-        .set_ephemeral_timer(&alice.ctx, Timer::Enabled { duration: 60 })
+        .set_ephemeral_timer(alice, Timer::Enabled { duration: 60 })
         .await?;
     let sent = alice.pop_sent_msg().await;
-    bob.recv_msg(&sent).await;
+    let bob_received_message = bob.recv_msg(&sent).await;
     assert_eq!(
-        chat_bob.get_ephemeral_timer(&bob.ctx).await?,
+        bob_received_message.text,
+        "Message deletion timer is set to 1 minute by alice@example.org."
+    );
+    assert_eq!(
+        chat_bob.get_ephemeral_timer(bob).await?,
         Timer::Enabled { duration: 60 }
     );
 
     chat_alice
-        .set_ephemeral_timer(&alice.ctx, Timer::Disabled)
+        .set_ephemeral_timer(alice, Timer::Disabled)
         .await?;
     let sent = alice.pop_sent_msg().await;
     bob.recv_msg(&sent).await;
-    assert_eq!(
-        chat_bob.get_ephemeral_timer(&bob.ctx).await?,
-        Timer::Disabled
-    );
+    assert_eq!(chat_bob.get_ephemeral_timer(bob).await?, Timer::Disabled);
 
     Ok(())
 }
@@ -821,6 +823,71 @@ async fn test_ephemeral_timer_non_member() -> Result<()> {
         alice_chat_id.get_ephemeral_timer(alice).await?,
         Timer::Disabled
     );
+
+    Ok(())
+}
+
+/// Tests that expiration of a disappearing message
+/// with unknown viewtype does not make `delete_expired_messages` fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_disappearing_unknown_viewtype() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let chat = alice.create_chat(bob).await;
+
+    let duration = 60;
+    chat.id
+        .set_ephemeral_timer(alice, Timer::Enabled { duration })
+        .await?;
+
+    let mut msg = Message::new_text("Expiring message".to_string());
+    let _alice_sent_message = alice.send_msg(chat.id, &mut msg).await;
+
+    // Set message viewtype to unassigned
+    // type 70 that was previously used for videochat invitations.
+    alice
+        .sql
+        .execute("UPDATE msgs SET type=70 WHERE id=?", (msg.id,))
+        .await?;
+
+    SystemTime::shift(Duration::from_secs(100));
+
+    // This should not fail.
+    delete_expired_messages(alice, time()).await?;
+
+    Ok(())
+}
+
+/// Tests that deletion of a message with unknown viewtype
+/// triggered by `delete_device_after`
+/// does not make `delete_expired_messages` fail.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_delete_device_after_unknown_viewtype() -> Result<()> {
+    let mut tcm = TestContextManager::new();
+    let alice = &tcm.alice().await;
+    let bob = &tcm.bob().await;
+
+    let chat = alice.create_chat(bob).await;
+    alice
+        .set_config(Config::DeleteDeviceAfter, Some("600"))
+        .await?;
+
+    let mut msg = Message::new_text("Some message".to_string());
+    let _alice_sent_message = alice.send_msg(chat.id, &mut msg).await;
+
+    // Set message viewtype to unassigned
+    // type 70 that was previously used for videochat invitations.
+    alice
+        .sql
+        .execute("UPDATE msgs SET type=70 WHERE id=?", (msg.id,))
+        .await?;
+
+    SystemTime::shift(Duration::from_secs(1000));
+
+    // This should not fail.
+    delete_expired_messages(alice, time()).await?;
 
     Ok(())
 }

@@ -2,12 +2,12 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::Cursor;
-use std::path::Path;
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, bail, ensure};
 use base64::Engine as _;
-use chrono::TimeZone;
+use data_encoding::BASE32_NOPAD;
 use deltachat_contact_tools::sanitize_bidi_characters;
+use iroh_gossip::proto::TopicId;
 use mail_builder::headers::HeaderType;
 use mail_builder::headers::address::{Address, EmailAddress};
 use mail_builder::mime::MimePart;
@@ -22,15 +22,16 @@ use crate::constants::{Chattype, DC_FROM_HANDSHAKE};
 use crate::contact::{Contact, ContactId, Origin};
 use crate::context::Context;
 use crate::e2ee::EncryptHelper;
+use crate::ensure_and_debug_assert;
 use crate::ephemeral::Timer as EphemeralTimer;
-use crate::key::self_fingerprint;
-use crate::key::{DcKey, SignedPublicKey};
+use crate::headerdef::HeaderDef;
+use crate::key::{DcKey, SignedPublicKey, self_fingerprint};
 use crate::location;
 use crate::log::{info, warn};
-use crate::message::{self, Message, MsgId, Viewtype};
+use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::{SystemMessage, is_hidden};
 use crate::param::Param;
-use crate::peer_channels::create_iroh_header;
+use crate::peer_channels::{create_iroh_header, get_iroh_topic_for_msg};
 use crate::simplify::escape_message_footer_marks;
 use crate::stock_str;
 use crate::tools::{
@@ -80,7 +81,7 @@ pub struct MimeFactory {
     /// because in case of "member removed" message
     /// removed member is in the recipient list,
     /// but not in the `To` header.
-    /// In case of broadcast lists there are multiple recipients,
+    /// In case of broadcast channels there are multiple recipients,
     /// but the `To` header has no members.
     ///
     /// If `bcc_self` configuration is enabled,
@@ -98,7 +99,7 @@ pub struct MimeFactory {
     /// Vector of pairs of recipient name and address that goes into the `To` field.
     ///
     /// The list of actual message recipient addresses may be different,
-    /// e.g. if members are hidden for broadcast lists
+    /// e.g. if members are hidden for broadcast channels
     /// or if the keys for some recipients are missing
     /// and encrypted message cannot be sent to them.
     to: Vec<(String, String)>,
@@ -141,6 +142,9 @@ pub struct MimeFactory {
 
     /// True if the avatar should be attached.
     pub attach_selfavatar: bool,
+
+    /// This field is used to sustain the topic id of webxdcs needed for peer channels.
+    webxdc_topic: Option<TopicId>,
 }
 
 /// Result of rendering a message, ready to be submitted to a send job.
@@ -178,7 +182,7 @@ impl MimeFactory {
         let now = time();
         let chat = Chat::load_from_db(context, msg.chat_id).await?;
         let attach_profile_data = Self::should_attach_profile_data(&msg);
-        let undisclosed_recipients = chat.typ == Chattype::Broadcast;
+        let undisclosed_recipients = chat.typ == Chattype::OutBroadcast;
 
         let from_addr = context.get_primary_self_addr().await?;
         let config_displayname = context
@@ -249,6 +253,10 @@ impl MimeFactory {
             let mut missing_key_addresses = BTreeSet::new();
             context
                 .sql
+                // Sort recipients by `add_timestamp DESC` so that if the group is large and there
+                // are multiple SMTP messages, a newly added member receives the member addition
+                // message earlier and has gossiped keys of other members (otherwise the new member
+                // may receive messages from other members earlier and fail to verify them).
                 .query_map(
                     "SELECT
                      c.authname,
@@ -262,7 +270,8 @@ impl MimeFactory {
                      LEFT JOIN contacts c ON cc.contact_id=c.id
                      LEFT JOIN public_keys k ON k.fingerprint=c.fingerprint
                      WHERE cc.chat_id=?
-                     AND (cc.contact_id>9 OR (cc.contact_id=1 AND ?))",
+                     AND (cc.contact_id>9 OR (cc.contact_id=1 AND ?))
+                     ORDER BY cc.add_timestamp DESC",
                     (msg.chat_id, chat.typ == Chattype::Group),
                     |row| {
                         let authname: String = row.get(0)?;
@@ -310,7 +319,7 @@ impl MimeFactory {
                                             } else if id == ContactId::SELF {
                                                 member_fingerprints.push(self_fingerprint.to_string());
                                             } else {
-                                                debug_assert!(member_fingerprints.is_empty(), "If some past member is a key-contact, all other past members should be key-contacts too");
+                                                ensure_and_debug_assert!(member_fingerprints.is_empty(), "If some past member is a key-contact, all other past members should be key-contacts too");
                                             }
                                         }
                                         member_timestamps.push(add_timestamp);
@@ -361,7 +370,7 @@ impl MimeFactory {
                                                 // if we are leaving the group.
                                                 past_member_fingerprints.push(self_fingerprint.to_string());
                                             } else {
-                                                debug_assert!(past_member_fingerprints.is_empty(), "If some past member is a key-contact, all other past members should be key-contacts too");
+                                                ensure_and_debug_assert!(past_member_fingerprints.is_empty(), "If some past member is a key-contact, all other past members should be key-contacts too");
                                             }
                                         }
                                     }
@@ -369,8 +378,14 @@ impl MimeFactory {
                             }
                         }
 
-                        debug_assert!(member_timestamps.len() >= to.len());
-                        debug_assert!(member_fingerprints.is_empty() || member_fingerprints.len() >= to.len());
+                        ensure_and_debug_assert!(
+                            member_timestamps.len() >= to.len(),
+                            "member_timestamps.len() ({}) < to.len() ({})",
+                            member_timestamps.len(), to.len());
+                        ensure_and_debug_assert!(
+                            member_fingerprints.is_empty() || member_fingerprints.len() >= to.len(),
+                            "member_fingerprints.len() ({}) < to.len() ({})",
+                            member_fingerprints.len(), to.len());
 
                         if to.len() > 1 {
                             if let Some(position) = to.iter().position(|(_, x)| x == &from_addr) {
@@ -404,10 +419,7 @@ impl MimeFactory {
                 None
             } else {
                 if keys.is_empty() && !recipients.is_empty() {
-                    bail!(
-                        "No recipient keys are available, cannot encrypt to {:?}.",
-                        recipients
-                    );
+                    bail!("No recipient keys are available, cannot encrypt to {recipients:?}.");
                 }
 
                 // Remove recipients for which the key is missing.
@@ -447,11 +459,15 @@ impl MimeFactory {
         };
         let attach_selfavatar = Self::should_attach_selfavatar(context, &msg).await;
 
-        debug_assert!(
+        ensure_and_debug_assert!(
             member_timestamps.is_empty()
-                || to.len() + past_members.len() == member_timestamps.len()
+                || to.len() + past_members.len() == member_timestamps.len(),
+            "to.len() ({}) + past_members.len() ({}) != member_timestamps.len() ({})",
+            to.len(),
+            past_members.len(),
+            member_timestamps.len(),
         );
-
+        let webxdc_topic = get_iroh_topic_for_msg(context, msg.id).await?;
         let factory = MimeFactory {
             from_addr,
             from_displayname,
@@ -471,6 +487,7 @@ impl MimeFactory {
             last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar,
+            webxdc_topic,
         };
         Ok(factory)
     }
@@ -518,6 +535,7 @@ impl MimeFactory {
             last_added_location_id: None,
             sync_ids_to_delete: None,
             attach_selfavatar: false,
+            webxdc_topic: None,
         };
 
         Ok(res)
@@ -528,7 +546,7 @@ impl MimeFactory {
             Loaded::Message { msg, .. } => {
                 msg.param.get_bool(Param::SkipAutocrypt).unwrap_or_default()
             }
-            Loaded::Mdn { .. } => true,
+            Loaded::Mdn { .. } => false,
         }
     }
 
@@ -599,7 +617,7 @@ impl MimeFactory {
                     return Ok(msg.subject.clone());
                 }
 
-                if (chat.typ == Chattype::Group || chat.typ == Chattype::Broadcast)
+                if (chat.typ == Chattype::Group || chat.typ == Chattype::OutBroadcast)
                     && quoted_msg_subject.is_none_or_empty()
                 {
                     let re = if self.in_reply_to.is_empty() {
@@ -670,9 +688,13 @@ impl MimeFactory {
             ));
         }
 
-        debug_assert!(
+        ensure_and_debug_assert!(
             self.member_timestamps.is_empty()
-                || to.len() + past_members.len() == self.member_timestamps.len()
+                || to.len() + past_members.len() == self.member_timestamps.len(),
+            "to.len() ({}) + past_members.len() ({}) != self.member_timestamps.len() ({})",
+            to.len(),
+            past_members.len(),
+            self.member_timestamps.len(),
         );
         if to.is_empty() {
             to.push(hidden_recipients());
@@ -791,7 +813,7 @@ impl MimeFactory {
         }
 
         if let Loaded::Message { chat, .. } = &self.loaded {
-            if chat.typ == Chattype::Broadcast {
+            if chat.typ == Chattype::OutBroadcast || chat.typ == Chattype::InBroadcast {
                 headers.push((
                     "List-ID",
                     mail_builder::headers::text::Text::new(format!(
@@ -1035,7 +1057,7 @@ impl MimeFactory {
 
             match &self.loaded {
                 Loaded::Message { chat, msg } => {
-                    if chat.typ != Chattype::Broadcast {
+                    if chat.typ != Chattype::OutBroadcast {
                         for (addr, key) in &encryption_keys {
                             let fingerprint = key.dc_fingerprint().hex();
                             let cmd = msg.param.get_cmd();
@@ -1067,13 +1089,14 @@ impl MimeFactory {
                                 continue;
                             }
 
-                            let header = Aheader::new(
-                                addr.clone(),
-                                key.clone(),
+                            let header = Aheader {
+                                addr: addr.clone(),
+                                public_key: key.clone(),
                                 // Autocrypt 1.1.0 specification says that
                                 // `prefer-encrypt` attribute SHOULD NOT be included.
-                                EncryptPreference::NoPreference,
-                            )
+                                prefer_encrypt: EncryptPreference::NoPreference,
+                                verified: false,
+                            }
                             .to_string();
 
                             message = message.header(
@@ -1300,9 +1323,9 @@ impl MimeFactory {
         let send_verified_headers = match chat.typ {
             Chattype::Single => true,
             Chattype::Group => true,
-            // Mailinglists and broadcast lists can actually never be verified:
+            // Mailinglists and broadcast channels can actually never be verified:
             Chattype::Mailinglist => false,
-            Chattype::Broadcast => false,
+            Chattype::OutBroadcast | Chattype::InBroadcast => false,
         };
         if chat.is_protected() && send_verified_headers {
             headers.push((
@@ -1319,7 +1342,12 @@ impl MimeFactory {
                     mail_builder::headers::raw::Raw::new(chat.grpid.clone()).into(),
                 ));
             }
+        }
 
+        if chat.typ == Chattype::Group
+            || chat.typ == Chattype::OutBroadcast
+            || chat.typ == Chattype::InBroadcast
+        {
             headers.push((
                 "Chat-Group-Name",
                 mail_builder::headers::text::Text::new(chat.name.to_string()).into(),
@@ -1333,6 +1361,7 @@ impl MimeFactory {
 
             match command {
                 SystemMessage::MemberRemovedFromGroup => {
+                    ensure!(chat.typ != Chattype::OutBroadcast);
                     let email_to_remove = msg.param.get(Param::Arg).unwrap_or_default();
 
                     if email_to_remove
@@ -1356,6 +1385,7 @@ impl MimeFactory {
                     }
                 }
                 SystemMessage::MemberAddedToGroup => {
+                    ensure!(chat.typ != Chattype::OutBroadcast);
                     // TODO: lookup the contact by ID rather than email address.
                     // We are adding key-contacts, the cannot be looked up by address.
                     let email_to_add = msg.param.get(Param::Arg).unwrap_or_default();
@@ -1489,16 +1519,31 @@ impl MimeFactory {
                 ));
             }
             SystemMessage::IrohNodeAddr => {
+                let node_addr = context
+                    .get_or_try_init_peer_channel()
+                    .await?
+                    .get_node_addr()
+                    .await?;
+
+                // We should not send `null` as relay URL
+                // as this is the only way to reach the node.
+                debug_assert!(node_addr.relay_url().is_some());
                 headers.push((
-                    "Iroh-Node-Addr",
-                    mail_builder::headers::text::Text::new(serde_json::to_string(
-                        &context
-                            .get_or_try_init_peer_channel()
-                            .await?
-                            .get_node_addr()
-                            .await?,
-                    )?)
-                    .into(),
+                    HeaderDef::IrohNodeAddr.into(),
+                    mail_builder::headers::text::Text::new(serde_json::to_string(&node_addr)?)
+                        .into(),
+                ));
+            }
+            SystemMessage::CallAccepted => {
+                headers.push((
+                    "Chat-Content",
+                    mail_builder::headers::raw::Raw::new("call-accepted").into(),
+                ));
+            }
+            SystemMessage::CallEnded => {
+                headers.push((
+                    "Chat-Content",
+                    mail_builder::headers::raw::Raw::new("call-ended").into(),
                 ));
             }
             _ => {}
@@ -1520,20 +1565,25 @@ impl MimeFactory {
                 "Chat-Content",
                 mail_builder::headers::raw::Raw::new("sticker").into(),
             ));
-        } else if msg.viewtype == Viewtype::VideochatInvitation {
+        } else if msg.viewtype == Viewtype::Call {
             headers.push((
                 "Chat-Content",
-                mail_builder::headers::raw::Raw::new("videochat-invitation").into(),
+                mail_builder::headers::raw::Raw::new("call").into(),
             ));
+            placeholdertext = Some(
+                "[This is a 'Call'. The sender uses an experiment not supported on your version yet]".to_string(),
+            );
+        }
+
+        if let Some(offer) = msg.param.get(Param::WebrtcRoom) {
             headers.push((
                 "Chat-Webrtc-Room",
-                mail_builder::headers::raw::Raw::new(
-                    msg.param
-                        .get(Param::WebrtcRoom)
-                        .unwrap_or_default()
-                        .to_string(),
-                )
-                .into(),
+                mail_builder::headers::raw::Raw::new(b_encode(offer)).into(),
+            ));
+        } else if let Some(answer) = msg.param.get(Param::WebrtcAccepted) {
+            headers.push((
+                "Chat-Webrtc-Accepted",
+                mail_builder::headers::raw::Raw::new(b_encode(answer)).into(),
             ));
         }
 
@@ -1671,10 +1721,13 @@ impl MimeFactory {
             let json = msg.param.get(Param::Arg).unwrap_or_default();
             parts.push(context.build_status_update_part(json));
         } else if msg.viewtype == Viewtype::Webxdc {
+            let topic = self
+                .webxdc_topic
+                .map(|top| BASE32_NOPAD.encode(top.as_bytes()).to_ascii_lowercase())
+                .unwrap_or(create_iroh_header(context, msg.id).await?);
             headers.push((
-                "Iroh-Gossip-Topic",
-                mail_builder::headers::raw::Raw::new(create_iroh_header(context, msg.id).await?)
-                    .into(),
+                HeaderDef::IrohGossipTopic.get_headername(),
+                mail_builder::headers::raw::Raw::new(topic).into(),
             ));
             if let (Some(json), _) = context
                 .render_webxdc_status_update_object(
@@ -1712,16 +1765,6 @@ impl MimeFactory {
     fn render_mdn(&mut self) -> Result<MimePart<'static>> {
         // RFC 6522, this also requires the `report-type` parameter which is equal
         // to the MIME subtype of the second body part of the multipart/report
-        //
-        // currently, we do not send MDNs encrypted:
-        // - in a multi-device-setup that is not set up properly, MDNs would disturb the communication as they
-        //   are send automatically which may lead to spreading outdated Autocrypt headers.
-        // - they do not carry any information but the Message-ID
-        // - this save some KB
-        // - in older versions, we did not encrypt messages to ourself when they to to SMTP - however, if these messages
-        //   are forwarded for any reasons (eg. gmail always forwards to IMAP), we have no chance to decrypt them;
-        //   this issue is fixed with 0.9.4
-
         let Loaded::Mdn {
             rfc724_mid,
             additional_msg_ids,
@@ -1776,69 +1819,15 @@ fn hidden_recipients() -> Address<'static> {
 
 async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'static>> {
     let file_name = msg.get_filename().context("msg has no file")?;
-    let suffix = Path::new(&file_name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("dat");
-
     let blob = msg
         .param
         .get_file_blob(context)?
         .context("msg has no file")?;
-
-    // Get file name to use for sending.  For privacy purposes, we do
-    // not transfer the original filenames eg. for images; these names
-    // are normally not needed and contain timestamps, running numbers
-    // etc.
-    let filename_to_send: String = match msg.viewtype {
-        Viewtype::Voice => format!(
-            "voice-messsage_{}.{}",
-            chrono::Utc
-                .timestamp_opt(msg.timestamp_sort, 0)
-                .single()
-                .map_or_else(
-                    || "YY-mm-dd_hh:mm:ss".to_string(),
-                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
-                ),
-            &suffix
-        ),
-        Viewtype::Image | Viewtype::Gif => format!(
-            "image_{}.{}",
-            chrono::Utc
-                .timestamp_opt(msg.timestamp_sort, 0)
-                .single()
-                .map_or_else(
-                    || "YY-mm-dd_hh:mm:ss".to_string(),
-                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string(),
-                ),
-            &suffix,
-        ),
-        Viewtype::Video => format!(
-            "video_{}.{}",
-            chrono::Utc
-                .timestamp_opt(msg.timestamp_sort, 0)
-                .single()
-                .map_or_else(
-                    || "YY-mm-dd_hh:mm:ss".to_string(),
-                    |ts| ts.format("%Y-%m-%d_%H-%M-%S").to_string()
-                ),
-            &suffix
-        ),
-        _ => file_name,
-    };
-
-    /* check mimetype */
-    let mimetype = match msg.param.get(Param::MimeType) {
-        Some(mtype) => mtype.to_string(),
-        None => {
-            if let Some((_viewtype, res)) = message::guess_msgtype_from_suffix(msg) {
-                res.to_string()
-            } else {
-                "application/octet-stream".to_string()
-            }
-        }
-    };
-
+    let mimetype = msg
+        .param
+        .get(Param::MimeType)
+        .unwrap_or("application/octet-stream")
+        .to_string();
     let body = fs::read(blob.to_abs_path()).await?;
 
     // create mime part, for Content-Disposition, see RFC 2183.
@@ -1846,8 +1835,7 @@ async fn build_body_file(context: &Context, msg: &Message) -> Result<MimePart<'s
     // at least on tested Thunderbird and Gma'l in 2017.
     // But I've heard about problems with inline and outl'k, so we just use the attachment-type until we
     // run into other problems ...
-    let mail =
-        MimePart::new(mimetype, body).attachment(sanitize_bidi_characters(&filename_to_send));
+    let mail = MimePart::new(mimetype, body).attachment(sanitize_bidi_characters(&file_name));
 
     Ok(mail)
 }
@@ -1887,6 +1875,18 @@ fn render_rfc724_mid(rfc724_mid: &str) -> String {
     } else {
         format!("<{rfc724_mid}>")
     }
+}
+
+/// Encodes UTF-8 string as a single B-encoded-word.
+///
+/// We manually encode some headers because as of
+/// version 0.4.4 mail-builder crate does not encode
+/// newlines correctly if they appear in a text header.
+fn b_encode(value: &str) -> String {
+    format!(
+        "=?utf-8?B?{}?=",
+        base64::engine::general_purpose::STANDARD.encode(value)
+    )
 }
 
 #[cfg(test)]

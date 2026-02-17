@@ -213,17 +213,18 @@ impl Session {
 
         let mut uid_message_ids: BTreeMap<u32, String> = BTreeMap::new();
         uid_message_ids.insert(uid, rfc724_mid);
-        let (last_uid, _received) = self
-            .fetch_many_msgs(
-                context,
-                folder,
-                uidvalidity,
-                vec![uid],
-                &uid_message_ids,
-                false,
-            )
-            .await?;
-        if last_uid.is_none() {
+        let (sender, receiver) = async_channel::unbounded();
+        self.fetch_many_msgs(
+            context,
+            folder,
+            uidvalidity,
+            vec![uid],
+            &uid_message_ids,
+            false,
+            sender,
+        )
+        .await?;
+        if receiver.recv().await.is_err() {
             bail!("Failed to fetch UID {uid}");
         }
         Ok(())
@@ -237,14 +238,20 @@ impl MimeMessage {
     /// the mime-structure itself is not available.
     ///
     /// The placeholder part currently contains a text with size and availability of the message;
+    /// `error` is set as the part error;
     /// in the future, we may do more advanced things as previews here.
     pub(crate) async fn create_stub_from_partial_download(
         &mut self,
         context: &Context,
         org_bytes: u32,
+        error: Option<String>,
     ) -> Result<()> {
+        let prefix = match error {
+            None => "",
+            Some(_) => "[❗] ",
+        };
         let mut text = format!(
-            "[{}]",
+            "{prefix}[{}]",
             stock_str::partial_download_msg_body(context, org_bytes).await
         );
         if let Some(delete_server_after) = context.get_config_delete_server_after().await? {
@@ -258,9 +265,10 @@ impl MimeMessage {
 
         info!(context, "Partial download: {}", text);
 
-        self.parts.push(Part {
+        self.do_add_single_part(Part {
             typ: Viewtype::Text,
             msg: text,
+            error,
             ..Default::default()
         });
 
@@ -275,8 +283,9 @@ mod tests {
     use super::*;
     use crate::chat::{get_chat_msgs, send_msg};
     use crate::ephemeral::Timer;
+    use crate::message::delete_msgs;
     use crate::receive_imf::receive_imf_from_inbox;
-    use crate::test_utils::TestContext;
+    use crate::test_utils::{E2EE_INFO_MSGS, TestContext, TestContextManager};
 
     #[test]
     fn test_downloadstate_values() {
@@ -458,7 +467,10 @@ mod tests {
         .await?;
         let msg = bob.get_last_msg().await;
         let chat_id = msg.chat_id;
-        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 1);
+        assert_eq!(
+            get_chat_msgs(&bob, chat_id).await?.len(),
+            E2EE_INFO_MSGS + 1
+        );
         assert_eq!(msg.download_state(), DownloadState::Available);
 
         // downloading the status update afterwards expands to nothing and moves the placeholder to trash-chat
@@ -471,7 +483,7 @@ mod tests {
             None,
         )
         .await?;
-        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), 0);
+        assert_eq!(get_chat_msgs(&bob, chat_id).await?.len(), E2EE_INFO_MSGS);
         assert!(
             Message::load_from_db_optional(&bob, msg.id)
                 .await?
@@ -529,6 +541,45 @@ mod tests {
                 .await?
                 .is_none()
         );
+
+        Ok(())
+    }
+
+    /// Tests that fully downloading the message
+    /// works even if the Message-ID already exists
+    /// in the database assigned to the trash chat.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_partial_download_trashed() -> Result<()> {
+        let mut tcm = TestContextManager::new();
+        let alice = &tcm.alice().await;
+
+        let imf_raw = b"From: Bob <bob@example.org>\n\
+              To: Alice <alice@example.org>\n\
+              Chat-Version: 1.0\n\
+              Subject: subject\n\
+              Message-ID: <first@example.org>\n\
+              Date: Sun, 14 Nov 2021 00:10:00 +0000\
+              Content-Type: text/plain";
+
+        // Download message from Bob partially.
+        let partial_received_msg =
+            receive_imf_from_inbox(alice, "first@example.org", imf_raw, false, Some(100000))
+                .await?
+                .unwrap();
+        assert_eq!(partial_received_msg.msg_ids.len(), 1);
+
+        // Delete the received message.
+        // Not it is still in the database,
+        // but in the trash chat.
+        delete_msgs(alice, &[partial_received_msg.msg_ids[0]]).await?;
+
+        // Fully download message after deletion.
+        let full_received_msg =
+            receive_imf_from_inbox(alice, "first@example.org", imf_raw, false, None).await?;
+
+        // The message does not reappear.
+        // However, `receive_imf` should not fail.
+        assert!(full_received_msg.is_none());
 
         Ok(())
     }

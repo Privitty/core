@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 from warnings import warn
@@ -185,7 +186,21 @@ class Account:
         return Contact(self, contact_id)
 
     def get_contact_by_addr(self, address: str) -> Optional[Contact]:
-        """Check if an e-mail address belongs to a known and unblocked contact."""
+        """Looks up a known and unblocked contact with a given e-mail address.
+        To get a list of all known and unblocked contacts, use contacts_get_contacts().
+
+        **POTENTIAL SECURITY ISSUE**: If there are multiple contacts with this address
+        (e.g. an address-contact and a key-contact),
+        this looks up the most recently seen contact,
+        i.e. which contact is returned depends on which contact last sent a message.
+        If the user just clicked on a mailto: link, then this is the best thing you can do.
+        But **DO NOT** internally represent contacts by their email address
+        and do not use this function to look them up;
+        otherwise this function will sometimes look up the wrong contact.
+        Instead, you should internally represent contacts by their ids.
+
+        To validate an e-mail address independently of the contact database
+        use check_email_validity()."""
         contact_id = self._rpc.lookup_contact_id_by_addr(self.id, address)
         return contact_id and Contact(self, contact_id)
 
@@ -288,9 +303,45 @@ class Account:
     def create_group(self, name: str, protect: bool = False) -> Chat:
         """Create a new group chat.
 
-        After creation, the group has only self-contact as member and is in unpromoted state.
+        After creation,
+        the group has only self-contact as member one member (see `SpecialContactId.SELF`)
+        and is in _unpromoted_ state.
+        This means, you can add or remove members, change the name,
+        the group image and so on without messages being sent to all group members.
+
+        This changes as soon as the first message is sent to the group members
+        and the group becomes _promoted_.
+        After that, all changes are synced with all group members
+        by sending status message.
+
+        To check, if a chat is still unpromoted, you can look at the `is_unpromoted` property of a chat
+        (see `get_full_snapshot()` / `get_basic_snapshot()`).
+        This may be useful if you want to show some help for just created groups.
+
+        :param protect: If set to 1 the function creates group with protection initially enabled.
+                        Only verified members are allowed in these groups
+                        and end-to-end-encryption is always enabled.
         """
         return Chat(self, self._rpc.create_group_chat(self.id, name, protect))
+
+    def create_broadcast(self, name: str) -> Chat:
+        """Create a new **broadcast channel**
+        (called "Channel" in the UI).
+
+        Broadcast channels are similar to groups on the sending device,
+        however, recipients get the messages in a read-only chat
+        and will not see who the other members are.
+
+        Called `broadcast` here rather than `channel`,
+        because the word "channel" already appears a lot in the code,
+        which would make it hard to grep for it.
+
+        After creation, the chat contains no recipients and is in _unpromoted_ state;
+        see `create_group()` for more information on the unpromoted state.
+
+        Returns the created chat.
+        """
+        return Chat(self, self._rpc.create_broadcast(self.id, name))
 
     def get_chat_by_id(self, chat_id: int) -> Chat:
         """Return the Chat instance with the given ID."""
@@ -420,3 +471,8 @@ class Account:
     def initiate_autocrypt_key_transfer(self) -> None:
         """Send Autocrypt Setup Message."""
         return self._rpc.initiate_autocrypt_key_transfer(self.id)
+
+    def ice_servers(self) -> list:
+        """Return ICE servers for WebRTC configuration."""
+        ice_servers_json = self._rpc.ice_servers(self.id)
+        return json.loads(ice_servers_json)

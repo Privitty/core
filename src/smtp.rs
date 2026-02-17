@@ -87,7 +87,7 @@ impl Smtp {
             return Ok(());
         }
 
-        self.connectivity.set_connecting(context).await;
+        self.connectivity.set_connecting(context);
         let lp = ConfiguredLoginParam::load(context)
             .await?
             .context("Not configured")?;
@@ -187,7 +187,7 @@ pub(crate) async fn smtp_send(
         info!(context, "SMTP-sending out mime message:\n{message}");
     }
 
-    smtp.connectivity.set_working(context).await;
+    smtp.connectivity.set_working(context);
 
     if let Err(err) = smtp
         .connect_configured(context)
@@ -242,7 +242,7 @@ pub(crate) async fn smtp_send(
                         // Yandex error "554 5.7.1 [2] Message rejected under suspicion of SPAM; https://ya.cc/..."
                         // should definitely go here, because user has to open the link to
                         // resume message sending.
-                        SendResult::Failure(format_err!("Permanent SMTP error: {}", err))
+                        SendResult::Failure(format_err!("Permanent SMTP error: {err}"))
                     }
                 }
                 async_smtp::error::Error::Transient(ref response) => {
@@ -414,7 +414,11 @@ pub(crate) async fn send_msg_to_smtp(
                 .await?;
         }
         SendResult::Failure(ref err) => {
-            if err.to_string().contains("Invalid unencrypted mail") {
+            if err
+                .to_string()
+                .to_lowercase()
+                .contains("invalid unencrypted mail")
+            {
                 let res = context
                     .sql
                     .query_row_optional(
@@ -467,7 +471,7 @@ pub(crate) async fn send_msg_to_smtp(
             }
             Ok(())
         }
-        SendResult::Failure(err) => Err(format_err!("{}", err)),
+        SendResult::Failure(err) => Err(format_err!("{err}")),
     }
 }
 
@@ -582,7 +586,7 @@ async fn send_mdn_rfc724_mid(
 
     let addr = contact.get_addr();
     let recipient = async_smtp::EmailAddress::new(addr.to_string())
-        .map_err(|err| format_err!("invalid recipient: {} {:?}", addr, err))?;
+        .map_err(|err| format_err!("invalid recipient: {addr} {err:?}"))?;
     let recipients = vec![recipient];
 
     match smtp_send(context, &recipients, &body, smtp, None).await {

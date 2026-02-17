@@ -14,16 +14,17 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail, ensure, format_err};
-use async_channel::Receiver;
+use async_channel::{self, Receiver, Sender};
 use async_imap::types::{Fetch, Flag, Name, NameAttribute, UnsolicitedResponse};
 use deltachat_contact_tools::ContactAddress;
-use futures::{FutureExt as _, StreamExt, TryStreamExt};
+use futures::{FutureExt as _, TryStreamExt};
 use futures_lite::FutureExt;
 use num_traits::FromPrimitive;
 use rand::Rng;
 use ratelimit::Ratelimit;
 use url::Url;
 
+use crate::calls::{create_fallback_ice_servers, create_ice_servers_from_metadata};
 use crate::chat::{self, ChatId, ChatIdBlocked};
 use crate::chatlist_events;
 use crate::config::Config;
@@ -47,7 +48,7 @@ use crate::receive_imf::{
 };
 use crate::scheduler::connectivity::ConnectivityStore;
 use crate::stock_str;
-use crate::tools::{self, create_id, duration_to_str};
+use crate::tools::{self, create_id, duration_to_str, time};
 
 pub(crate) mod capabilities;
 mod client;
@@ -123,6 +124,18 @@ pub(crate) struct ServerMetadata {
     pub admin: Option<String>,
 
     pub iroh_relay: Option<Url>,
+
+    /// JSON with ICE servers for WebRTC calls
+    /// and the expiration timestamp.
+    ///
+    /// If JSON is about to expire, new TURN credentials
+    /// should be fetched from the server
+    /// to be ready for WebRTC calls.
+    pub ice_servers: String,
+
+    /// Timestamp when ICE servers are considered
+    /// expired and should be updated.
+    pub ice_servers_expiration_timestamp: i64,
 }
 
 impl async_imap::Authenticator for OAuth2 {
@@ -146,7 +159,6 @@ pub enum FolderMeaning {
     Mvbox,
     Sent,
     Trash,
-    Drafts,
 
     /// Virtual folders.
     ///
@@ -166,7 +178,6 @@ impl FolderMeaning {
             FolderMeaning::Mvbox => Some(Config::ConfiguredMvboxFolder),
             FolderMeaning::Sent => Some(Config::ConfiguredSentboxFolder),
             FolderMeaning::Trash => Some(Config::ConfiguredTrashFolder),
-            FolderMeaning::Drafts => None,
             FolderMeaning::Virtual => None,
         }
     }
@@ -325,7 +336,7 @@ impl Imap {
         }
 
         info!(context, "Connecting to IMAP server.");
-        self.connectivity.set_connecting(context).await;
+        self.connectivity.set_connecting(context);
 
         self.conn_last_try = tools::Time::now();
         const BACKOFF_MIN_MS: u64 = 2000;
@@ -408,7 +419,7 @@ impl Imap {
                         "IMAP-LOGIN as {}",
                         lp.user
                     )));
-                    self.connectivity.set_preparing(context).await;
+                    self.connectivity.set_preparing(context);
                     info!(context, "Successfully logged into IMAP server.");
                     return Ok(session);
                 }
@@ -466,7 +477,7 @@ impl Imap {
         let mut session = match self.connect(context, configuring).await {
             Ok(session) => session,
             Err(err) => {
-                self.connectivity.set_err(context, &err).await;
+                self.connectivity.set_err(context, &err);
                 return Err(err);
             }
         };
@@ -555,14 +566,42 @@ impl Imap {
         }
         session.new_mail = false;
 
+        let mut read_cnt = 0;
+        loop {
+            let (n, fetch_more) = self
+                .fetch_new_msg_batch(context, session, folder, folder_meaning)
+                .await?;
+            read_cnt += n;
+            if !fetch_more {
+                return Ok(read_cnt > 0);
+            }
+        }
+    }
+
+    /// Returns number of messages processed and whether the function should be called again.
+    async fn fetch_new_msg_batch(
+        &mut self,
+        context: &Context,
+        session: &mut Session,
+        folder: &str,
+        folder_meaning: FolderMeaning,
+    ) -> Result<(usize, bool)> {
         let uid_validity = get_uidvalidity(context, folder).await?;
         let old_uid_next = get_uid_next(context, folder).await?;
+        info!(
+            context,
+            "fetch_new_msg_batch({folder}): UIDVALIDITY={uid_validity}, UIDNEXT={old_uid_next}."
+        );
 
-        let msgs = session.prefetch(old_uid_next).await.context("prefetch")?;
+        let uids_to_prefetch = 500;
+        let msgs = session
+            .prefetch(old_uid_next, uids_to_prefetch)
+            .await
+            .context("prefetch")?;
         let read_cnt = msgs.len();
 
         let download_limit = context.download_limit().await?;
-        let mut uids_fetch = Vec::<(_, bool /* partially? */)>::with_capacity(msgs.len() + 1);
+        let mut uids_fetch = Vec::<(u32, bool /* partially? */)>::with_capacity(msgs.len() + 1);
         let mut uid_message_ids = BTreeMap::new();
         let mut largest_uid_skipped = None;
         let delete_target = context.get_delete_msgs_target().await?;
@@ -692,54 +731,79 @@ impl Imap {
         }
 
         if !uids_fetch.is_empty() {
-            self.connectivity.set_working(context).await;
+            self.connectivity.set_working(context);
         }
 
-        // Actually download messages.
-        let mut largest_uid_fetched: u32 = 0;
+        let (sender, receiver) = async_channel::unbounded();
+
         let mut received_msgs = Vec::with_capacity(uids_fetch.len());
-        let mut uids_fetch_in_batch = Vec::with_capacity(max(uids_fetch.len(), 1));
-        let mut fetch_partially = false;
-        uids_fetch.push((0, !uids_fetch.last().unwrap_or(&(0, false)).1));
-        for (uid, fp) in uids_fetch {
-            if fp != fetch_partially {
-                let (largest_uid_fetched_in_batch, received_msgs_in_batch) = session
-                    .fetch_many_msgs(
-                        context,
-                        folder,
-                        uid_validity,
-                        uids_fetch_in_batch.split_off(0),
-                        &uid_message_ids,
-                        fetch_partially,
-                    )
-                    .await
-                    .context("fetch_many_msgs")?;
-                received_msgs.extend(received_msgs_in_batch);
-                largest_uid_fetched = max(
-                    largest_uid_fetched,
-                    largest_uid_fetched_in_batch.unwrap_or(0),
-                );
-                fetch_partially = fp;
-            }
-            uids_fetch_in_batch.push(uid);
-        }
-
-        // Advance uid_next to the maximum of the largest known UID plus 1
-        // and mailbox UIDNEXT.
-        // Largest known UID is normally less than UIDNEXT,
-        // but a message may have arrived between determining UIDNEXT
-        // and executing the FETCH command.
         let mailbox_uid_next = session
             .selected_mailbox
             .as_ref()
             .with_context(|| format!("Expected {folder:?} to be selected"))?
             .uid_next
             .unwrap_or_default();
-        let new_uid_next = max(
-            max(largest_uid_fetched, largest_uid_skipped.unwrap_or(0)) + 1,
-            mailbox_uid_next,
-        );
 
+        let update_uids_future = async {
+            let mut largest_uid_fetched: u32 = 0;
+
+            while let Ok((uid, received_msg_opt)) = receiver.recv().await {
+                largest_uid_fetched = max(largest_uid_fetched, uid);
+                if let Some(received_msg) = received_msg_opt {
+                    received_msgs.push(received_msg)
+                }
+            }
+
+            largest_uid_fetched
+        };
+
+        let actually_download_messages_future = async {
+            let sender = sender;
+            let mut uids_fetch_in_batch = Vec::with_capacity(max(uids_fetch.len(), 1));
+            let mut fetch_partially = false;
+            uids_fetch.push((0, !uids_fetch.last().unwrap_or(&(0, false)).1));
+            for (uid, fp) in uids_fetch {
+                if fp != fetch_partially {
+                    session
+                        .fetch_many_msgs(
+                            context,
+                            folder,
+                            uid_validity,
+                            uids_fetch_in_batch.split_off(0),
+                            &uid_message_ids,
+                            fetch_partially,
+                            sender.clone(),
+                        )
+                        .await
+                        .context("fetch_many_msgs")?;
+                    fetch_partially = fp;
+                }
+                uids_fetch_in_batch.push(uid);
+            }
+
+            anyhow::Ok(())
+        };
+
+        let (largest_uid_fetched, fetch_res) =
+            tokio::join!(update_uids_future, actually_download_messages_future);
+
+        // Advance uid_next to the largest fetched UID plus 1.
+        //
+        // This may be larger than `mailbox_uid_next`
+        // if the message has arrived after selecting mailbox
+        // and determining its UIDNEXT and before prefetch.
+        let mut new_uid_next = largest_uid_fetched + 1;
+        let fetch_more = fetch_res.is_ok() && {
+            let prefetch_uid_next = old_uid_next + uids_to_prefetch;
+            // If we have successfully fetched all messages we planned during prefetch,
+            // then we have covered at least the range between old UIDNEXT
+            // and UIDNEXT of the mailbox at the time of selecting it.
+            new_uid_next = max(new_uid_next, min(prefetch_uid_next, mailbox_uid_next));
+
+            new_uid_next = max(new_uid_next, largest_uid_skipped.unwrap_or(0) + 1);
+
+            prefetch_uid_next < mailbox_uid_next
+        };
         if new_uid_next > old_uid_next {
             set_uid_next(context, folder, new_uid_next).await?;
         }
@@ -752,7 +816,11 @@ impl Imap {
 
         chat::mark_old_messages_as_noticed(context, received_msgs).await?;
 
-        Ok(read_cnt > 0)
+        // Now fail if fetching failed, so we will
+        // establish a new session if this one is broken.
+        fetch_res?;
+
+        Ok((read_cnt, fetch_more))
     }
 
     /// Read the recipients from old emails sent by the user and add them as contacts.
@@ -789,7 +857,10 @@ impl Session {
             .context("listing folders for resync")?;
         for folder in all_folders {
             let folder_meaning = get_folder_meaning(&folder);
-            if folder_meaning != FolderMeaning::Virtual {
+            if !matches!(
+                folder_meaning,
+                FolderMeaning::Virtual | FolderMeaning::Unknown
+            ) {
                 self.resync_folder_uids(context, folder.name(), folder_meaning)
                     .await?;
             }
@@ -1300,9 +1371,19 @@ impl Session {
 
     /// Fetches a list of messages by server UID.
     ///
-    /// Returns the last UID fetched successfully and the info about each downloaded message.
+    /// Sends pairs of UID and info about each downloaded message to the provided channel.
+    /// Received message info is optional because UID may be ignored
+    /// if the message has a `\Deleted` flag.
+    ///
+    /// The channel is used to return the results because the function may fail
+    /// due to network errors before it finishes fetching all the messages.
+    /// In this case caller still may want to process all the results
+    /// received over the channel and persist last seen UID in the database
+    /// before bubbling up the failure.
+    ///
     /// If the message is incorrect or there is a failure to write a message to the database,
     /// it is skipped and the error is logged.
+    #[expect(clippy::too_many_arguments)]
     pub(crate) async fn fetch_many_msgs(
         &mut self,
         context: &Context,
@@ -1311,12 +1392,10 @@ impl Session {
         request_uids: Vec<u32>,
         uid_message_ids: &BTreeMap<u32, String>,
         fetch_partially: bool,
-    ) -> Result<(Option<u32>, Vec<ReceivedMsg>)> {
-        let mut last_uid = None;
-        let mut received_msgs = Vec::new();
-
+        received_msgs_channel: Sender<(u32, Option<ReceivedMsg>)>,
+    ) -> Result<()> {
         if request_uids.is_empty() {
-            return Ok((last_uid, received_msgs));
+            return Ok(());
         }
 
         for (request_uids, set) in build_sequence_sets(&request_uids)? {
@@ -1351,13 +1430,14 @@ impl Session {
 
                 // Try to find a requested UID in returned FETCH responses.
                 while fetch_response.is_none() {
-                    let Some(next_fetch_response) = fetch_responses.next().await else {
+                    let Some(next_fetch_response) = fetch_responses
+                        .try_next()
+                        .await
+                        .context("Failed to process IMAP FETCH result")?
+                    else {
                         // No more FETCH responses received from the server.
                         break;
                     };
-
-                    let next_fetch_response =
-                        next_fetch_response.context("Failed to process IMAP FETCH result")?;
 
                     if let Some(next_uid) = next_fetch_response.uid {
                         if next_uid == request_uid {
@@ -1402,7 +1482,7 @@ impl Session {
 
                 if is_deleted {
                     info!(context, "Not processing deleted msg {}.", request_uid);
-                    last_uid = Some(request_uid);
+                    received_msgs_channel.send((request_uid, None)).await?;
                     continue;
                 }
 
@@ -1413,7 +1493,7 @@ impl Session {
                         context,
                         "Not processing message {} without a BODY.", request_uid
                     );
-                    last_uid = Some(request_uid);
+                    received_msgs_channel.send((request_uid, None)).await?;
                     continue;
                 };
 
@@ -1432,7 +1512,7 @@ impl Session {
                     context,
                     "Passing message UID {} to receive_imf().", request_uid
                 );
-                match receive_imf_inner(
+                let res = receive_imf_inner(
                     context,
                     folder,
                     uidvalidity,
@@ -1440,25 +1520,45 @@ impl Session {
                     rfc724_mid,
                     body,
                     is_seen,
-                    partial,
+                    partial.map(|msg_size| (msg_size, None)),
                 )
-                .await
-                {
-                    Ok(received_msg) => {
-                        if let Some(m) = received_msg {
-                            received_msgs.push(m);
-                        }
+                .await;
+                let received_msg = if let Err(err) = res {
+                    warn!(context, "receive_imf error: {:#}.", err);
+                    if partial.is_some() {
+                        return Err(err);
                     }
-                    Err(err) => {
-                        warn!(context, "receive_imf error: {:#}.", err);
-                    }
+                    receive_imf_inner(
+                        context,
+                        folder,
+                        uidvalidity,
+                        request_uid,
+                        rfc724_mid,
+                        body,
+                        is_seen,
+                        Some((body.len().try_into()?, Some(format!("{err:#}")))),
+                    )
+                    .await?
+                } else {
+                    res?
                 };
-                last_uid = Some(request_uid)
+                received_msgs_channel
+                    .send((request_uid, received_msg))
+                    .await?;
             }
 
             // If we don't process the whole response, IMAP client is left in a broken state where
             // it will try to process the rest of response as the next response.
-            while fetch_responses.next().await.is_some() {}
+            //
+            // Make sure to not ignore the errors, because
+            // if connection times out, it will return
+            // infinite stream of `Some(Err(_))` results.
+            while fetch_responses
+                .try_next()
+                .await
+                .context("Failed to drain FETCH responses")?
+                .is_some()
+            {}
 
             if count != request_uids.len() {
                 warn!(
@@ -1477,7 +1577,7 @@ impl Session {
             }
         }
 
-        Ok((last_uid, received_msgs))
+        Ok(())
     }
 
     /// Retrieves server metadata if it is supported.
@@ -1491,7 +1591,43 @@ impl Session {
         }
 
         let mut lock = context.metadata.write().await;
-        if (*lock).is_some() {
+        if let Some(ref mut old_metadata) = *lock {
+            let now = time();
+
+            // Refresh TURN server credentials if they expire in 12 hours.
+            if now + 3600 * 12 < old_metadata.ice_servers_expiration_timestamp {
+                return Ok(());
+            }
+
+            info!(context, "ICE servers expired, requesting new credentials.");
+            let mailbox = "";
+            let options = "";
+            let metadata = self
+                .get_metadata(mailbox, options, "(/shared/vendor/deltachat/turn)")
+                .await?;
+            let mut got_turn_server = false;
+            for m in metadata {
+                if m.entry == "/shared/vendor/deltachat/turn" {
+                    if let Some(value) = m.value {
+                        match create_ice_servers_from_metadata(context, &value).await {
+                            Ok((parsed_timestamp, parsed_ice_servers)) => {
+                                old_metadata.ice_servers_expiration_timestamp = parsed_timestamp;
+                                old_metadata.ice_servers = parsed_ice_servers;
+                                got_turn_server = false;
+                            }
+                            Err(err) => {
+                                warn!(context, "Failed to parse TURN server metadata: {err:#}.");
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !got_turn_server {
+                // Set expiration timestamp 7 days in the future so we don't request it again.
+                old_metadata.ice_servers_expiration_timestamp = time() + 3600 * 24 * 7;
+                old_metadata.ice_servers = create_fallback_ice_servers(context).await?;
+            }
             return Ok(());
         }
 
@@ -1503,6 +1639,8 @@ impl Session {
         let mut comment = None;
         let mut admin = None;
         let mut iroh_relay = None;
+        let mut ice_servers = None;
+        let mut ice_servers_expiration_timestamp = 0;
 
         let mailbox = "";
         let options = "";
@@ -1510,7 +1648,7 @@ impl Session {
             .get_metadata(
                 mailbox,
                 options,
-                "(/shared/comment /shared/admin /shared/vendor/deltachat/irohrelay)",
+                "(/shared/comment /shared/admin /shared/vendor/deltachat/irohrelay /shared/vendor/deltachat/turn)",
             )
             .await?;
         for m in metadata {
@@ -1533,13 +1671,36 @@ impl Session {
                         }
                     }
                 }
+                "/shared/vendor/deltachat/turn" => {
+                    if let Some(value) = m.value {
+                        match create_ice_servers_from_metadata(context, &value).await {
+                            Ok((parsed_timestamp, parsed_ice_servers)) => {
+                                ice_servers_expiration_timestamp = parsed_timestamp;
+                                ice_servers = Some(parsed_ice_servers);
+                            }
+                            Err(err) => {
+                                warn!(context, "Failed to parse TURN server metadata: {err:#}.");
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
+        let ice_servers = if let Some(ice_servers) = ice_servers {
+            ice_servers
+        } else {
+            // Set expiration timestamp 7 days in the future so we don't request it again.
+            ice_servers_expiration_timestamp = time() + 3600 * 24 * 7;
+            create_fallback_ice_servers(context).await?
+        };
+
         *lock = Some(ServerMetadata {
             comment,
             admin,
             iroh_relay,
+            ice_servers,
+            ice_servers_expiration_timestamp,
         });
         Ok(())
     }
@@ -1655,7 +1816,7 @@ impl Session {
             .uid_store(uid_set, &query)
             .await
             .with_context(|| format!("IMAP failed to store: ({uid_set}, {query})"))?;
-        while let Some(_response) = responses.next().await {
+        while let Some(_response) = responses.try_next().await? {
             // Read all the responses
         }
         Ok(())
@@ -2077,27 +2238,6 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         "迷惑メール",
         "스팸",
     ];
-    const DRAFT_NAMES: &[&str] = &[
-        "Drafts",
-        "Kladder",
-        "Entw?rfe",
-        "Borradores",
-        "Brouillons",
-        "Bozze",
-        "Concepten",
-        "Wersje robocze",
-        "Rascunhos",
-        "Entwürfe",
-        "Koncepty",
-        "Kopie robocze",
-        "Taslaklar",
-        "Utkast",
-        "Πρόχειρα",
-        "Черновики",
-        "下書き",
-        "草稿",
-        "임시보관함",
-    ];
     const TRASH_NAMES: &[&str] = &[
         "Trash",
         "Bin",
@@ -2124,8 +2264,6 @@ fn get_folder_meaning_by_name(folder_name: &str) -> FolderMeaning {
         FolderMeaning::Sent
     } else if SPAM_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Spam
-    } else if DRAFT_NAMES.iter().any(|s| s.to_lowercase() == lower) {
-        FolderMeaning::Drafts
     } else if TRASH_NAMES.iter().any(|s| s.to_lowercase() == lower) {
         FolderMeaning::Trash
     } else {
@@ -2139,7 +2277,6 @@ fn get_folder_meaning_by_attrs(folder_attrs: &[NameAttribute]) -> FolderMeaning 
             NameAttribute::Trash => return FolderMeaning::Trash,
             NameAttribute::Sent => return FolderMeaning::Sent,
             NameAttribute::Junk => return FolderMeaning::Spam,
-            NameAttribute::Drafts => return FolderMeaning::Drafts,
             NameAttribute::All | NameAttribute::Flagged => return FolderMeaning::Virtual,
             NameAttribute::Extension(label) => {
                 match label.as_ref() {

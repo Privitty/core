@@ -9,6 +9,7 @@ class ContactFlag(IntEnum):
     """Bit flags for get_contacts() method."""
 
     ADD_SELF = 0x02
+    ADDRESS = 0x04
 
 
 class ChatlistFlag(IntEnum):
@@ -72,6 +73,10 @@ class EventType(str, Enum):
     CHATLIST_ITEM_CHANGED = "ChatlistItemChanged"
     ACCOUNTS_CHANGED = "AccountsChanged"
     ACCOUNTS_ITEM_CHANGED = "AccountsItemChanged"
+    INCOMING_CALL = "IncomingCall"
+    INCOMING_CALL_ACCEPTED = "IncomingCallAccepted"
+    OUTGOING_CALL_ACCEPTED = "OutgoingCallAccepted"
+    CALL_ENDED = "CallEnded"
     CONFIG_SYNCED = "ConfigSynced"
     WEBXDC_REALTIME_DATA = "WebxdcRealtimeData"
     WEBXDC_REALTIME_ADVERTISEMENT_RECEIVED = "WebxdcRealtimeAdvertisementReceived"
@@ -90,10 +95,40 @@ class ChatType(IntEnum):
     """Chat type."""
 
     UNDEFINED = 0
+
     SINGLE = 100
+    """1:1 chat, i.e. a direct chat with a single contact"""
+
     GROUP = 120
+
     MAILINGLIST = 140
-    BROADCAST = 160
+
+    OUT_BROADCAST = 160
+    """Outgoing broadcast channel, called "Channel" in the UI.
+
+    The user can send into this channel,
+    and all recipients will receive messages
+    in an `IN_BROADCAST`.
+
+    Called `broadcast` here rather than `channel`,
+    because the word "channel" already appears a lot in the code,
+    which would make it hard to grep for it.
+    """
+
+    IN_BROADCAST = 165
+    """Incoming broadcast channel, called "Channel" in the UI.
+
+    This channel is read-only,
+    and we do not know who the other recipients are.
+
+    This is similar to a `MAILINGLIST`,
+    with the main difference being that
+    `IN_BROADCAST`s are encrypted.
+
+    Called `broadcast` here rather than `channel`,
+    because the word "channel" already appears a lot in the code,
+    which would make it hard to grep for it.
+    """
 
 
 class ChatVisibility(str, Enum):
@@ -125,7 +160,6 @@ class ViewType(str, Enum):
     VOICE = "Voice"
     VIDEO = "Video"
     FILE = "File"
-    VIDEOCHAT_INVITATION = "VideochatInvitation"
     WEBXDC = "Webxdc"
     VCARD = "Vcard"
 
@@ -244,11 +278,3 @@ class SocketSecurity(IntEnum):
     SSL = 1
     STARTTLS = 2
     PLAIN = 3
-
-
-class VideochatType(IntEnum):
-    """Video chat URL type."""
-
-    UNKNOWN = 0
-    BASICWEBRTC = 1
-    JITSI = 2
