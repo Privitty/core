@@ -32,7 +32,7 @@ jobs:
           ref: ${{ github.event.inputs.branch || github.ref }}
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@6d28f1ea826946162388c29db5a29aca24037adb
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}-linux
       - name: Upload binary
@@ -50,12 +50,12 @@ jobs:
         arch: [win32, win64]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@6d28f1ea826946162388c29db5a29aca24037a
+      - uses: actions/checkout@6d28f1ea826946162388c29db5a29aca24037adb
         with:
           ref: ${{ github.event.inputs.branch || github.ref }}
           show-progress: false
           persist-credentials: false
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@6d28f1ea826946162388c29db5a29aca24037adb
       - name: Build deltachat-rpc-server binaries
         run: nix build .#deltachat-rpc-server-${{ matrix.arch }}
       - name: Upload binary
