@@ -102,7 +102,7 @@ jobs:
           ref: ${{ github.event.inputs.branch || github.ref }}
           show-progress: false
           persist-credentials: false
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@6d28f1ea826946162388c29db5a29aca24037adb
         with:
           python-version: "3.11"
 
