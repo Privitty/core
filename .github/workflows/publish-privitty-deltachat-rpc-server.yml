@@ -8,13 +8,13 @@ concurrency:
 
 on:
   push:
-    branches: [desktop-core]
+    branches: [desktop-core-1.159.5]
   workflow_dispatch:
     inputs:
       branch:
         description: "Branch to build from"
         required: false
-        default: "desktop-core"
+        default: "desktop-core-1.159.5"
 
 permissions: {}
 
