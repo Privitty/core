@@ -1,4 +1,4 @@
-# Build deltachat-rpc-server from branch deskstop-core (Privitty/core) and publish to npm as @privitty/deltachat-rpc-server
+# Build deltachat-rpc-server from branch desktop-core-2.15.0 (Privitty/core) and publish to npm as @privitty/deltachat-rpc-server
 
 name: Publish @privitty/deltachat-rpc-server
 
@@ -8,13 +8,13 @@ concurrency:
 
 on:
   push:
-    branches: [desktop-core]
+    branches: [desktop-core-2.15.0]
   workflow_dispatch:
     inputs:
       branch:
         description: "Branch to build from"
         required: false
-        default: "desktop-core"
+        default: "desktop-core-2.15.0"
 
 permissions: {}
 

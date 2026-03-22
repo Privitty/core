@@ -1,4 +1,4 @@
-# Build jsonrpc-client from branch desktop-core (Privitty/core) and publish to npm as @privitty/jsonrpc-client
+# Build jsonrpc-client from branch desktop-core-2.15.0 (Privitty/core) and publish to npm as @privitty/jsonrpc-client
 
 name: Publish @privitty/deltachat-rpc-client
 
@@ -8,13 +8,13 @@ concurrency:
 
 on:
   push:
-    branches: [desktop-core]
+    branches: [desktop-core-2.15.0]
   workflow_dispatch:
     inputs:
       branch:
         description: "Branch to build from"
         required: false
-        default: "desktop-core"
+        default: "desktop-core-2.15.0"
 
 permissions: {}
 
