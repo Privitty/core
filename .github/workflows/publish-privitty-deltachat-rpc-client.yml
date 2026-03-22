@@ -1,0 +1,68 @@
+# Build jsonrpc-client from branch desktop-core (Privitty/core) and publish to npm as @privitty/jsonrpc-client
+
+name: Publish @privitty/deltachat-rpc-client
+
+concurrency:
+  group: publish-privitty-rpc-client-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [desktop-core]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from"
+        required: false
+        default: "desktop-core"
+
+permissions: {}
+
+jobs:
+  pack-module:
+    name: "Publish @privitty/jsonrpc-client"
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          show-progress: false
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Patch package.json for @privitty/jsonrpc-client
+        working-directory: deltachat-jsonrpc/typescript
+        run: |
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
+            pkg.name = '@privitty/jsonrpc-client';
+            pkg.repository = { type: 'git', url: 'https://github.com/Privitty/core.git' };
+            fs.writeFileSync('./package.json', JSON.stringify(pkg, null, 2));
+          "
+
+      - name: Install dependencies without running scripts
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm install --ignore-scripts
+
+      - name: Package
+        working-directory: deltachat-jsonrpc/typescript
+        run: |
+          npm run build
+          npm pack .
+
+      - name: Publish
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm publish --provenance privitty-jsonrpc-client-* --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
