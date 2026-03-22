@@ -1,0 +1,80 @@
+# Publish @privitty/jsonrpc-client to npm (Privitty fork).
+# Source stays as @deltachat/jsonrpc-client in deltachat-jsonrpc/typescript/package.json;
+# this workflow rewrites name + repository only at publish time.
+#
+# Runs on the same branch as your RPC publish workflow (dekstop-core). If you prefer one
+# workflow file, copy the job `publish_privitty_jsonrpc` into publish-privitty-deltachat-rpc-server.yml.
+
+name: Publish @privitty/jsonrpc-client
+
+concurrency:
+  group: publish-privitty-jsonrpc-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [dekstop-core]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from"
+        required: false
+        default: "dekstop-core"
+
+permissions: {}
+
+jobs:
+  publish_privitty_jsonrpc:
+    name: Build & publish @privitty/jsonrpc-client
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          show-progress: false
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Point package at @privitty/jsonrpc-client (Privitty repo)
+        working-directory: deltachat-jsonrpc/typescript
+        run: |
+          node <<'NODE'
+          const fs = require("fs");
+          const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+          p.name = "@privitty/jsonrpc-client";
+          p.repository = {
+            type: "git",
+            url: "https://github.com/Privitty/core.git",
+            directory: "deltachat-jsonrpc/typescript",
+          };
+          fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+          NODE
+
+      - name: Install dependencies (no lifecycle scripts)
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm install --ignore-scripts
+
+      - name: Build (TypeScript + Rust bindings via cargo test)
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm run build
+
+      - name: Pack
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm pack .
+
+      - name: Publish to npm
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm publish --provenance privitty-jsonrpc-client-* --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
