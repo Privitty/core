@@ -18,7 +18,7 @@ use tokio::time::{Duration, sleep};
 
 use crate::context::{Context, ContextBuilder};
 use crate::events::{Event, EventEmitter, EventType, Events};
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::push::PushSubscriber;
 use crate::stock_str::StockStrings;
 
@@ -78,7 +78,7 @@ impl Accounts {
         ensure!(dir.exists(), "directory does not exist");
 
         let config_file = dir.join(CONFIG_NAME);
-        ensure!(config_file.exists(), "{:?} does not exist", config_file);
+        ensure!(config_file.exists(), "{config_file:?} does not exist");
 
         let config = Config::from_file(config_file, writable).await?;
         let events = Events::new();
@@ -724,8 +724,7 @@ impl Config {
         {
             ensure!(
                 self.inner.accounts.iter().any(|e| e.id == id),
-                "invalid account id: {}",
-                id
+                "invalid account id: {id}"
             );
 
             self.inner.selected_account = id;

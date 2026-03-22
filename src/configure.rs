@@ -27,7 +27,7 @@ use crate::config::{self, Config};
 use crate::constants::NON_ALPHANUMERIC_WITHOUT_DOT;
 use crate::context::Context;
 use crate::imap::Imap;
-use crate::log::{LogExt, info, warn};
+use crate::log::{LogExt, warn};
 pub use crate::login_param::EnteredLoginParam;
 use crate::login_param::{
     ConfiguredCertificateChecks, ConfiguredLoginParam, ConfiguredServerLoginParam,
@@ -137,7 +137,7 @@ impl Context {
 
         let res = self
             .inner_configure(param)
-            .race(cancel_channel.recv().map(|_| Err(format_err!("Cancelled"))))
+            .race(cancel_channel.recv().map(|_| Err(format_err!("Canceled"))))
             .await;
 
         self.free_ongoing().await;

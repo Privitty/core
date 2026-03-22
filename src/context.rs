@@ -26,10 +26,11 @@ use crate::download::DownloadState;
 use crate::events::{Event, EventEmitter, EventType, Events};
 use crate::imap::{FolderMeaning, Imap, ServerMetadata};
 use crate::key::{load_self_secret_key, self_fingerprint};
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::logged_debug_assert;
 use crate::login_param::{ConfiguredLoginParam, EnteredLoginParam};
 use crate::message::{self, Message, MessageState, MsgId};
+use crate::net::tls::TlsSessionStore;
 use crate::param::{Param, Params};
 use crate::peer_channels::Iroh;
 use crate::push::PushSubscriber;
@@ -297,6 +298,9 @@ pub struct InnerContext {
     /// True if account has subscribed to push notifications via IMAP.
     pub(crate) push_subscribed: AtomicBool,
 
+    /// TLS session resumption cache.
+    pub(crate) tls_session_store: TlsSessionStore,
+
     /// Iroh for realtime peer channels.
     pub(crate) iroh: Arc<RwLock<Option<Iroh>>>,
 
@@ -475,6 +479,7 @@ impl Context {
             debug_logging: std::sync::RwLock::new(None),
             push_subscriber,
             push_subscribed: AtomicBool::new(false),
+            tls_session_store: TlsSessionStore::new(),
             iroh: Arc::new(RwLock::new(None)),
             self_fingerprint: OnceLock::new(),
             connectivities: parking_lot::Mutex::new(Vec::new()),
@@ -973,12 +978,6 @@ impl Context {
         res.insert("public_key_count", pub_key_cnt.to_string());
         res.insert("fingerprint", fingerprint_str);
         res.insert(
-            "webrtc_instance",
-            self.get_config(Config::WebrtcInstance)
-                .await?
-                .unwrap_or_else(|| "<unset>".to_string()),
-        );
-        res.insert(
             "media_quality",
             self.get_config_int(Config::MediaQuality).await?.to_string(),
         );
@@ -1055,12 +1054,6 @@ impl Context {
             self.get_config_int(Config::GossipPeriod).await?.to_string(),
         );
         res.insert(
-            "verified_one_on_one_chats", // deprecated 2025-07
-            self.get_config_bool(Config::VerifiedOneOnOneChats)
-                .await?
-                .to_string(),
-        );
-        res.insert(
             "webxdc_realtime_enabled",
             self.get_config_bool(Config::WebxdcRealtimeEnabled)
                 .await?
@@ -1076,6 +1069,13 @@ impl Context {
             "first_key_contacts_msg_id",
             self.sql
                 .get_raw_config("first_key_contacts_msg_id")
+                .await?
+                .unwrap_or_default(),
+        );
+        res.insert(
+            "fail_on_receiving_full_msg",
+            self.sql
+                .get_raw_config("fail_on_receiving_full_msg")
                 .await?
                 .unwrap_or_default(),
         );

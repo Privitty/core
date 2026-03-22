@@ -3,6 +3,7 @@ import sys
 from os import path, makedirs, chdir, chmod
 from shutil import copy
 
+# run from npm-package-privitty/
 chdir(path.join(path.dirname(path.abspath(__file__)), "../"))
 
 if len(sys.argv) < 3:

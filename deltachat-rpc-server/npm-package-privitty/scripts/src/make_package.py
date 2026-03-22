@@ -25,11 +25,7 @@ def write_package_json(platform_path, rust_target, my_binary_name):
         "cpu": [convert_cpu_arch_to_npm_cpu_arch(cpu_arch)],
         "main": my_binary_name,
         "license": "MPL-2.0",
-        "repository": {
-            "type": "git",
-            "url": "https://github.com/Privitty/core.git",
-            "directory": "deltachat-rpc-server",
-        },
+        "repository": {"type": "git", "url": "https://github.com/Privitty/core.git", "directory": "deltachat-rpc-server"},
     }
     with open(platform_path + "/package.json", "w") as f:
         f.write(json.dumps(package_json, indent=4))

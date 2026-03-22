@@ -22,7 +22,7 @@ use crate::constants::DC_CHAT_ID_TRASH;
 use crate::contact::ContactId;
 use crate::context::Context;
 use crate::events::EventType;
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::message::{Message, MsgId, Viewtype};
 use crate::mimeparser::SystemMessage;
 use crate::tools::{duration_to_str, time};
@@ -140,7 +140,7 @@ impl Kml {
         if self.tag == KmlTag::PlacemarkTimestampWhen
             || self.tag == KmlTag::PlacemarkPointCoordinates
         {
-            let val = event.unescape().unwrap_or_default();
+            let val = event.xml_content().unwrap_or_default();
 
             let val = val.replace(['\n', '\r', '\t', ' '], "");
 

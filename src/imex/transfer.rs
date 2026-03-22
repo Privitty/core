@@ -41,14 +41,14 @@ use tokio_util::sync::CancellationToken;
 use crate::chat::add_device_msg;
 use crate::context::Context;
 use crate::imex::BlobDirContents;
-use crate::log::{info, warn};
+use crate::log::warn;
 use crate::message::Message;
 use crate::qr::Qr;
 use crate::stock_str::backup_transfer_msg_body;
 use crate::tools::{TempPathGuard, create_id, time};
 use crate::{EventType, e2ee};
 
-use super::{DBFILE_BACKUP_NAME, PRIVITTY_BACKUP_NAME, export_backup_stream, export_database, import_backup_stream};
+use super::{DBFILE_BACKUP_NAME, PRIVITTY_BACKUP_NAME, calculate_dir_size, export_backup_stream, export_database, import_backup_stream};
 
 /// ALPN protocol identifier for the backup transfer protocol.
 const BACKUP_ALPN: &[u8] = b"/deltachat/backup";
@@ -250,7 +250,7 @@ impl BackupProvider {
                         if let Err(err) = Self::handle_connection(context.clone(), conn, auth_token, dbfile).race(
                             async {
                                 cancel_token.recv().await.ok();
-                                Err(format_err!("Backup transfer cancelled"))
+                                Err(format_err!("Backup transfer canceled"))
                             }
                         ).race(
                             async {
@@ -270,12 +270,12 @@ impl BackupProvider {
                     }
                 },
                 _ = cancel_token.recv() => {
-                    info!(context, "Backup transfer cancelled by the user, stopping accept loop.");
+                    info!(context, "Backup transfer canceled by the user, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
                 _ = drop_token.cancelled() => {
-                    info!(context, "Backup transfer cancelled by dropping the provider, stopping accept loop.");
+                    info!(context, "Backup transfer canceled by dropping the provider, stopping accept loop.");
                     context.emit_event(EventType::ImexProgress(0));
                     break;
                 }
@@ -372,7 +372,7 @@ pub async fn get_backup(context: &Context, qr: Qr) -> Result<()> {
             let res = get_backup2(context, node_addr, auth_token)
                 .race(async {
                     cancel_token.recv().await.ok();
-                    Err(format_err!("Backup reception cancelled"))
+                    Err(format_err!("Backup reception canceled"))
                 })
                 .await;
             if let Err(ref res) = res {

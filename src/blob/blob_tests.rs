@@ -335,6 +335,28 @@ async fn test_recode_image_2() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_recode_image_bad_exif() {
+    // `exiftool` reports for this file "Bad offset for IFD0 XResolution", still Exif must be
+    // detected and removed.
+    let bytes = include_bytes!("../../test-data/image/1000x1000-bad-exif.jpg");
+    SendImageCheckMediaquality {
+        viewtype: Viewtype::Image,
+        media_quality_config: "0",
+        bytes,
+        extension: "jpg",
+        has_exif: true,
+        original_width: 1000,
+        original_height: 1000,
+        compressed_width: 1000,
+        compressed_height: 1000,
+        ..Default::default()
+    }
+    .test()
+    .await
+    .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_recode_image_balanced_png() {
     let bytes = include_bytes!("../../test-data/image/screenshot.png");
 
@@ -416,6 +438,28 @@ async fn test_recode_image_balanced_png() {
     .unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_sticker_with_exif() {
+    let bytes = include_bytes!("../../test-data/image/logo-exif.png");
+    SendImageCheckMediaquality {
+        viewtype: Viewtype::Sticker,
+        bytes,
+        extension: "png",
+        // TODO: Pretend there's no Exif. Currently `exif` crate doesn't detect Exif in this image,
+        // so the test doesn't check all the logic it should.
+        has_exif: false,
+        original_width: 135,
+        original_height: 135,
+        res_viewtype: Some(Viewtype::Sticker),
+        compressed_width: 135,
+        compressed_height: 135,
+        ..Default::default()
+    }
+    .test()
+    .await
+    .unwrap();
+}
+
 /// Tests that RGBA PNG can be recoded into JPEG
 /// by dropping alpha channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -485,6 +529,7 @@ struct SendImageCheckMediaquality<'a> {
     pub(crate) original_width: u32,
     pub(crate) original_height: u32,
     pub(crate) orientation: i32,
+    pub(crate) res_viewtype: Option<Viewtype>,
     pub(crate) compressed_width: u32,
     pub(crate) compressed_height: u32,
     pub(crate) set_draft: bool,
@@ -500,6 +545,7 @@ impl SendImageCheckMediaquality<'_> {
         let original_width = self.original_width;
         let original_height = self.original_height;
         let orientation = self.orientation;
+        let res_viewtype = self.res_viewtype.unwrap_or(Viewtype::Image);
         let compressed_width = self.compressed_width;
         let compressed_height = self.compressed_height;
         let set_draft = self.set_draft;
@@ -550,7 +596,7 @@ impl SendImageCheckMediaquality<'_> {
         }
 
         let bob_msg = bob.recv_msg(&sent).await;
-        assert_eq!(bob_msg.get_viewtype(), Viewtype::Image);
+        assert_eq!(bob_msg.get_viewtype(), res_viewtype);
         assert_eq!(bob_msg.get_width() as u32, compressed_width);
         assert_eq!(bob_msg.get_height() as u32, compressed_height);
         let file_saved = bob
@@ -564,7 +610,7 @@ impl SendImageCheckMediaquality<'_> {
         }
 
         let (_, exif) = image_metadata(&std::fs::File::open(&file_saved)?)?;
-        assert!(exif.is_none());
+        assert!(res_viewtype != Viewtype::Image || exif.is_none());
 
         let img = check_image_size(file_saved, compressed_width, compressed_height);
 

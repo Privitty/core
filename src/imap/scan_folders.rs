@@ -5,7 +5,7 @@ use anyhow::{Context as _, Result};
 use super::{get_folder_meaning_by_attrs, get_folder_meaning_by_name};
 use crate::config::Config;
 use crate::imap::{Imap, session::Session};
-use crate::log::{LogExt, info};
+use crate::log::LogExt;
 use crate::tools::{self, time_elapsed};
 use crate::{context::Context, imap::FolderMeaning};
 
@@ -73,8 +73,8 @@ impl Imap {
 
             // Don't scan folders that are watched anyway
             if !watched_folders.contains(&folder.name().to_string())
-                && folder_meaning != FolderMeaning::Drafts
                 && folder_meaning != FolderMeaning::Trash
+                && folder_meaning != FolderMeaning::Unknown
             {
                 self.fetch_move_delete(context, session, folder.name(), folder_meaning)
                     .await
