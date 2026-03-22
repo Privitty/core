@@ -1,0 +1,66 @@
+# Publish @privitty/jsonrpc-client to npm (TypeScript JSON-RPC client, like jsonrpc-client-npm-package.yml)
+
+name: Publish @privitty/deltachat-rpc-client
+
+concurrency:
+  group: publish-privitty-rpc-client-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [desktop-core]
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from"
+        required: false
+        default: "desktop-core"
+
+permissions: {}
+
+jobs:
+  pack-module:
+    name: Publish @privitty/jsonrpc-client
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || github.ref }}
+          show-progress: false
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Rewrite package.json for Privitty
+        working-directory: deltachat-jsonrpc/typescript
+        run: |
+          node -e "
+            const pkg = require('./package.json');
+            pkg.name = '@privitty/jsonrpc-client';
+            pkg.repository = { type: 'git', url: 'https://github.com/Privitty/core.git' };
+            if (pkg.author) pkg.author = pkg.author.replace(/Delta Chat|chatmail/gi, 'Privitty');
+            require('fs').writeFileSync('./package.json', JSON.stringify(pkg, null, 2));
+          "
+
+      - name: Install dependencies without running scripts
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm install --ignore-scripts
+
+      - name: Package
+        working-directory: deltachat-jsonrpc/typescript
+        run: |
+          npm run build
+          npm pack .
+
+      - name: Publish
+        working-directory: deltachat-jsonrpc/typescript
+        run: npm publish --provenance privitty-jsonrpc-client-* --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
